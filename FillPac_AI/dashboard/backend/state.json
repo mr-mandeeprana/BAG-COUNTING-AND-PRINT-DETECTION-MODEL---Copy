@@ -1,54 +1,60 @@
 {
-  "system_status": "running",
-  "total_count": 242,
-  "total_printed_count": 14,
-  "total_missing_count": 141,
-  "total_printed_bags_count": 14,
-  "total_not_printed_bags_count": 141,
+  "system_status": "stopped",
+  "startup_time": "2026-07-17T10:09:36.947139+00:00",
+  "service_status": {
+    "model_loaded": true,
+    "elasticsearch_connected": false,
+    "dashboard_enabled": true
+  },
+  "total_count": 146,
+  "total_printed_count": 114,
+  "total_missing_count": 32,
+  "total_printed_bags_count": 114,
+  "total_not_printed_bags_count": 32,
   "cameras": {
     "Camera 1": {
-      "count": 53,
-      "printed_count": 2,
-      "missing_count": 50,
-      "printed_bags_count": 2,
-      "not_printed_bags_count": 50,
-      "fps": 2.55,
-      "status": "online",
+      "count": 35,
+      "printed_count": 29,
+      "missing_count": 6,
+      "printed_bags_count": 29,
+      "not_printed_bags_count": 6,
+      "fps": 0.44,
+      "status": "offline",
       "print_status": "no_bag",
-      "updated_at": "2026-07-17T04:31:49.785082+00:00"
+      "updated_at": "2026-07-17T13:30:17.140203+00:00"
     },
     "Camera 2": {
-      "count": 53,
-      "printed_count": 0,
-      "missing_count": 19,
-      "printed_bags_count": 0,
-      "not_printed_bags_count": 19,
-      "fps": 2.54,
-      "status": "online",
+      "count": 32,
+      "printed_count": 28,
+      "missing_count": 4,
+      "printed_bags_count": 28,
+      "not_printed_bags_count": 4,
+      "fps": 0.44,
+      "status": "offline",
       "print_status": "no_bag",
-      "updated_at": "2026-07-17T04:31:49.876609+00:00"
+      "updated_at": "2026-07-17T13:30:17.148487+00:00"
     },
     "Camera 3": {
-      "count": 68,
-      "printed_count": 12,
-      "missing_count": 54,
-      "printed_bags_count": 12,
-      "not_printed_bags_count": 54,
-      "fps": 2.58,
-      "status": "online",
+      "count": 40,
+      "printed_count": 29,
+      "missing_count": 11,
+      "printed_bags_count": 29,
+      "not_printed_bags_count": 11,
+      "fps": 0.48,
+      "status": "offline",
       "print_status": "no_bag",
-      "updated_at": "2026-07-17T04:31:49.963558+00:00"
+      "updated_at": "2026-07-17T13:30:17.158840+00:00"
     },
     "Camera 4": {
-      "count": 68,
-      "printed_count": 0,
-      "missing_count": 18,
-      "printed_bags_count": 0,
-      "not_printed_bags_count": 18,
-      "fps": 2.5,
-      "status": "online",
-      "print_status": "no_bag",
-      "updated_at": "2026-07-17T04:31:49.674741+00:00"
+      "count": 39,
+      "printed_count": 28,
+      "missing_count": 11,
+      "printed_bags_count": 28,
+      "not_printed_bags_count": 11,
+      "fps": 0.63,
+      "status": "offline",
+      "print_status": "missing",
+      "updated_at": "2026-07-17T13:30:17.229151+00:00"
     }
   }
 }

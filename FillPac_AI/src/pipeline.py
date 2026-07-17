@@ -6,6 +6,7 @@ Pipeline
 """
 
 import time
+import threading
 
 import cv2
 
@@ -118,33 +119,49 @@ class Pipeline:
         )
         self.track_print_votes = {}
         self.track_print_last_seen = {}
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
         self._restore_persisted_counts()
 
     def process(self):
-        if not self.connected:
-            self.connected = self.camera.connect()
+        try:
             if not self.connected:
+                self.connected = self.camera.connect()
+                if not self.connected:
+                    self._publish_runtime_status(fps=0.0, print_status="offline")
+                    return False
+
+            frame = self.read_frame()
+            if frame is None:
+                self.release()
                 self._publish_runtime_status(fps=0.0, print_status="offline")
                 return False
 
-        frame = self.read_frame()
-        if frame is None:
+            self.frame_index += 1
+            detections = self.detect(frame)
+            tracks = self.track(detections)
+            print_results = self.print_detection(tracks, detections)
+            self.record_print_observations(print_results, tracks)
+            countable_tracks = self.countable_tracks(tracks)
+            count = self.count(countable_tracks)
+            fps = self.calculate_fps()
+            self.draw(frame, tracks, detections, print_results, count, fps)
+            self._set_latest_frame(frame)
+            self._publish_events(count, fps, print_results)
+            return True
+        except Exception:
+            self.logger.error(f"Unhandled exception in pipeline {self.name}.", exc_info=True)
             self.release()
-            self._publish_runtime_status(fps=0.0, print_status="offline")
+            self._publish_runtime_status(fps=0.0, print_status="error")
             return False
 
-        self.frame_index += 1
-        detections = self.detect(frame)
-        tracks = self.track(detections)
-        print_results = self.print_detection(tracks, detections)
-        self.record_print_observations(print_results, tracks)
-        countable_tracks = self.countable_tracks(tracks)
-        count = self.count(countable_tracks)
-        fps = self.calculate_fps()
-        self.draw(frame, tracks, detections, print_results, count, fps)
-        self.publish(frame)
-        self._publish_events(count, fps, print_results)
-        return True
+    def run(self, stop_event):
+        self.logger.info(f"{self.name} pipeline thread started.")
+        while not stop_event.is_set():
+            active = self.process()
+            if not active:
+                time.sleep(0.1)
+        self.logger.info(f"{self.name} pipeline thread stopping.")
 
     def read_frame(self):
         success, frame = self.camera.read()
@@ -228,8 +245,19 @@ class Pipeline:
             counted_bags=self.counter.last_counted_bags,
         )
 
-    def publish(self, frame):
+    def publish(self):
+        frame = self._get_latest_frame()
+        if frame is None:
+            return
         cv2.imshow(self.window_name, frame)
+
+    def _set_latest_frame(self, frame):
+        with self._frame_lock:
+            self._latest_frame = frame.copy() if frame is not None else None
+
+    def _get_latest_frame(self):
+        with self._frame_lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
 
     def calculate_fps(self):
         current_time = time.time()
@@ -240,6 +268,8 @@ class Pipeline:
     def release(self):
         self.camera.release()
         self.connected = False
+        with self._frame_lock:
+            self._latest_frame = None
 
     def _publish_events(self, count, fps, print_results):
         counted_results = self._update_print_totals()
@@ -353,9 +383,12 @@ class Pipeline:
 
         positive_votes = sum(1 for vote in votes if vote)
         positive_ratio = positive_votes / len(votes)
-        return (
-            positive_votes >= self.min_print_votes
-            and positive_ratio >= self.print_vote_threshold
+        enough_positive_votes = positive_votes >= self.min_print_votes
+        limited_observations = len(votes) < self.min_print_votes
+        has_positive_signal = positive_votes > 0
+
+        return positive_ratio >= self.print_vote_threshold and (
+            enough_positive_votes or (limited_observations and has_positive_signal)
         )
 
     def _trim_print_history(self, active_track_ids):

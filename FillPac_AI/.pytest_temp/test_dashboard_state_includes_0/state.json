@@ -1,0 +1,31 @@
+{
+  "system_status": "idle",
+  "startup_time": "2026-07-17T12:57:52.863017+00:00",
+  "service_status": {},
+  "total_count": 2,
+  "total_printed_count": 1,
+  "total_missing_count": 1,
+  "total_printed_bags_count": 1,
+  "total_not_printed_bags_count": 1,
+  "cameras": {
+    "Camera 1": {
+      "count": 2,
+      "printed_count": 1,
+      "missing_count": 1,
+      "printed_bags_count": 0,
+      "not_printed_bags_count": 0,
+      "fps": 8.5,
+      "status": "online",
+      "print_status": "ok",
+      "camera_status": {
+        "connected": true,
+        "backend": "ffmpeg",
+        "queue_occupancy": 1,
+        "frames_read": 12,
+        "frames_dropped": 0,
+        "reconnect_count": 0
+      },
+      "updated_at": "2026-07-17T12:57:52.871069+00:00"
+    }
+  }
+}

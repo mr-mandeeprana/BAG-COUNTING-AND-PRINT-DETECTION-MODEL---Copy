@@ -13,6 +13,7 @@ Centralized logging for the application.
 """
 
 import logging
+import logging.handlers
 import os
 
 
@@ -21,13 +22,15 @@ class Logger:
     def __init__(
         self,
         log_file="logs/application.log",
-        level=logging.INFO
+        level=logging.INFO,
+        max_bytes: int = 10_485_760,
+        backup_count: int = 5,
     ):
 
-        os.makedirs("logs", exist_ok=True)
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
 
         self.logger = logging.getLogger("FillPacAI")
-        self.logger.setLevel(level)
+        self.logger.setLevel(self._parse_level(level))
 
         # Avoid duplicate handlers
         if self.logger.hasHandlers():
@@ -35,23 +38,35 @@ class Logger:
 
         formatter = logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(message)s",
-            "%Y-%m-%d %H:%M:%S"
+            "%Y-%m-%d %H:%M:%S",
         )
 
-        # Console Handler
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
 
-        # File Handler
-        file_handler = logging.FileHandler(
+        file_handler = logging.handlers.RotatingFileHandler(
             log_file,
             mode="a",
-            encoding="utf-8"
+            encoding="utf-8",
+            maxBytes=max_bytes,
+            backupCount=backup_count,
         )
         file_handler.setFormatter(formatter)
 
         self.logger.addHandler(console_handler)
         self.logger.addHandler(file_handler)
+
+    @staticmethod
+    def _parse_level(level):
+        if isinstance(level, int):
+            return level
+
+        if isinstance(level, str):
+            level_name = level.strip().upper()
+            if level_name in logging._nameToLevel:
+                return logging._nameToLevel[level_name]
+
+        return logging.INFO
 
     # ======================================================
 

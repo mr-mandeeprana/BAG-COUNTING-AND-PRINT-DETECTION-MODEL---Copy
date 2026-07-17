@@ -12,7 +12,7 @@ project:
 
 model: &default_model
   path: "models/fillpac_yolo26n_best.pt"
-  confidence: 0.35
+  confidence: 0.25
   iou: 0.45
   device: "cuda"
   image_size: 640
@@ -28,7 +28,7 @@ model: &default_model
     - 0
     - 1
   bag_confidence: 0.35
-  print_confidence: 0.55
+  print_confidence: 0.25
 
 # ----------------------------------------------------------
 # TRACKER
@@ -46,7 +46,7 @@ tracker:
   match_thresh: 0.85
   frame_rate: 30
   minimum_consecutive_frames: 1
-  min_track_age: 3
+  min_track_age: 4
   min_bbox_area: 4000
   min_bbox_area_ratio: 0.002
   min_track_confidence: 0.25
@@ -80,7 +80,7 @@ counting: &default_counting
 
 print_detection: &default_print_detection
   enabled: true
-  confidence: 0.40
+  confidence: 0.25
   # Fraction of the print box's area that must overlap the bag box to count
   # as "printed on this bag" (prevents a print on a neighboring bag from
   # counting due to a sliver of edge overlap).
@@ -110,7 +110,7 @@ cameras:
     counting: *default_counting
     print_detection:
       enabled: true
-      confidence: 0.40
+      confidence: 0.25
     roi:
       x1: 0
       y1: 425
@@ -127,7 +127,7 @@ cameras:
     counting: *default_counting
     print_detection:
       enabled: true
-      confidence: 0.40
+      confidence: 0.25
     roi:
       x1: 0
       y1: 425
@@ -144,7 +144,7 @@ cameras:
     counting: *default_counting
     print_detection:
       enabled: true
-      confidence: 0.40
+      confidence: 0.25
     roi:
       x1: 150
       y1: 425
@@ -161,7 +161,7 @@ cameras:
     counting: *default_counting
     print_detection:
       enabled: true
-      confidence: 0.40
+      confidence: 0.25
     roi:
       x1: 150
       y1: 425
@@ -207,7 +207,7 @@ elasticsearch:
 # ----------------------------------------------------------
 
 dashboard:
-  enabled: true
+  enabled: false
   host: "0.0.0.0"
   port: 8000
   persist_interval_seconds: 0.25

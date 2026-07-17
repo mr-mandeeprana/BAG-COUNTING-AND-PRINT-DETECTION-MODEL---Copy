@@ -28,7 +28,7 @@ Camera
 
 - `src/application.py`: boots config, logging, and pipelines
 - `src/pipeline.py`: camera runtime flow
-- `src/camera.py`: MP4/RTSP capture and reconnect support
+- `src/camera.py`: MP4/RTSP capture
 - `src/detector.py`: YOLO inference
 - `src/tracker.py`: stable bag tracking
 - `src/counter.py`: center-based counting
@@ -46,3 +46,13 @@ The dashboard backend exposes:
 - print status
 - fps
 - system status
+
+Each camera entry now includes a `camera_status` object with runtime health metrics:
+
+- `connected`
+- `backend`
+- `queue_size`
+- `queue_occupancy`
+- `frames_read`
+- `frames_dropped`
+- `last_frame_age_seconds`

@@ -1,0 +1,24 @@
+{
+  "system_status": "running",
+  "startup_time": "2026-07-17T12:57:52.821935+00:00",
+  "service_status": {},
+  "total_count": 3,
+  "total_printed_count": 2,
+  "total_missing_count": 1,
+  "total_printed_bags_count": 2,
+  "total_not_printed_bags_count": 1,
+  "cameras": {
+    "Camera 1": {
+      "count": 3,
+      "printed_count": 2,
+      "missing_count": 1,
+      "printed_bags_count": 0,
+      "not_printed_bags_count": 0,
+      "fps": 12.5,
+      "status": "online",
+      "print_status": "ok",
+      "camera_status": null,
+      "updated_at": "2026-07-17T12:57:52.838216+00:00"
+    }
+  }
+}

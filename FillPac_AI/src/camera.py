@@ -6,7 +6,7 @@ Camera Module
 """
 
 import time
-from typing import Union
+from typing import Optional, Union
 
 import cv2
 
@@ -58,19 +58,9 @@ class Camera:
                 return False, None
 
             self._log("warning", f"{self.name} disconnected")
-            self.reconnect()
             return False, None
 
         return True, frame
-
-    def reconnect(self):
-        self.release()
-        self._log("info", f"Reconnecting {self.name}...")
-
-        while True:
-            if self.connect():
-                break
-            time.sleep(2)
 
     def release(self):
         if self.cap is not None:

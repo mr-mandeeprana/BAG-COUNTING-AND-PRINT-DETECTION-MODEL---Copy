@@ -81,6 +81,30 @@ def test_pipeline_records_print_history_and_finalizes_counted_bag():
     assert pipeline.track_print_last_seen == {}
 
 
+def test_pipeline_finalizes_printed_with_limited_positive_observations():
+    pipeline = make_pipeline()
+    pipeline.min_print_votes = 2
+    pipeline.print_vote_threshold = 0.5
+    pipeline.track_print_votes = {7: [True]}
+    pipeline.track_print_last_seen = {7: 10}
+
+    assert pipeline._finalize_print_status(7) is True
+    assert pipeline.track_print_votes == {}
+    assert pipeline.track_print_last_seen == {}
+
+
+def test_pipeline_finalizes_missing_with_only_negative_observations():
+    pipeline = make_pipeline()
+    pipeline.min_print_votes = 2
+    pipeline.print_vote_threshold = 0.5
+    pipeline.track_print_votes = {7: [False]}
+    pipeline.track_print_last_seen = {7: 10}
+
+    assert pipeline._finalize_print_status(7) is False
+    assert pipeline.track_print_votes == {}
+    assert pipeline.track_print_last_seen == {}
+
+
 def test_pipeline_ignores_motion_jump_print_observations():
     pipeline = make_pipeline()
     tracks = [{"track_id": 7, "speed": 4, "motion_jump": True}]

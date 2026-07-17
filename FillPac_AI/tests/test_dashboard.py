@@ -31,10 +31,25 @@ def test_dashboard_state_persists_snapshot(tmp_path):
     assert state["cameras"]["Camera 1"]["print_status"] == "ok"
 
 
-def test_dashboard_state_loads_existing_counts(tmp_path):
+def test_dashboard_state_includes_camera_status(tmp_path):
     state_file = tmp_path / "state.json"
-    state_file.write_text(
-        json.dumps(
+    dashboard = DashboardState(enabled=True, state_file=state_file)
+
+    dashboard.update_camera(
+        "Camera 1",
+        count=2,
+        fps=8.5,
+        status="online",
+        print_status="ok",
+        printed_count=1,
+        missing_count=1,
+        camera_status={
+            "connected": True,
+            "backend": "ffmpeg",
+            "queue_occupancy": 1,
+            "frames_read": 12,
+            "frames_dropped": 0,
+
             {
                 "system_status": "running",
                 "total_count": 5,

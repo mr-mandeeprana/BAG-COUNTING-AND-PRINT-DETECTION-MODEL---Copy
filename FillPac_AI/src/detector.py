@@ -51,16 +51,22 @@ class Detector:
         self.frame_index = 0
         self.logger = logger
 
-        if str(device).startswith("cuda") and torch.cuda.is_available():
+        requested_device = str(device).strip().lower()
+        if requested_device in {"cuda", "gpu"} and torch.cuda.is_available():
             self.device = "cuda"
         else:
+            if requested_device in {"cuda", "gpu"}:
+                self._log(
+                    "warning",
+                    "CUDA requested but unavailable, falling back to CPU.",
+                )
             self.device = "cpu"
+
         self.half = bool(half and self.device == "cuda")
 
         self._validate_model_file()
         self._log("info", f"Loading YOLO model: {self.model_path}")
-        self.model = YOLO(str(self.model_path))
-        self.model.to(self.device)
+        self._load_model()
         self._fuse_model()
         self._warm_up_model()
         self._log(
@@ -72,16 +78,17 @@ class Detector:
         self.frame_index += 1
         timestamp = time.time()
 
+        predict_kwargs = {"quantize": "fp16"} if self.half else {}
         with torch.inference_mode():
             results = self.model.predict(
                 source=frame,
                 conf=self.confidence,
                 iou=self.iou,
                 imgsz=self.image_size,
-                half=self.half,
                 max_det=self.max_detections,
                 device=self.device,
                 verbose=False,
+                **predict_kwargs,
             )
 
         detections = []
@@ -223,6 +230,23 @@ class Detector:
                 "Replace it with a valid trained checkpoint before running the app."
             )
 
+    def _load_model(self):
+        try:
+            self.model = YOLO(str(self.model_path))
+            self.model.to(self.device)
+        except Exception as exc:
+            if self.device == "cuda":
+                self._log(
+                    "warning",
+                    f"Failed to load model on CUDA: {exc}. Falling back to CPU.",
+                )
+                self.device = "cpu"
+                self.half = False
+                self.model = YOLO(str(self.model_path))
+                self.model.to(self.device)
+            else:
+                raise
+
     def _fuse_model(self):
         try:
             self.model.fuse()
@@ -235,14 +259,15 @@ class Detector:
             dtype=np.uint8,
         )
 
+        predict_kwargs = {"quantize": "fp16"} if self.half else {}
         try:
             with torch.inference_mode():
                 self.model.predict(
                     source=dummy,
                     imgsz=self.image_size,
                     device=self.device,
-                    half=self.half,
                     verbose=False,
+                    **predict_kwargs,
                 )
         except Exception as exc:
             self._log("warning", f"Could not warm up YOLO model: {exc}")

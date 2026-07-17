@@ -46,4 +46,6 @@ def test_config_uses_trained_model_and_dataset_yaml():
     assert camera["model"]["half"] is True
     assert camera["model"]["max_detections"] == 50
     assert camera["buffer_size"] == 1
+    assert camera["queue_size"] == 3
+    assert camera["read_timeout"] == 0.2
     assert Path("models/data.yaml").exists()

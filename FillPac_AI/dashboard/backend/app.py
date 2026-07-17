@@ -19,7 +19,16 @@ api.add_middleware(
 
 @api.get("/health")
 async def health():
-    return {"status": "ok"}
+    snapshot = dashboard_state.snapshot()
+    return {
+        "status": "ok",
+        "system_status": snapshot.get("system_status"),
+        "dashboard_enabled": dashboard_state.enabled,
+        "service_status": snapshot.get("service_status", {}),
+        "camera_count": len(snapshot.get("cameras", {})),
+        "total_count": snapshot.get("total_count", 0),
+        "startup_time": snapshot.get("startup_time"),
+    }
 
 
 @api.get("/state")
