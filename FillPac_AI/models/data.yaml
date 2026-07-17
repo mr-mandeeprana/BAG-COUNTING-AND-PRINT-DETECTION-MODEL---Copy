@@ -1,0 +1,8 @@
+path: .
+train: ../data/images/train
+val: ../data/images/val
+test: ../data/images/test
+
+names:
+  0: Bag
+  1: Print

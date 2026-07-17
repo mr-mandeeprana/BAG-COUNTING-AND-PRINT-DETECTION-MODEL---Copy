@@ -1,0 +1,22 @@
+.venv/
+.pytest_cache/
+.agents/
+.vscode/
+__pycache__/
+*.py[cod]
+
+FillPac_AI/.pytest_cache/
+FillPac_AI/.ultralytics/
+FillPac_AI/**/__pycache__/
+FillPac_AI/logs/
+FillPac_AI/runs/
+FillPac_AI/data/output/
+FillPac_AI/data/import_backups/
+FillPac_AI/data/videos/
+FillPac_AI/data/images.zip
+FillPac_AI/data/labels/*.cache
+
+Find bag and print.yolo26/train/
+
+*.tmp
+*.log

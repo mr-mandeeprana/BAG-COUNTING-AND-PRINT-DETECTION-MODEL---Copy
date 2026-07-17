@@ -1,0 +1,222 @@
+# ==========================================================
+# FillPac AI - Bag Counting & Print Detection Configuration
+# ==========================================================
+
+project:
+  name: "FillPac AI"
+  version: "1.0.0"
+
+# ----------------------------------------------------------
+# MODEL
+# ----------------------------------------------------------
+
+model: &default_model
+  path: "models/fillpac_yolo26n_best.pt"
+  confidence: 0.35
+  iou: 0.45
+  device: "cuda"
+  image_size: 640
+  half: true
+  max_detections: 50
+  min_bbox_area: 800
+  detection_roi:
+    x1: 0
+    y1: 120
+    x2: 1920
+    y2: 1080
+  allowed_classes:
+    - 0
+    - 1
+  bag_confidence: 0.35
+  print_confidence: 0.55
+
+# ----------------------------------------------------------
+# TRACKER
+# ----------------------------------------------------------
+
+tracker:
+  type: "bytetrack"
+  track_high_thresh: 0.45
+  # NOTE: track_low_thresh and new_track_thresh are NOT supported by the
+  # installed supervision.ByteTrack version (no equivalent parameter exists)
+  # and are currently ignored — Tracker logs a warning if they're set.
+  track_low_thresh: 0.10
+  new_track_thresh: 0.60
+  track_buffer: 60
+  match_thresh: 0.85
+  frame_rate: 30
+  minimum_consecutive_frames: 1
+  min_track_age: 3
+  min_bbox_area: 4000
+  min_bbox_area_ratio: 0.002
+  min_track_confidence: 0.25
+  max_jump_distance: 250
+  min_iou_warning: 0.10
+  unstable_frame_threshold: 3
+  history_ttl_frames: 120
+
+# ----------------------------------------------------------
+# COUNTING
+# ----------------------------------------------------------
+
+counting: &default_counting
+  method: "center"
+  direction: "up"
+  # duplicate_distance/duplicate_time together suppress double-counts when
+  # the tracker drops a track and reassigns a new track_id to the same bag
+  # right around the counting line (a fresh count within duplicate_time
+  # seconds and duplicate_distance pixels of the last count is skipped).
+  duplicate_distance: 30
+  duplicate_time: 0.8
+  line_tolerance: 12
+  late_start_margin: 40
+  minimum_cross_distance: 15
+  min_track_frames: 4
+  stale_track_frames: 120
+
+# ----------------------------------------------------------
+# PRINT DETECTION
+# ----------------------------------------------------------
+
+print_detection: &default_print_detection
+  enabled: true
+  confidence: 0.40
+  # Fraction of the print box's area that must overlap the bag box to count
+  # as "printed on this bag" (prevents a print on a neighboring bag from
+  # counting due to a sliver of edge overlap).
+  iou_threshold: 0.00
+  min_overlap_ratio: 0.30
+  min_print_area: 80
+  max_print_area: 0
+  min_aspect_ratio: 0
+  max_aspect_ratio: 0
+  max_center_distance: 0
+  vote_threshold: 0.60
+  min_votes: 4
+  history_ttl_frames: 120
+
+# ----------------------------------------------------------
+# CAMERAS
+# ----------------------------------------------------------
+
+cameras:
+  - id: 1
+    name: "Camera 1"
+    enabled: true
+    mode: "video"
+    source: "data/videos/camera 1.mp4"
+    buffer_size: 1
+    model: *default_model
+    counting: *default_counting
+    print_detection:
+      enabled: true
+      confidence: 0.40
+    roi:
+      x1: 0
+      y1: 425
+      x2: 477
+      y2: 425
+
+  - id: 2
+    name: "Camera 2"
+    enabled: true
+    mode: "video"
+    source: "data/videos/camera 2.mp4"
+    buffer_size: 1
+    model: *default_model
+    counting: *default_counting
+    print_detection:
+      enabled: true
+      confidence: 0.40
+    roi:
+      x1: 0
+      y1: 425
+      x2: 477
+      y2: 425
+
+  - id: 3
+    name: "Camera 3"
+    enabled: true
+    mode: "video"
+    source: "data/videos/camera 3.mp4"
+    buffer_size: 1
+    model: *default_model
+    counting: *default_counting
+    print_detection:
+      enabled: true
+      confidence: 0.40
+    roi:
+      x1: 150
+      y1: 425
+      x2: 1200
+      y2: 425
+
+  - id: 4
+    name: "Camera 4"
+    enabled: true
+    mode: "video"
+    source: "data/videos/camera 4.mp4"
+    buffer_size: 1
+    model: *default_model
+    counting: *default_counting
+    print_detection:
+      enabled: true
+      confidence: 0.40
+    roi:
+      x1: 150
+      y1: 425
+      x2: 1200
+      y2: 425
+
+# ----------------------------------------------------------
+# DISPLAY
+# ----------------------------------------------------------
+
+display:
+  show_boxes: true
+  show_labels: true
+  show_center: true
+  show_roi: true
+  show_fps: true
+  show_count: true
+
+# ----------------------------------------------------------
+# OUTPUT
+# ----------------------------------------------------------
+
+output:
+  save_video: false
+  save_images: false
+  output_path: "data/output"
+
+# ----------------------------------------------------------
+# ELASTICSEARCH
+# ----------------------------------------------------------
+
+elasticsearch:
+  enabled: false
+  host: "localhost"
+  port: 9200
+  indices:
+    count: "fillpac-count"
+    print: "fillpac-print"
+    camera: "fillpac-camera"
+
+# ----------------------------------------------------------
+# DASHBOARD
+# ----------------------------------------------------------
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  persist_interval_seconds: 0.25
+
+# ----------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------
+
+logging:
+  level: "INFO"
+  file: "logs/application.log"
+  count_file: "logs/count_events.jsonl"
