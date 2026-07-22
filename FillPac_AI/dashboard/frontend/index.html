@@ -1,0 +1,1505 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <meta
+        name="description"
+        content="FillPac AI - Real-Time Bag Counting and Print Detection Dashboard"
+    >
+
+    <title>
+        FillPac AI | Production Vision Dashboard
+    </title>
+
+    <!-- =====================================================
+         FONT
+    ====================================================== -->
+
+    <link
+        rel="preconnect"
+        href="https://fonts.googleapis.com"
+    >
+
+    <link
+        rel="preconnect"
+        href="https://fonts.gstatic.com"
+        crossorigin
+    >
+
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+        rel="stylesheet"
+    >
+
+    <!-- =====================================================
+         ICONS
+    ====================================================== -->
+
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    >
+
+    <!-- =====================================================
+         DASHBOARD CSS
+    ====================================================== -->
+
+    <link
+        rel="stylesheet"
+        href="css/dashboard.css"
+    >
+</head>
+
+
+<body>
+
+<!-- =========================================================
+     APPLICATION
+========================================================= -->
+
+<div class="app-container">
+
+
+    <!-- =====================================================
+         TOP HEADER
+    ====================================================== -->
+
+    <header class="top-header">
+
+
+        <!-- LEFT SECTION -->
+
+        <div class="header-left">
+
+            <!-- Logo Placeholder -->
+
+            <div class="company-logo">
+
+                <div class="logo-placeholder">
+
+                    <i class="fa-solid fa-industry"></i>
+
+                    <span>
+                        COMPANY LOGO
+                    </span>
+
+                </div>
+
+            </div>
+
+
+            <!-- Application Identity -->
+
+            <div class="application-title">
+
+                <h1>
+                    FillPac AI
+                </h1>
+
+                <span>
+                    Production Vision Dashboard
+                </span>
+
+            </div>
+
+        </div>
+
+
+        <!-- CENTER LOGO -->
+
+        <div class="header-center">
+
+            <div class="customer-logo-placeholder">
+
+                CUSTOMER
+                <br>
+                LOGO
+
+            </div>
+
+        </div>
+
+
+        <!-- RIGHT SECTION -->
+
+        <div class="header-right">
+
+
+            <!-- System Status -->
+
+            <div
+                class="system-status online"
+                id="systemStatus"
+            >
+
+                <span class="status-dot"></span>
+
+                <span id="systemStatusText">
+                    SYSTEM ONLINE
+                </span>
+
+            </div>
+
+
+            <!-- Time -->
+
+            <div class="datetime-container">
+
+                <strong id="currentTime">
+                    --:--:--
+                </strong>
+
+                <span id="currentDate">
+                    -- --- ----
+                </span>
+
+            </div>
+
+
+            <!-- User -->
+
+            <button class="header-icon-button">
+
+                <i class="fa-solid fa-user"></i>
+
+            </button>
+
+
+            <!-- Fullscreen -->
+
+            <button
+                class="header-icon-button"
+                id="fullscreenButton"
+                title="Fullscreen"
+            >
+
+                <i class="fa-solid fa-expand"></i>
+
+            </button>
+
+        </div>
+
+    </header>
+
+
+    <!-- =====================================================
+         BODY
+    ====================================================== -->
+
+    <div class="app-body">
+
+
+        <!-- =================================================
+             SIDEBAR
+        ================================================== -->
+
+        <aside
+            class="sidebar"
+            id="sidebar"
+        >
+
+
+            <!-- DASHBOARD -->
+
+            <button
+                class="sidebar-item active"
+                data-page="dashboard"
+            >
+
+                <i class="fa-solid fa-table-columns"></i>
+
+                <span>
+                    Dashboard
+                </span>
+
+            </button>
+
+
+            <!-- LIVE MONITOR -->
+
+            <button
+                class="sidebar-item"
+                data-page="monitor"
+            >
+
+                <i class="fa-solid fa-video"></i>
+
+                <span>
+                    Live Monitor
+                </span>
+
+            </button>
+
+
+            <!-- PRODUCTION -->
+
+            <button
+                class="sidebar-item"
+                data-page="production"
+            >
+
+                <i class="fa-solid fa-industry"></i>
+
+                <span>
+                    Production
+                </span>
+
+            </button>
+
+
+            <!-- ANALYTICS -->
+
+            <button
+                class="sidebar-item"
+                data-page="analytics"
+            >
+
+                <i class="fa-solid fa-chart-line"></i>
+
+                <span>
+                    Analytics
+                </span>
+
+            </button>
+
+
+            <!-- EVENTS -->
+
+            <button
+                class="sidebar-item"
+                data-page="events"
+            >
+
+                <i class="fa-solid fa-list-check"></i>
+
+                <span>
+                    Events
+                </span>
+
+            </button>
+
+
+            <!-- CAMERAS -->
+
+            <button
+                class="sidebar-item"
+                data-page="cameras"
+            >
+
+                <i class="fa-solid fa-camera"></i>
+
+                <span>
+                    Cameras
+                </span>
+
+            </button>
+
+
+            <!-- SETTINGS -->
+
+            <button
+                class="sidebar-item"
+                data-page="settings"
+            >
+
+                <i class="fa-solid fa-gear"></i>
+
+                <span>
+                    Settings
+                </span>
+
+            </button>
+
+
+            <!-- SIDEBAR FOOTER -->
+
+            <div class="sidebar-footer">
+
+                <div class="ai-status">
+
+                    <div class="ai-status-icon">
+
+                        <i class="fa-solid fa-brain"></i>
+
+                    </div>
+
+                    <div>
+
+                        <strong>
+                            AI Engine
+                        </strong>
+
+                        <span id="modelStatus">
+                            Checking...
+                        </span>
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </aside>
+
+
+        <!-- =================================================
+             MAIN CONTENT
+        ================================================== -->
+
+        <main class="main-content">
+
+
+            <!-- =============================================
+                 PAGE HEADER
+            ============================================== -->
+
+            <section class="page-header">
+
+                <div>
+
+                    <h2>
+                        Production Overview
+                    </h2>
+
+                    <p>
+                        Real-time bag counting and print detection monitoring
+                    </p>
+
+                </div>
+
+
+                <div class="page-actions">
+
+                    <button
+                        class="secondary-button"
+                        id="refreshButton"
+                    >
+
+                        <i class="fa-solid fa-rotate"></i>
+
+                        Refresh
+
+                    </button>
+
+
+                    <button
+                        class="primary-button"
+                        id="exportButton"
+                    >
+
+                        <i class="fa-solid fa-download"></i>
+
+                        Export
+
+                    </button>
+
+                </div>
+
+            </section>
+
+
+            <!-- =============================================
+                 FILTER SECTION
+            ============================================== -->
+
+            <section class="filter-panel">
+
+
+                <div class="filter-header">
+
+                    <div>
+
+                        <i class="fa-solid fa-filter"></i>
+
+                        <strong>
+                            Production Filters
+                        </strong>
+
+                    </div>
+
+
+                    <button
+                        class="text-button"
+                        id="resetFilters"
+                    >
+
+                        Reset Filters
+
+                    </button>
+
+                </div>
+
+
+                <div class="filter-grid">
+
+
+                    <!-- START DATE -->
+
+                    <div class="filter-group">
+
+                        <label for="startDate">
+                            Start Date
+                        </label>
+
+                        <input
+                            type="datetime-local"
+                            id="startDate"
+                        >
+
+                    </div>
+
+
+                    <!-- END DATE -->
+
+                    <div class="filter-group">
+
+                        <label for="endDate">
+                            End Date
+                        </label>
+
+                        <input
+                            type="datetime-local"
+                            id="endDate"
+                        >
+
+                    </div>
+
+
+                    <!-- CAMERA -->
+
+                    <div class="filter-group">
+
+                        <label for="cameraFilter">
+                            Camera
+                        </label>
+
+                        <select id="cameraFilter">
+
+                            <option value="all">
+                                All Cameras
+                            </option>
+
+                            <option value="Camera 1">
+                                Camera 1
+                            </option>
+
+                            <option value="Camera 2">
+                                Camera 2
+                            </option>
+
+                            <option value="Camera 3">
+                                Camera 3
+                            </option>
+
+                            <option value="Camera 4">
+                                Camera 4
+                            </option>
+
+                        </select>
+
+                    </div>
+
+
+                    <!-- PRINT STATUS -->
+
+                    <div class="filter-group">
+
+                        <label for="printFilter">
+                            Print Status
+                        </label>
+
+                        <select id="printFilter">
+
+                            <option value="all">
+                                All Status
+                            </option>
+
+                            <option value="printed">
+                                Printed
+                            </option>
+
+                            <option value="missing">
+                                Not Printed
+                            </option>
+
+                            <option value="unknown">
+                                Unknown
+                            </option>
+
+                        </select>
+
+                    </div>
+
+
+                    <!-- SHIFT -->
+
+                    <div class="filter-group">
+
+                        <label for="shiftFilter">
+                            Shift
+                        </label>
+
+                        <select id="shiftFilter">
+
+                            <option value="all">
+                                All Shifts
+                            </option>
+
+                            <option value="A">
+                                Shift A
+                            </option>
+
+                            <option value="B">
+                                Shift B
+                            </option>
+
+                            <option value="C">
+                                Shift C
+                            </option>
+
+                        </select>
+
+                    </div>
+
+
+                    <!-- RECORDS -->
+
+                    <div class="filter-group">
+
+                        <label for="recordLimit">
+                            Last Records
+                        </label>
+
+                        <select id="recordLimit">
+
+                            <option value="50">
+                                50
+                            </option>
+
+                            <option
+                                value="100"
+                                selected
+                            >
+                                100
+                            </option>
+
+                            <option value="250">
+                                250
+                            </option>
+
+                            <option value="500">
+                                500
+                            </option>
+
+                        </select>
+
+                    </div>
+
+
+                    <!-- APPLY -->
+
+                    <div class="filter-action">
+
+                        <button
+                            class="primary-button full-button"
+                            id="applyFilters"
+                        >
+
+                            <i class="fa-solid fa-filter"></i>
+
+                            Apply Filters
+
+                        </button>
+
+                    </div>
+
+                </div>
+
+            </section>
+
+
+            <!-- =============================================
+                 KPI CARDS
+            ============================================== -->
+
+            <section class="kpi-grid">
+
+
+                <!-- TOTAL BAGS -->
+
+                <article class="kpi-card">
+
+                    <div class="kpi-icon blue">
+
+                        <i class="fa-solid fa-box"></i>
+
+                    </div>
+
+                    <div class="kpi-content">
+
+                        <span class="kpi-label">
+                            Total Bags
+                        </span>
+
+                        <strong
+                            class="kpi-value"
+                            id="totalBags"
+                        >
+                            0
+                        </strong>
+
+                        <span class="kpi-description">
+                            Total production count
+                        </span>
+
+                    </div>
+
+                </article>
+
+
+                <!-- PRINTED -->
+
+                <article class="kpi-card">
+
+                    <div class="kpi-icon green">
+
+                        <i class="fa-solid fa-circle-check"></i>
+
+                    </div>
+
+                    <div class="kpi-content">
+
+                        <span class="kpi-label">
+                            Printed Bags
+                        </span>
+
+                        <strong
+                            class="kpi-value"
+                            id="printedBags"
+                        >
+                            0
+                        </strong>
+
+                        <span class="kpi-description">
+                            Print detected successfully
+                        </span>
+
+                    </div>
+
+                </article>
+
+
+                <!-- NOT PRINTED -->
+
+                <article class="kpi-card">
+
+                    <div class="kpi-icon red">
+
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+
+                    </div>
+
+                    <div class="kpi-content">
+
+                        <span class="kpi-label">
+                            Not Printed
+                        </span>
+
+                        <strong
+                            class="kpi-value"
+                            id="missingBags"
+                        >
+                            0
+                        </strong>
+
+                        <span class="kpi-description">
+                            Print missing detection
+                        </span>
+
+                    </div>
+
+                </article>
+
+
+                <!-- PRINT RATE -->
+
+                <article class="kpi-card">
+
+                    <div class="kpi-icon purple">
+
+                        <i class="fa-solid fa-percent"></i>
+
+                    </div>
+
+                    <div class="kpi-content">
+
+                        <span class="kpi-label">
+                            Print Quality
+                        </span>
+
+                        <strong
+                            class="kpi-value"
+                            id="printQuality"
+                        >
+                            0%
+                        </strong>
+
+                        <span class="kpi-description">
+                            Successful print rate
+                        </span>
+
+                    </div>
+
+                </article>
+
+
+                <!-- ONLINE CAMERAS -->
+
+                <article class="kpi-card">
+
+                    <div class="kpi-icon teal">
+
+                        <i class="fa-solid fa-camera"></i>
+
+                    </div>
+
+                    <div class="kpi-content">
+
+                        <span class="kpi-label">
+                            Cameras Online
+                        </span>
+
+                        <strong
+                            class="kpi-value"
+                            id="onlineCameras"
+                        >
+                            0 / 4
+                        </strong>
+
+                        <span class="kpi-description">
+                            Vision system availability
+                        </span>
+
+                    </div>
+
+                </article>
+
+            </section>
+
+
+            <!-- =============================================
+                 CAMERA SECTION
+            ============================================== -->
+
+            <section class="section-container">
+
+
+                <div class="section-header">
+
+                    <div>
+
+                        <h3>
+                            Camera Production Status
+                        </h3>
+
+                        <p>
+                            Live status from all FillPac AI cameras
+                        </p>
+
+                    </div>
+
+
+                    <div class="live-indicator">
+
+                        <span class="live-dot"></span>
+
+                        LIVE
+
+                    </div>
+
+                </div>
+
+
+                <div
+                    class="camera-grid"
+                    id="cameraGrid"
+                >
+
+
+                    <!-- CAMERA 1 -->
+
+                    <article
+                        class="camera-card"
+                        id="camera-card-1"
+                    >
+
+                        <div class="camera-card-header">
+
+                            <div>
+
+                                <span class="camera-number">
+                                    CAM 01
+                                </span>
+
+                                <h4>
+                                    Camera 1
+                                </h4>
+
+                            </div>
+
+                            <span
+                                class="camera-status offline"
+                                id="camera1Status"
+                            >
+                                OFFLINE
+                            </span>
+
+                        </div>
+
+
+                        <div class="camera-metrics">
+
+                            <div>
+
+                                <span>
+                                    Total Bags
+                                </span>
+
+                                <strong id="camera1Count">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Printed
+                                </span>
+
+                                <strong id="camera1Printed">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Not Printed
+                                </span>
+
+                                <strong id="camera1Missing">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    FPS
+                                </span>
+
+                                <strong id="camera1Fps">
+                                    0.0
+                                </strong>
+
+                            </div>
+
+                        </div>
+
+                    </article>
+
+
+                    <!-- CAMERA 2 -->
+
+                    <article
+                        class="camera-card"
+                        id="camera-card-2"
+                    >
+
+                        <div class="camera-card-header">
+
+                            <div>
+
+                                <span class="camera-number">
+                                    CAM 02
+                                </span>
+
+                                <h4>
+                                    Camera 2
+                                </h4>
+
+                            </div>
+
+                            <span
+                                class="camera-status offline"
+                                id="camera2Status"
+                            >
+                                OFFLINE
+                            </span>
+
+                        </div>
+
+
+                        <div class="camera-metrics">
+
+                            <div>
+
+                                <span>
+                                    Total Bags
+                                </span>
+
+                                <strong id="camera2Count">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Printed
+                                </span>
+
+                                <strong id="camera2Printed">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Not Printed
+                                </span>
+
+                                <strong id="camera2Missing">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    FPS
+                                </span>
+
+                                <strong id="camera2Fps">
+                                    0.0
+                                </strong>
+
+                            </div>
+
+                        </div>
+
+                    </article>
+
+
+                    <!-- CAMERA 3 -->
+
+                    <article
+                        class="camera-card"
+                        id="camera-card-3"
+                    >
+
+                        <div class="camera-card-header">
+
+                            <div>
+
+                                <span class="camera-number">
+                                    CAM 03
+                                </span>
+
+                                <h4>
+                                    Camera 3
+                                </h4>
+
+                            </div>
+
+                            <span
+                                class="camera-status offline"
+                                id="camera3Status"
+                            >
+                                OFFLINE
+                            </span>
+
+                        </div>
+
+
+                        <div class="camera-metrics">
+
+                            <div>
+
+                                <span>
+                                    Total Bags
+                                </span>
+
+                                <strong id="camera3Count">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Printed
+                                </span>
+
+                                <strong id="camera3Printed">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Not Printed
+                                </span>
+
+                                <strong id="camera3Missing">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    FPS
+                                </span>
+
+                                <strong id="camera3Fps">
+                                    0.0
+                                </strong>
+
+                            </div>
+
+                        </div>
+
+                    </article>
+
+
+                    <!-- CAMERA 4 -->
+
+                    <article
+                        class="camera-card"
+                        id="camera-card-4"
+                    >
+
+                        <div class="camera-card-header">
+
+                            <div>
+
+                                <span class="camera-number">
+                                    CAM 04
+                                </span>
+
+                                <h4>
+                                    Camera 4
+                                </h4>
+
+                            </div>
+
+                            <span
+                                class="camera-status offline"
+                                id="camera4Status"
+                            >
+                                OFFLINE
+                            </span>
+
+                        </div>
+
+
+                        <div class="camera-metrics">
+
+                            <div>
+
+                                <span>
+                                    Total Bags
+                                </span>
+
+                                <strong id="camera4Count">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Printed
+                                </span>
+
+                                <strong id="camera4Printed">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    Not Printed
+                                </span>
+
+                                <strong id="camera4Missing">
+                                    0
+                                </strong>
+
+                            </div>
+
+
+                            <div>
+
+                                <span>
+                                    FPS
+                                </span>
+
+                                <strong id="camera4Fps">
+                                    0.0
+                                </strong>
+
+                            </div>
+
+                        </div>
+
+                    </article>
+
+
+                </div>
+
+            </section>
+
+
+            <!-- =============================================
+                 ANALYTICS
+            ============================================== -->
+
+            <section class="analytics-grid">
+
+
+                <!-- PRODUCTION TREND -->
+
+                <article class="chart-card">
+
+                    <div class="chart-header">
+
+                        <div>
+
+                            <h3>
+                                Production Trend
+                            </h3>
+
+                            <p>
+                                Bag production over time
+                            </p>
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="chart-container">
+
+                        <canvas id="productionChart"></canvas>
+
+                    </div>
+
+                </article>
+
+
+                <!-- PRINT QUALITY -->
+
+                <article class="chart-card">
+
+                    <div class="chart-header">
+
+                        <div>
+
+                            <h3>
+                                Print Quality
+                            </h3>
+
+                            <p>
+                                Printed vs not printed bags
+                            </p>
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="chart-container donut-container">
+
+                        <canvas id="printChart"></canvas>
+
+                    </div>
+
+                </article>
+
+
+            </section>
+
+
+            <!-- =============================================
+                 RECENT EVENTS
+            ============================================== -->
+
+            <section class="section-container">
+
+
+                <div class="section-header">
+
+                    <div>
+
+                        <h3>
+                            Recent Bag Events
+                        </h3>
+
+                        <p>
+                            Latest production and print detection events
+                        </p>
+
+                    </div>
+
+
+                    <button class="secondary-button">
+
+                        <i class="fa-solid fa-file-csv"></i>
+
+                        Export CSV
+
+                    </button>
+
+                </div>
+
+
+                <div class="table-wrapper">
+
+                    <table class="event-table">
+
+                        <thead>
+
+                            <tr>
+
+                                <th>
+                                    Time
+                                </th>
+
+                                <th>
+                                    Camera
+                                </th>
+
+                                <th>
+                                    Total Count
+                                </th>
+
+                                <th>
+                                    Print Status
+                                </th>
+
+                                <th>
+                                    FPS
+                                </th>
+
+                                <th>
+                                    Camera Status
+                                </th>
+
+                            </tr>
+
+                        </thead>
+
+
+                        <tbody id="eventTableBody">
+
+                            <tr class="empty-row">
+
+                                <td colspan="6">
+
+                                    <div class="empty-state">
+
+                                        <i class="fa-solid fa-box-open"></i>
+
+                                        <span>
+                                            Waiting for production events...
+                                        </span>
+
+                                    </div>
+
+                                </td>
+
+                            </tr>
+
+                        </tbody>
+
+                    </table>
+
+                </div>
+
+            </section>
+
+
+            <!-- =============================================
+                 SYSTEM HEALTH
+            ============================================== -->
+
+            <section class="system-health">
+
+
+                <div class="health-item">
+
+                    <span class="health-dot"></span>
+
+                    <div>
+
+                        <span>
+                            AI Model
+                        </span>
+
+                        <strong id="healthModel">
+                            Checking
+                        </strong>
+
+                    </div>
+
+                </div>
+
+
+                <div class="health-item">
+
+                    <span class="health-dot"></span>
+
+                    <div>
+
+                        <span>
+                            Dashboard
+                        </span>
+
+                        <strong id="healthDashboard">
+                            Connected
+                        </strong>
+
+                    </div>
+
+                </div>
+
+
+                <div class="health-item">
+
+                    <span class="health-dot"></span>
+
+                    <div>
+
+                        <span>
+                            Elasticsearch
+                        </span>
+
+                        <strong id="healthElasticsearch">
+                            Checking
+                        </strong>
+
+                    </div>
+
+                </div>
+
+
+                <div class="health-item">
+
+                    <span class="health-dot"></span>
+
+                    <div>
+
+                        <span>
+                            Socket Connection
+                        </span>
+
+                        <strong id="socketStatus">
+                            Connecting
+                        </strong>
+
+                    </div>
+
+                </div>
+
+
+            </section>
+
+
+            <!-- =============================================
+                 FOOTER
+            ============================================== -->
+
+            <footer class="dashboard-footer">
+
+                <span>
+                    FillPac AI Production Vision System
+                </span>
+
+                <span>
+                    Real-Time Bag Counting & Print Detection
+                </span>
+
+            </footer>
+
+
+        </main>
+
+    </div>
+
+</div>
+
+
+<!-- =========================================================
+     SOCKET.IO
+========================================================= -->
+
+<script
+    src="https://cdn.socket.io/4.7.5/socket.io.min.js"
+></script>
+
+
+<!-- =========================================================
+     CHART.JS
+========================================================= -->
+
+<script
+    src="https://cdn.jsdelivr.net/npm/chart.js"
+></script>
+
+
+<!-- =========================================================
+     DASHBOARD JAVASCRIPT
+========================================================= -->
+
+<script
+    src="js/dashboard.js"
+></script>
+
+
+</body>
+
+</html>
