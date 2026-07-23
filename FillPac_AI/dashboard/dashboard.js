@@ -1,8 +1,30 @@
 /*
 ==========================================================
 FillPac AI
-Production Dashboard
-Real-Time Frontend
+Production Vision Dashboard
+Frontend JavaScript
+==========================================================
+
+Purpose
+-------
+- Connect to FillPac AI Socket.IO dashboard backend
+- Receive real-time "dashboard_state" events
+- Update production KPIs
+- Update Camera 1-4 cards
+- Update system health
+- Update production charts
+- Handle filters
+- Handle refresh
+- Handle fullscreen
+- Export current dashboard data as CSV
+
+Backend
+-------
+Default URL:
+http://localhost:8000
+
+Socket Event:
+dashboard_state
 ==========================================================
 */
 
@@ -11,21 +33,15 @@ Real-Time Frontend
 // CONFIGURATION
 // ==========================================================
 
-const DASHBOARD_SERVER =
-    "http://localhost:8000";
+const DASHBOARD_SERVER = "http://localhost:8000";
 
-const SOCKET_EVENT =
-    "dashboard_state";
+const SOCKET_EVENT = "dashboard_state";
 
-const REST_POLL_INTERVAL =
-    1000;
-
-const MAX_CHART_POINTS =
-    30;
+const MAX_CHART_POINTS = 30;
 
 
 // ==========================================================
-// STATE
+// APPLICATION STATE
 // ==========================================================
 
 let currentDashboardState = null;
@@ -40,35 +56,22 @@ let previousCameraState = {};
 
 let recentEvents = [];
 
-let restPollTimer = null;
-
 
 // ==========================================================
-// HELPERS
+// DOM HELPERS
 // ==========================================================
 
 function getElement(id) {
-
-    return document.getElementById(
-        id
-    );
-
+    return document.getElementById(id);
 }
 
 
-function setText(
-    id,
-    value
-) {
+function setText(id, value) {
 
-    const element =
-        getElement(id);
+    const element = getElement(id);
 
     if (element) {
-
-        element.textContent =
-            value;
-
+        element.textContent = value;
     }
 
 }
@@ -76,15 +79,10 @@ function setText(
 
 function safeNumber(value) {
 
-    const number =
-        Number(value);
+    const number = Number(value);
 
-    if (
-        !Number.isFinite(number)
-    ) {
-
+    if (!Number.isFinite(number)) {
         return 0;
-
     }
 
     return number;
@@ -94,28 +92,24 @@ function safeNumber(value) {
 
 function formatNumber(value) {
 
-    return safeNumber(
-        value
-    ).toLocaleString();
+    return safeNumber(value).toLocaleString();
 
 }
 
 
 // ==========================================================
-// INITIALIZE
+// INITIALIZE DASHBOARD
 // ==========================================================
 
 document.addEventListener(
     "DOMContentLoaded",
     () => {
 
-        console.log(
-            "Starting FillPac AI Dashboard..."
-        );
-
         initializeClock();
 
         initializeCharts();
+
+        initializeSocket();
 
         initializeControls();
 
@@ -123,13 +117,7 @@ document.addEventListener(
 
         initializeDefaultDates();
 
-        initializeSocket();
-
-        // Initial REST request
-        loadDashboardState();
-
-        // REST fallback
-        startRestPolling();
+        loadInitialState();
 
     }
 );
@@ -153,33 +141,34 @@ function initializeClock() {
 
 function updateClock() {
 
-    const now =
-        new Date();
+    const now = new Date();
 
-    const time =
-        now.toLocaleTimeString(
-            [],
-            {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit"
-            }
-        );
 
-    const date =
-        now.toLocaleDateString(
-            [],
-            {
-                day: "2-digit",
-                month: "short",
-                year: "numeric"
-            }
-        );
+    const time = now.toLocaleTimeString(
+        [],
+        {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        }
+    );
+
+
+    const date = now.toLocaleDateString(
+        [],
+        {
+            day: "2-digit",
+            month: "short",
+            year: "numeric"
+        }
+    );
+
 
     setText(
         "currentTime",
         time
     );
+
 
     setText(
         "currentDate",
@@ -190,30 +179,26 @@ function updateClock() {
 
 
 // ==========================================================
-// DEFAULT DATES
+// INITIAL DEFAULT FILTER DATES
 // ==========================================================
 
 function initializeDefaultDates() {
 
-    const endDate =
-        new Date();
+    const endDate = new Date();
 
-    const startDate =
-        new Date();
+    const startDate = new Date();
 
     startDate.setHours(
         startDate.getHours() - 24
     );
 
+
     const startInput =
-        getElement(
-            "startDate"
-        );
+        getElement("startDate");
 
     const endInput =
-        getElement(
-            "endDate"
-        );
+        getElement("endDate");
+
 
     if (startInput) {
 
@@ -223,6 +208,7 @@ function initializeDefaultDates() {
             );
 
     }
+
 
     if (endInput) {
 
@@ -244,8 +230,7 @@ function formatDateTimeLocal(date) {
     const localDate =
         new Date(
             date.getTime()
-            -
-            offset * 60000
+            - offset * 60000
         );
 
     return localDate
@@ -259,28 +244,21 @@ function formatDateTimeLocal(date) {
 
 
 // ==========================================================
-// REST
+// LOAD INITIAL STATE USING REST
 // ==========================================================
 
-async function loadDashboardState() {
+async function loadInitialState() {
 
     try {
 
         const response =
             await fetch(
-
-                `${DASHBOARD_SERVER}/state?ts=${Date.now()}`,
-
+                `${DASHBOARD_SERVER}/state`,
                 {
-                    method: "GET",
-                    cache: "no-store",
-                    headers: {
-                        "Cache-Control":
-                            "no-cache"
-                    }
+                    cache: "no-store"
                 }
-
             );
+
 
         if (!response.ok) {
 
@@ -290,54 +268,27 @@ async function loadDashboardState() {
 
         }
 
+
         const state =
             await response.json();
+
 
         updateDashboard(
             state
         );
-
-        return true;
 
     }
 
     catch (error) {
 
         console.warn(
-            "Dashboard REST error:",
+            "Could not load initial dashboard state:",
             error
         );
 
-        return false;
+        setSystemOffline();
 
     }
-
-}
-
-
-// ==========================================================
-// REST FALLBACK POLLING
-// ==========================================================
-
-function startRestPolling() {
-
-    if (restPollTimer) {
-
-        clearInterval(
-            restPollTimer
-        );
-
-    }
-
-    restPollTimer =
-        setInterval(
-            () => {
-
-                loadDashboardState();
-
-            },
-            REST_POLL_INTERVAL
-        );
 
 }
 
@@ -354,7 +305,7 @@ function initializeSocket() {
     ) {
 
         console.error(
-            "Socket.IO library unavailable."
+            "Socket.IO client library is not available."
         );
 
         setText(
@@ -362,19 +313,13 @@ function initializeSocket() {
             "Unavailable"
         );
 
-        updateHealthIndicator(
-            "socketStatus",
-            false
-        );
-
         return;
 
     }
 
+
     socket = io(
-
         DASHBOARD_SERVER,
-
         {
 
             transports: [
@@ -382,8 +327,7 @@ function initializeSocket() {
                 "polling"
             ],
 
-            reconnection:
-                true,
+            reconnection: true,
 
             reconnectionAttempts:
                 Infinity,
@@ -398,12 +342,11 @@ function initializeSocket() {
                 10000
 
         }
-
     );
 
 
     // ======================================================
-    // CONNECT
+    // CONNECTED
     // ======================================================
 
     socket.on(
@@ -411,39 +354,32 @@ function initializeSocket() {
         () => {
 
             console.log(
-                "Socket.IO connected:",
-                socket.id
+                "Dashboard Socket.IO connected."
             );
+
 
             setText(
                 "socketStatus",
                 "Connected"
             );
 
+
             updateHealthIndicator(
                 "socketStatus",
                 true
             );
-
-            // Resync immediately
-            loadDashboardState();
 
         }
     );
 
 
     // ======================================================
-    // LIVE STATE
+    // DASHBOARD STATE
     // ======================================================
 
     socket.on(
         SOCKET_EVENT,
-        state => {
-
-            console.log(
-                "Live dashboard update:",
-                state
-            );
+        (state) => {
 
             updateDashboard(
                 state
@@ -454,48 +390,53 @@ function initializeSocket() {
 
 
     // ======================================================
-    // DISCONNECT
+    // DISCONNECTED
     // ======================================================
 
     socket.on(
         "disconnect",
-        reason => {
+        (reason) => {
 
             console.warn(
-                "Socket disconnected:",
+                "Dashboard Socket.IO disconnected:",
                 reason
             );
+
 
             setText(
                 "socketStatus",
                 "Disconnected"
             );
 
+
             updateHealthIndicator(
                 "socketStatus",
                 false
             );
 
-    });
+        }
+    );
 
 
     // ======================================================
-    // ERROR
+    // CONNECTION ERROR
     // ======================================================
 
     socket.on(
         "connect_error",
-        error => {
+        (error) => {
 
             console.warn(
-                "Socket error:",
+                "Dashboard Socket.IO connection error:",
                 error.message
             );
+
 
             setText(
                 "socketStatus",
                 "Connection Error"
             );
+
 
             updateHealthIndicator(
                 "socketStatus",
@@ -509,7 +450,7 @@ function initializeSocket() {
 
 
 // ==========================================================
-// UPDATE DASHBOARD
+// MAIN DASHBOARD UPDATE
 // ==========================================================
 
 function updateDashboard(state) {
@@ -517,35 +458,43 @@ function updateDashboard(state) {
     if (
         !state
         ||
-        typeof state !== "object"
+        typeof state
+        !== "object"
     ) {
 
         return;
 
     }
 
+
     currentDashboardState =
         state;
+
 
     updateSystemStatus(
         state
     );
 
+
     updateKPIs(
         state
     );
+
 
     updateCameraCards(
         state.cameras || {}
     );
 
+
     updateSystemHealth(
         state.service_status || {}
     );
 
+
     updateCharts(
         state
     );
+
 
     detectCameraEvents(
         state.cameras || {}
@@ -566,19 +515,23 @@ function updateSystemStatus(state) {
             || "offline"
         ).toLowerCase();
 
+
     const container =
         getElement(
             "systemStatus"
         );
 
+
     if (!container) {
         return;
     }
+
 
     container.classList.remove(
         "online",
         "offline"
     );
+
 
     if (
         status === "running"
@@ -592,6 +545,7 @@ function updateSystemStatus(state) {
             "online"
         );
 
+
         setText(
             "systemStatusText",
             "SYSTEM ONLINE"
@@ -604,6 +558,7 @@ function updateSystemStatus(state) {
         container.classList.add(
             "offline"
         );
+
 
         setText(
             "systemStatusText",
@@ -622,17 +577,20 @@ function setSystemOffline() {
             "systemStatus"
         );
 
+
     if (container) {
 
         container.classList.remove(
             "online"
         );
 
+
         container.classList.add(
             "offline"
         );
 
     }
+
 
     setText(
         "systemStatusText",
@@ -643,7 +601,7 @@ function setSystemOffline() {
 
 
 // ==========================================================
-// KPI
+// KPI UPDATE
 // ==========================================================
 
 function updateKPIs(state) {
@@ -653,12 +611,14 @@ function updateKPIs(state) {
             state.total_count
         );
 
+
     const printed =
         safeNumber(
             state.total_printed_count
             ??
             state.total_printed_bags_count
         );
+
 
     const missing =
         safeNumber(
@@ -667,9 +627,6 @@ function updateKPIs(state) {
             state.total_not_printed_bags_count
         );
 
-    // ======================================================
-    // TOTAL
-    // ======================================================
 
     setText(
         "totalBags",
@@ -678,12 +635,14 @@ function updateKPIs(state) {
         )
     );
 
+
     setText(
         "printedBags",
         formatNumber(
             printed
         )
     );
+
 
     setText(
         "missingBags",
@@ -694,30 +653,33 @@ function updateKPIs(state) {
 
 
     // ======================================================
-    // QUALITY
+    // PRINT QUALITY
     // ======================================================
 
-    const classified =
+    const classifiedTotal =
         printed
-        +
-        missing;
+        + missing;
 
-    let quality = 0;
+
+    let quality =
+        0;
+
 
     if (
-        classified > 0
+        classifiedTotal
+        > 0
     ) {
 
         quality =
             (
                 printed
                 /
-                classified
+                classifiedTotal
             )
-            *
-            100;
+            * 100;
 
     }
+
 
     setText(
         "printQuality",
@@ -726,47 +688,40 @@ function updateKPIs(state) {
 
 
     // ======================================================
-    // CAMERAS ONLINE
+    // ONLINE CAMERAS
     // ======================================================
 
     const cameras =
-        state.cameras || {};
+        state.cameras
+        || {};
+
 
     const cameraList =
         Object.values(
             cameras
         );
 
+
     const online =
         cameraList.filter(
-            camera => {
-
-                const status =
-                    String(
-                        camera.status || ""
-                    ).toLowerCase();
-
-                return (
-                    status === "online"
-                    ||
-                    status === "running"
-                    ||
-                    status === "active"
-                );
-
-            }
+            camera =>
+                String(
+                    camera.status
+                    || ""
+                ).toLowerCase()
+                === "online"
         ).length;
 
-    const configured =
+
+    const configuredCameraCount =
         cameraList.length > 0
-            ?
-            cameraList.length
-            :
-            4;
+            ? cameraList.length
+            : 4;
+
 
     setText(
         "onlineCameras",
-        `${online} / ${configured}`
+        `${online} / ${configuredCameraCount}`
     );
 
 }
@@ -776,25 +731,27 @@ function updateKPIs(state) {
 // CAMERA CARDS
 // ==========================================================
 
-function updateCameraCards(cameras) {
+function updateCameraCards(
+    cameras
+) {
 
     for (
-        let number = 1;
-        number <= 4;
-        number++
+        let cameraNumber = 1;
+        cameraNumber <= 4;
+        cameraNumber++
     ) {
 
         const cameraName =
-            `Camera ${number}`;
+            `Camera ${cameraNumber}`;
+
 
         const camera =
-            cameras[
-                cameraName
-            ]
+            cameras[cameraName]
             || {};
 
+
         updateSingleCamera(
-            number,
+            cameraNumber,
             camera
         );
 
@@ -817,12 +774,14 @@ function updateSingleCamera(
             camera.count
         );
 
+
     const printed =
         safeNumber(
             camera.printed_count
             ??
             camera.printed_bags_count
         );
+
 
     const missing =
         safeNumber(
@@ -831,16 +790,17 @@ function updateSingleCamera(
             camera.not_printed_bags_count
         );
 
+
     const fps =
         safeNumber(
             camera.fps
         );
 
+
     const status =
         String(
             camera.status
-            ||
-            "offline"
+            || "offline"
         ).toLowerCase();
 
 
@@ -855,12 +815,14 @@ function updateSingleCamera(
         )
     );
 
+
     setText(
         `camera${cameraNumber}Printed`,
         formatNumber(
             printed
         )
     );
+
 
     setText(
         `camera${cameraNumber}Missing`,
@@ -869,11 +831,10 @@ function updateSingleCamera(
         )
     );
 
+
     setText(
         `camera${cameraNumber}Fps`,
-        fps.toFixed(
-            1
-        )
+        fps.toFixed(1)
     );
 
 
@@ -886,44 +847,44 @@ function updateSingleCamera(
             `camera${cameraNumber}Status`
         );
 
-    if (!statusElement) {
-        return;
-    }
 
-    statusElement.classList.remove(
-        "online",
-        "offline"
-    );
+    if (
+        statusElement
+    ) {
 
-    const isOnline = (
-
-        status === "online"
-        ||
-        status === "running"
-        ||
-        status === "active"
-
-    );
-
-    if (isOnline) {
-
-        statusElement.classList.add(
-            "online"
-        );
-
-        statusElement.textContent =
-            "ONLINE";
-
-    }
-
-    else {
-
-        statusElement.classList.add(
+        statusElement.classList.remove(
+            "online",
             "offline"
         );
 
-        statusElement.textContent =
-            status.toUpperCase();
+
+        if (
+            status === "online"
+            ||
+            status === "running"
+        ) {
+
+            statusElement.classList.add(
+                "online"
+            );
+
+
+            statusElement.textContent =
+                "ONLINE";
+
+        }
+
+        else {
+
+            statusElement.classList.add(
+                "offline"
+            );
+
+
+            statusElement.textContent =
+                status.toUpperCase();
+
+        }
 
     }
 
@@ -935,121 +896,174 @@ function updateSingleCamera(
 // ==========================================================
 
 function updateSystemHealth(
-    health
+    serviceStatus
 ) {
 
     const modelLoaded =
         Boolean(
-            health.model_loaded
+            serviceStatus.model_loaded
         );
 
-    const inferenceRunning =
-        Boolean(
-            health.inference_manager_running
-        );
+
+    const dashboardEnabled =
+        serviceStatus.dashboard_enabled
+        !== false;
+
 
     const elasticsearchConnected =
         Boolean(
-            health.elasticsearch_connected
+            serviceStatus.elasticsearch_connected
         );
 
 
-    setHealthValue(
+    // ======================================================
+    // MODEL
+    // ======================================================
+
+    setText(
         "healthModel",
-        modelLoaded,
         modelLoaded
             ? "Loaded"
-            : "Not Loaded"
+            : "Unavailable"
     );
 
 
-    setHealthValue(
-        "healthInference",
-        inferenceRunning,
-        inferenceRunning
-            ? "Running"
-            : "Stopped"
+    setText(
+        "modelStatus",
+        modelLoaded
+            ? "Model Loaded"
+            : "Model Offline"
     );
 
 
-    setHealthValue(
+    updateHealthIndicator(
+        "healthModel",
+        modelLoaded
+    );
+
+
+    // ======================================================
+    // DASHBOARD
+    // ======================================================
+
+    setText(
+        "healthDashboard",
+        dashboardEnabled
+            ? "Enabled"
+            : "Disabled"
+    );
+
+
+    updateHealthIndicator(
+        "healthDashboard",
+        dashboardEnabled
+    );
+
+
+    // ======================================================
+    // ELASTICSEARCH
+    // ======================================================
+
+    setText(
         "healthElasticsearch",
-        elasticsearchConnected,
         elasticsearchConnected
             ? "Connected"
             : "Disconnected"
     );
 
-}
-
-
-// ==========================================================
-// HEALTH HELPER
-// ==========================================================
-
-function setHealthValue(
-    id,
-    healthy,
-    text
-) {
-
-    setText(
-        id,
-        text
-    );
 
     updateHealthIndicator(
-        id,
-        healthy
+        "healthElasticsearch",
+        elasticsearchConnected
     );
 
 }
 
 
+// ==========================================================
+// HEALTH INDICATOR
+// ==========================================================
+
 function updateHealthIndicator(
-    id,
+    elementId,
     healthy
 ) {
 
     const element =
         getElement(
-            id
+            elementId
         );
+
 
     if (!element) {
         return;
     }
+
 
     const healthItem =
         element.closest(
             ".health-item"
         );
 
+
     if (!healthItem) {
         return;
     }
 
-    healthItem.classList.remove(
-        "healthy",
-        "unhealthy"
-    );
 
-    healthItem.classList.add(
-        healthy
-            ?
-            "healthy"
-            :
-            "unhealthy"
-    );
+    const dot =
+        healthItem.querySelector(
+            ".health-dot"
+        );
+
+
+    if (!dot) {
+        return;
+    }
+
+
+    if (healthy) {
+
+        dot.style.background =
+            "#22c55e";
+
+        dot.style.boxShadow =
+            "0 0 0 4px rgba(34, 197, 94, 0.12)";
+
+    }
+
+    else {
+
+        dot.style.background =
+            "#ef4444";
+
+        dot.style.boxShadow =
+            "0 0 0 4px rgba(239, 68, 68, 0.12)";
+
+    }
 
 }
 
 
 // ==========================================================
-// CHARTS
+// CHART INITIALIZATION
 // ==========================================================
 
 function initializeCharts() {
+
+    if (
+        typeof Chart
+        === "undefined"
+    ) {
+
+        console.warn(
+            "Chart.js is unavailable."
+        );
+
+        return;
+
+    }
+
 
     initializeProductionChart();
 
@@ -1069,15 +1083,11 @@ function initializeProductionChart() {
             "productionChart"
         );
 
-    if (
-        !canvas
-        ||
-        typeof Chart === "undefined"
-    ) {
 
+    if (!canvas) {
         return;
-
     }
+
 
     productionChart =
         new Chart(
@@ -1089,7 +1099,8 @@ function initializeProductionChart() {
 
                 data: {
 
-                    labels: [],
+                    labels:
+                        [],
 
                     datasets: [
 
@@ -1098,13 +1109,20 @@ function initializeProductionChart() {
                             label:
                                 "Total Bags",
 
-                            data: [],
+                            data:
+                                [],
+
+                            borderWidth:
+                                2,
 
                             tension:
-                                0.3,
+                                0.35,
 
                             fill:
-                                false
+                                false,
+
+                            pointRadius:
+                                2
 
                         }
 
@@ -1128,7 +1146,10 @@ function initializeProductionChart() {
                         legend: {
 
                             display:
-                                true
+                                true,
+
+                            position:
+                                "top"
 
                         }
 
@@ -1139,7 +1160,14 @@ function initializeProductionChart() {
                         y: {
 
                             beginAtZero:
-                                true
+                                true,
+
+                            ticks: {
+
+                                precision:
+                                    0
+
+                            }
 
                         }
 
@@ -1164,15 +1192,11 @@ function initializePrintChart() {
             "printChart"
         );
 
-    if (
-        !canvas
-        ||
-        typeof Chart === "undefined"
-    ) {
 
+    if (!canvas) {
         return;
-
     }
+
 
     printChart =
         new Chart(
@@ -1221,9 +1245,6 @@ function initializePrintChart() {
                     cutout:
                         "70%",
 
-                    animation:
-                        false,
-
                     plugins: {
 
                         legend: {
@@ -1247,12 +1268,15 @@ function initializePrintChart() {
 // UPDATE CHARTS
 // ==========================================================
 
-function updateCharts(state) {
+function updateCharts(
+    state
+) {
 
     const total =
         safeNumber(
             state.total_count
         );
+
 
     const printed =
         safeNumber(
@@ -1260,6 +1284,7 @@ function updateCharts(state) {
             ??
             state.total_printed_bags_count
         );
+
 
     const missing =
         safeNumber(
@@ -1270,26 +1295,29 @@ function updateCharts(state) {
 
 
     // ======================================================
-    // PRODUCTION
+    // PRODUCTION TREND
+    //
+    // NOTE:
+    // This is a live session trend.
+    // Historical production trends should later come from
+    // Elasticsearch.
     // ======================================================
 
-    if (productionChart) {
+    if (
+        productionChart
+    ) {
 
         const now =
             new Date()
                 .toLocaleTimeString(
                     [],
                     {
-                        hour:
-                            "2-digit",
-
-                        minute:
-                            "2-digit",
-
-                        second:
-                            "2-digit"
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit"
                     }
                 );
+
 
         productionChart
             .data
@@ -1297,6 +1325,7 @@ function updateCharts(state) {
             .push(
                 now
             );
+
 
         productionChart
             .data
@@ -1306,7 +1335,8 @@ function updateCharts(state) {
                 total
             );
 
-        while (
+
+        if (
             productionChart
                 .data
                 .labels
@@ -1320,6 +1350,7 @@ function updateCharts(state) {
                 .labels
                 .shift();
 
+
             productionChart
                 .data
                 .datasets[0]
@@ -1327,6 +1358,7 @@ function updateCharts(state) {
                 .shift();
 
         }
+
 
         productionChart.update(
             "none"
@@ -1336,10 +1368,12 @@ function updateCharts(state) {
 
 
     // ======================================================
-    // PRINT
+    // PRINT QUALITY CHART
     // ======================================================
 
-    if (printChart) {
+    if (
+        printChart
+    ) {
 
         printChart
             .data
@@ -1349,6 +1383,7 @@ function updateCharts(state) {
                 printed,
                 missing
             ];
+
 
         printChart.update(
             "none"
@@ -1360,7 +1395,7 @@ function updateCharts(state) {
 
 
 // ==========================================================
-// CAMERA EVENTS
+// DETECT NEW CAMERA EVENTS
 // ==========================================================
 
 function detectCameraEvents(
@@ -1382,17 +1417,22 @@ function detectCameraEvents(
                     cameraName
                 ];
 
-            if (previous) {
+
+            if (
+                previous
+            ) {
 
                 const currentCount =
                     safeNumber(
                         camera.count
                     );
 
+
                 const previousCount =
                     safeNumber(
                         previous.count
                     );
+
 
                 if (
                     currentCount
@@ -1408,6 +1448,7 @@ function detectCameraEvents(
                 }
 
             }
+
 
             previousCameraState[
                 cameraName
@@ -1434,7 +1475,7 @@ function detectCameraEvents(
 
 
 // ==========================================================
-// ADD EVENT
+// ADD RECENT EVENT
 // ==========================================================
 
 function addRecentEvent(
@@ -1444,6 +1485,10 @@ function addRecentEvent(
 
     const event = {
 
+        time:
+            new Date()
+                .toLocaleTimeString(),
+
         camera:
             cameraName,
 
@@ -1452,47 +1497,36 @@ function addRecentEvent(
                 camera.count
             ),
 
-        printed:
-            safeNumber(
-                camera.printed_count
-                ??
-                camera.printed_bags_count
-            ),
-
-        missing:
-            safeNumber(
-                camera.missing_count
-                ??
-                camera.not_printed_bags_count
-            ),
-
         printStatus:
             camera.print_status
-            || "-",
+            || "Unknown",
 
-        timestamp:
-            camera.updated_at
-            ||
-            new Date()
-                .toISOString()
+        fps:
+            safeNumber(
+                camera.fps
+            ).toFixed(1),
+
+        status:
+            camera.status
+            || "Unknown"
 
     };
+
 
     recentEvents.unshift(
         event
     );
 
+
     if (
-        recentEvents.length > 500
+        recentEvents.length
+        > 100
     ) {
 
-        recentEvents =
-            recentEvents.slice(
-                0,
-                500
-            );
+        recentEvents.pop();
 
     }
+
 
     renderRecentEvents();
 
@@ -1500,190 +1534,198 @@ function addRecentEvent(
 
 
 // ==========================================================
-// RENDER EVENTS
+// RENDER RECENT EVENTS
 // ==========================================================
 
 function renderRecentEvents() {
 
     const tableBody =
         getElement(
-            "eventsTableBody"
+            "eventTableBody"
         );
+
 
     if (!tableBody) {
         return;
     }
 
-    const cameraFilter =
-        getElement(
-            "cameraFilter"
-        )?.value
-        || "all";
-
-    const printFilter =
-        getElement(
-            "printFilter"
-        )?.value
-        || "all";
-
-    const recordLimit =
-        safeNumber(
-            getElement(
-                "recordLimit"
-            )?.value
-            || 100
-        );
-
-
-    let events =
-        [...recentEvents];
-
-
-    // ======================================================
-    // CAMERA FILTER
-    // ======================================================
 
     if (
-        cameraFilter !== "all"
+        recentEvents.length
+        === 0
     ) {
 
-        events =
-            events.filter(
-                event => {
+        tableBody.innerHTML = `
 
-                    return (
-                        event.camera
-                        ===
-                        cameraFilter
-                    );
+            <tr class="empty-row">
 
-                }
-            );
-
-    }
-
-
-    // ======================================================
-    // PRINT FILTER
-    // ======================================================
-
-    if (
-        printFilter !== "all"
-    ) {
-
-        events =
-            events.filter(
-                event => {
-
-                    const status =
-                        String(
-                            event.printStatus
-                            || ""
-                        ).toLowerCase();
-
-                    return (
-                        status
-                        ===
-                        printFilter.toLowerCase()
-                    );
-
-                }
-            );
-
-    }
-
-
-    events =
-        events.slice(
-            0,
-            recordLimit
-        );
-
-
-    // ======================================================
-    // EMPTY
-    // ======================================================
-
-    if (
-        events.length === 0
-    ) {
-
-        tableBody.innerHTML =
-            `
-            <tr>
                 <td colspan="6">
-                    No recent events
+
+                    <div class="empty-state">
+
+                        <i class="fa-solid fa-box-open"></i>
+
+                        <span>
+                            Waiting for production events...
+                        </span>
+
+                    </div>
+
                 </td>
+
             </tr>
-            `;
+
+        `;
 
         return;
 
     }
 
 
-    // ======================================================
-    // ROWS
-    // ======================================================
+    const selectedCamera =
+        getElement(
+            "cameraFilter"
+        )?.value
+        || "all";
 
-    tableBody.innerHTML =
-        events
-            .map(
+
+    const selectedPrint =
+        getElement(
+            "printFilter"
+        )?.value
+        || "all";
+
+
+    const limit =
+        safeNumber(
+            getElement(
+                "recordLimit"
+            )?.value
+        )
+        || 100;
+
+
+    let filtered =
+        recentEvents;
+
+
+    if (
+        selectedCamera
+        !== "all"
+    ) {
+
+        filtered =
+            filtered.filter(
+                event =>
+                    event.camera
+                    === selectedCamera
+            );
+
+    }
+
+
+    if (
+        selectedPrint
+        !== "all"
+    ) {
+
+        filtered =
+            filtered.filter(
                 event => {
 
-                    const time =
-                        new Date(
-                            event.timestamp
+                    const status =
+                        String(
+                            event.printStatus
                         )
-                        .toLocaleString();
+                        .toLowerCase();
 
-                    return `
-                        <tr>
-                            <td>${escapeHtml(time)}</td>
-                            <td>${escapeHtml(event.camera)}</td>
-                            <td>${event.count}</td>
-                            <td>${event.printed}</td>
-                            <td>${event.missing}</td>
-                            <td>${escapeHtml(event.printStatus)}</td>
-                        </tr>
-                    `;
+
+                    if (
+                        selectedPrint
+                        === "printed"
+                    ) {
+
+                        return (
+                            status
+                            === "printed"
+                            ||
+                            status
+                            === "print detected"
+                        );
+
+                    }
+
+
+                    if (
+                        selectedPrint
+                        === "missing"
+                    ) {
+
+                        return (
+                            status
+                            === "missing"
+                            ||
+                            status
+                            === "not printed"
+                        );
+
+                    }
+
+
+                    return (
+                        status
+                        === "unknown"
+                    );
 
                 }
+            );
+
+    }
+
+
+    filtered =
+        filtered.slice(
+            0,
+            limit
+        );
+
+
+    tableBody.innerHTML =
+        filtered
+            .map(
+                event => `
+
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(event.time)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(event.camera)}
+                        </td>
+
+                        <td>
+                            ${formatNumber(event.count)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(event.printStatus)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(event.fps)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(event.status)}
+                        </td>
+
+                    </tr>
+
+                `
             )
             .join("");
-
-}
-
-
-// ==========================================================
-// ESCAPE HTML
-// ==========================================================
-
-function escapeHtml(value) {
-
-    return String(
-        value
-    )
-        .replaceAll(
-            "&",
-            "&amp;"
-        )
-        .replaceAll(
-            "<",
-            "&lt;"
-        )
-        .replaceAll(
-            ">",
-            "&gt;"
-        )
-        .replaceAll(
-            '"',
-            "&quot;"
-        )
-        .replaceAll(
-            "'",
-            "&#039;"
-        );
 
 }
 
@@ -1694,17 +1736,25 @@ function escapeHtml(value) {
 
 function initializeControls() {
 
+    // ======================================================
+    // REFRESH
+    // ======================================================
+
     getElement(
         "refreshButton"
     )?.addEventListener(
         "click",
         () => {
 
-            loadDashboardState();
+            loadInitialState();
 
         }
     );
 
+
+    // ======================================================
+    // APPLY FILTERS
+    // ======================================================
 
     getElement(
         "applyFilters"
@@ -1718,6 +1768,10 @@ function initializeControls() {
     );
 
 
+    // ======================================================
+    // RESET FILTERS
+    // ======================================================
+
     getElement(
         "resetFilters"
     )?.addEventListener(
@@ -1730,6 +1784,10 @@ function initializeControls() {
     );
 
 
+    // ======================================================
+    // EXPORT
+    // ======================================================
+
     getElement(
         "exportButton"
     )?.addEventListener(
@@ -1741,6 +1799,10 @@ function initializeControls() {
         }
     );
 
+
+    // ======================================================
+    // FULLSCREEN
+    // ======================================================
 
     getElement(
         "fullscreenButton"
@@ -1757,10 +1819,21 @@ function initializeControls() {
 
 
 // ==========================================================
-// FILTER
+// APPLY FILTERS
 // ==========================================================
 
 function applyFilters() {
+
+    /*
+    IMPORTANT:
+
+    Current filters affect the live recent-events table.
+
+    Date range and shift filters require historical production
+    data from Elasticsearch.
+
+    They should not artificially modify current live counters.
+    */
 
     renderRecentEvents();
 
@@ -1768,7 +1841,7 @@ function applyFilters() {
 
 
 // ==========================================================
-// RESET FILTER
+// RESET FILTERS
 // ==========================================================
 
 function resetFilters() {
@@ -1778,15 +1851,18 @@ function resetFilters() {
             "cameraFilter"
         );
 
+
     const printFilter =
         getElement(
             "printFilter"
         );
 
+
     const shiftFilter =
         getElement(
             "shiftFilter"
         );
+
 
     const recordLimit =
         getElement(
@@ -1794,7 +1870,9 @@ function resetFilters() {
         );
 
 
-    if (cameraFilter) {
+    if (
+        cameraFilter
+    ) {
 
         cameraFilter.value =
             "all";
@@ -1802,7 +1880,9 @@ function resetFilters() {
     }
 
 
-    if (printFilter) {
+    if (
+        printFilter
+    ) {
 
         printFilter.value =
             "all";
@@ -1810,7 +1890,9 @@ function resetFilters() {
     }
 
 
-    if (shiftFilter) {
+    if (
+        shiftFilter
+    ) {
 
         shiftFilter.value =
             "all";
@@ -1818,7 +1900,9 @@ function resetFilters() {
     }
 
 
-    if (recordLimit) {
+    if (
+        recordLimit
+    ) {
 
         recordLimit.value =
             "100";
@@ -1844,6 +1928,7 @@ function initializeSidebar() {
             ".sidebar-item"
         );
 
+
     items.forEach(
         item => {
 
@@ -1862,6 +1947,7 @@ function initializeSidebar() {
 
                         }
                     );
+
 
                     item
                         .classList
@@ -1908,7 +1994,7 @@ async function toggleFullscreen() {
     catch (error) {
 
         console.warn(
-            "Fullscreen failed:",
+            "Fullscreen operation failed:",
             error
         );
 
@@ -1918,7 +2004,7 @@ async function toggleFullscreen() {
 
 
 // ==========================================================
-// EXPORT CSV
+// EXPORT DASHBOARD CSV
 // ==========================================================
 
 function exportDashboardCSV() {
@@ -1928,7 +2014,7 @@ function exportDashboardCSV() {
     ) {
 
         console.warn(
-            "No dashboard data."
+            "No dashboard data available for export."
         );
 
         return;
@@ -2012,32 +2098,21 @@ function exportDashboardCSV() {
     const csv =
         rows
             .map(
-                row => {
-
-                    return row
+                row =>
+                    row
                         .map(
-                            value => {
-
-                                return (
-                                    `"${String(value)
-                                        .replaceAll(
-                                            '"',
-                                            '""'
-                                        )}"`
-                                );
-
-                            }
+                            escapeCSV
                         )
-                        .join(",");
-
-                }
+                        .join(",")
             )
             .join("\n");
 
 
     const blob =
         new Blob(
-            [csv],
+            [
+                csv
+            ],
             {
                 type:
                     "text/csv;charset=utf-8;"
@@ -2062,24 +2137,114 @@ function exportDashboardCSV() {
 
 
     link.download =
-        `fillpac_dashboard_${Date.now()}.csv`;
+        `fillpac-dashboard-${createFileTimestamp()}.csv`;
 
 
-    document.body.appendChild(
-        link
-    );
+    document.body
+        .appendChild(
+            link
+        );
 
 
     link.click();
 
 
-    document.body.removeChild(
-        link
-    );
+    document.body
+        .removeChild(
+            link
+        );
 
 
     URL.revokeObjectURL(
         url
     );
+
+}
+
+
+// ==========================================================
+// CSV ESCAPE
+// ==========================================================
+
+function escapeCSV(
+    value
+) {
+
+    const stringValue =
+        String(
+            value
+            ?? ""
+        );
+
+
+    if (
+        stringValue.includes(",")
+        ||
+        stringValue.includes("\"")
+        ||
+        stringValue.includes("\n")
+    ) {
+
+        return (
+            "\""
+            +
+            stringValue.replace(
+                /"/g,
+                "\"\""
+            )
+            +
+            "\""
+        );
+
+    }
+
+
+    return stringValue;
+
+}
+
+
+// ==========================================================
+// HTML ESCAPE
+// ==========================================================
+
+function escapeHtml(
+    value
+) {
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+
+    div.textContent =
+        String(
+            value
+            ?? ""
+        );
+
+
+    return div.innerHTML;
+
+}
+
+
+// ==========================================================
+// FILE TIMESTAMP
+// ==========================================================
+
+function createFileTimestamp() {
+
+    const now =
+        new Date();
+
+
+    return now
+        .toISOString()
+        .replace(
+            /[:.]/g,
+            "-"
+        );
 
 }

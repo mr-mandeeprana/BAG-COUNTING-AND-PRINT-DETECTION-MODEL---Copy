@@ -280,6 +280,15 @@ class InferenceManager:
 
             self.total_requests += 1
 
+            # Log queue size to detect overload
+            queue_size = len(self._pending_requests)
+
+            if queue_size > 5:
+                self._log(
+                    "warning",
+                    f"Inference queue size {queue_size} (camera: {camera_name})",
+                )
+
             # Wake inference worker
             self._condition.notify()
 
@@ -340,7 +349,7 @@ class InferenceManager:
         self,
         camera_name,
         frame,
-        timeout=5.0,
+        timeout=15.0,
     ):
         """
         Submit a frame and wait for its inference result.
@@ -568,6 +577,13 @@ class InferenceManager:
             )
 
             self.total_inferences += 1
+
+            # Log slow inference
+            if result.inference_time > 1:
+                self._log(
+                    "warning",
+                    f"Inference for {request.camera_name} took {result.inference_time:.2f}s",
+                )
 
         except Exception as error:
 

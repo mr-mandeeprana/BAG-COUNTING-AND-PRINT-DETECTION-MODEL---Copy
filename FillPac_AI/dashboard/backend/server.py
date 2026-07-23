@@ -4,90 +4,77 @@ FillPac AI
 Dashboard API + Socket.IO Server
 ==========================================================
 
-Purpose
--------
-Provides:
-
-- REST API
-- Socket.IO real-time communication
-- Dashboard state file monitoring
-- Automatic dashboard_state broadcasting
-
 Architecture
 ------------
-FillPac AI Application
-        |
-        v
-dashboard/backend/state.json
-        |
-        v
-Dashboard State Watcher
-        |
-        +---- REST API
-        |
-        +---- Socket.IO
-                |
-                v
-        Dashboard Frontend
-
-Important
----------
-This server does NOT create another DashboardState instance.
-
-The main FillPac AI application is the only writer.
-
-This backend only reads state.json.
+FillPac AI
+    |
+    v
+state.json
+    |
+    +------ REST API
+    |
+    +------ Socket.IO
+             |
+             v
+          Browser
 ==========================================================
 """
 
 import asyncio
 import json
 import logging
+
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 import socketio
 
 
 # ==========================================================
-# CONFIGURATION
+# ABSOLUTE STATE FILE
 # ==========================================================
 
-STATE_FILE = Path(
-    "dashboard/backend/state.json"
+BACKEND_DIR = (
+    Path(__file__)
+    .resolve()
+    .parent
 )
 
-STATE_WATCH_INTERVAL = 0.25
+STATE_FILE = (
+    BACKEND_DIR
+    / "state.json"
+)
 
-STATE_READ_RETRIES = 5
+STATE_WATCH_INTERVAL = 0.20
 
-STATE_READ_RETRY_DELAY = 0.05
+STATE_READ_RETRIES = 10
+
+STATE_READ_RETRY_DELAY = 0.03
 
 
 # ==========================================================
 # LOGGER
 # ==========================================================
 
+logging.basicConfig(
+
+    level=logging.INFO,
+
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+
+)
+
 logger = logging.getLogger(
     "fillpac.dashboard"
 )
-
-if not logger.handlers:
-
-    logging.basicConfig(
-
-        level=logging.INFO,
-
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(name)s | "
-            "%(message)s"
-        ),
-
-    )
 
 
 # ==========================================================
@@ -100,7 +87,7 @@ api = FastAPI(
         "FillPac AI Dashboard API",
 
     version=
-        "1.0.0",
+        "1.1.0",
 
 )
 
@@ -142,19 +129,20 @@ sio = socketio.AsyncServer(
     cors_allowed_origins=
         "*",
 
+    logger=False,
+
+    engineio_logger=False,
+
 )
 
 
 # ==========================================================
-# DEFAULT DASHBOARD STATE
+# DEFAULT STATE
 # ==========================================================
 
 def default_dashboard_state(
     system_status="offline",
 ):
-    """
-    Return a valid empty dashboard state.
-    """
 
     return {
 
@@ -162,6 +150,9 @@ def default_dashboard_state(
             system_status,
 
         "startup_time":
+            None,
+
+        "updated_at":
             None,
 
         "service_status":
@@ -188,23 +179,12 @@ def default_dashboard_state(
 
 
 # ==========================================================
-# READ DASHBOARD STATE
+# READ STATE
 # ==========================================================
 
 async def read_dashboard_state():
-    """
-    Read state.json safely.
 
-    Because the AI application writes directly to state.json,
-    there may be a very small moment where the file contains
-    incomplete JSON.
-
-    Retry instead of immediately returning an error.
-    """
-
-    if (
-        not STATE_FILE.exists()
-    ):
+    if not STATE_FILE.exists():
 
         return (
             default_dashboard_state(
@@ -219,9 +199,6 @@ async def read_dashboard_state():
     ):
 
         try:
-
-            # Reading this small JSON file synchronously is
-            # acceptable because the file is tiny.
 
             with open(
                 STATE_FILE,
@@ -239,8 +216,7 @@ async def read_dashboard_state():
             ):
 
                 raise ValueError(
-                    "Dashboard state root "
-                    "must be a JSON object."
+                    "Dashboard state must be an object."
                 )
 
             return state
@@ -264,9 +240,7 @@ async def read_dashboard_state():
                 )
 
     logger.warning(
-        "Could not read dashboard state "
-        "after %s attempts: %s",
-        STATE_READ_RETRIES,
+        "Could not read dashboard state: %s",
         last_error,
     )
 
@@ -292,6 +266,11 @@ async def root():
         "status":
             "running",
 
+        "state_file":
+            str(
+                STATE_FILE
+            ),
+
     }
 
 
@@ -306,11 +285,9 @@ async def health():
         await read_dashboard_state()
     )
 
-    cameras = (
-        snapshot.get(
-            "cameras",
-            {},
-        )
+    cameras = snapshot.get(
+        "cameras",
+        {},
     )
 
     online_cameras = sum(
@@ -330,6 +307,7 @@ async def health():
         in {
             "online",
             "running",
+            "active",
         }
 
     )
@@ -376,16 +354,27 @@ async def health():
                 "startup_time"
             ),
 
+        "updated_at":
+            snapshot.get(
+                "updated_at"
+            ),
+
         "service_status":
             snapshot.get(
                 "service_status",
                 {},
             ),
+
+        "state_file":
+            str(
+                STATE_FILE
+            ),
+
     }
 
 
 # ==========================================================
-# FULL DASHBOARD STATE
+# STATE
 # ==========================================================
 
 @api.get("/state")
@@ -397,7 +386,7 @@ async def state():
 
 
 # ==========================================================
-# ALL CAMERAS
+# CAMERAS
 # ==========================================================
 
 @api.get("/cameras")
@@ -407,11 +396,9 @@ async def cameras():
         await read_dashboard_state()
     )
 
-    return (
-        snapshot.get(
-            "cameras",
-            {},
-        )
+    return snapshot.get(
+        "cameras",
+        {},
     )
 
 
@@ -430,23 +417,16 @@ async def camera(
         await read_dashboard_state()
     )
 
-    cameras_data = (
-        snapshot.get(
-            "cameras",
-            {},
-        )
+    cameras_data = snapshot.get(
+        "cameras",
+        {},
     )
 
-    camera_data = (
-        cameras_data.get(
-            camera_name
-        )
+    camera_data = cameras_data.get(
+        camera_name
     )
 
-    if (
-        camera_data
-        is None
-    ):
+    if camera_data is None:
 
         return JSONResponse(
 
@@ -455,7 +435,7 @@ async def camera(
             content={
 
                 "error":
-                    f"{camera_name} not found",
+                    f"{camera_name} not found"
 
             },
 
@@ -465,7 +445,7 @@ async def camera(
 
 
 # ==========================================================
-# PRODUCTION SUMMARY
+# PRODUCTION
 # ==========================================================
 
 @api.get("/production")
@@ -499,7 +479,7 @@ async def production():
 
 
 # ==========================================================
-# SOCKET.IO CONNECT
+# SOCKET CONNECT
 # ==========================================================
 
 @sio.event
@@ -508,13 +488,9 @@ async def connect(
     environ,
     auth=None,
 ):
-    """
-    Send current dashboard state immediately when a
-    dashboard client connects.
-    """
 
     logger.info(
-        "Dashboard client connected: %s",
+        "Dashboard connected: %s",
         sid,
     )
 
@@ -534,15 +510,16 @@ async def connect(
 
 
 # ==========================================================
-# SOCKET.IO DISCONNECT
+# SOCKET DISCONNECT
 # ==========================================================
 
 @sio.event
 async def disconnect(
     sid,
 ):
+
     logger.info(
-        "Dashboard client disconnected: %s",
+        "Dashboard disconnected: %s",
         sid,
     )
 
@@ -552,51 +529,49 @@ async def disconnect(
 # ==========================================================
 
 async def dashboard_state_watcher():
-    """
-    Monitor state.json for changes.
-
-    When the file changes, broadcast the latest state
-    to all connected dashboard clients.
-    """
 
     logger.info(
         "Dashboard state watcher started."
     )
 
-    last_modified_time = None
+    logger.info(
+        "Watching state file: %s",
+        STATE_FILE,
+    )
+
+    last_signature = None
 
     while True:
 
         try:
 
-            if (
-                STATE_FILE.exists()
-            ):
+            if STATE_FILE.exists():
 
-                current_modified_time = (
-
+                stat = (
                     STATE_FILE.stat()
-                    .st_mtime_ns
+                )
+
+                # Using both modification time and size
+                # gives a more reliable Windows file-change
+                # signature.
+                signature = (
+
+                    stat.st_mtime_ns,
+
+                    stat.st_size,
 
                 )
 
                 if (
-
-                    last_modified_time
-                    is None
-
+                    last_signature is None
                     or
-
-                    current_modified_time
-                    != last_modified_time
-
+                    signature != last_signature
                 ):
 
                     snapshot = (
                         await read_dashboard_state()
                     )
 
-                    # Do not broadcast temporary read errors.
                     if (
                         snapshot.get(
                             "system_status"
@@ -612,14 +587,18 @@ async def dashboard_state_watcher():
 
                         )
 
-                        last_modified_time = (
-                            current_modified_time
+                        last_signature = (
+                            signature
                         )
+
+        except asyncio.CancelledError:
+
+            raise
 
         except Exception:
 
             logger.exception(
-                "Dashboard state watcher error."
+                "Dashboard watcher error."
             )
 
         await asyncio.sleep(
@@ -628,19 +607,21 @@ async def dashboard_state_watcher():
 
 
 # ==========================================================
-# APPLICATION STARTUP
+# STARTUP
 # ==========================================================
 
 @api.on_event(
     "startup"
 )
 async def startup_event():
-    """
-    Start background state watcher.
-    """
 
     logger.info(
         "Starting FillPac AI Dashboard API."
+    )
+
+    logger.info(
+        "State file: %s",
+        STATE_FILE,
     )
 
     api.state.dashboard_watcher = (
@@ -651,31 +632,21 @@ async def startup_event():
 
 
 # ==========================================================
-# APPLICATION SHUTDOWN
+# SHUTDOWN
 # ==========================================================
 
 @api.on_event(
     "shutdown"
 )
 async def shutdown_event():
-    """
-    Stop state watcher cleanly.
-    """
 
     watcher = getattr(
-
         api.state,
-
         "dashboard_watcher",
-
         None,
-
     )
 
-    if (
-        watcher
-        is not None
-    ):
+    if watcher is not None:
 
         watcher.cancel()
 
@@ -693,7 +664,7 @@ async def shutdown_event():
 
 
 # ==========================================================
-# ASGI APPLICATION
+# ASGI
 # ==========================================================
 
 app = socketio.ASGIApp(

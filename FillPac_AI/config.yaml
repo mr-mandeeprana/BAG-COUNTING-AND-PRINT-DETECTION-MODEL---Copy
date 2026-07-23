@@ -14,19 +14,19 @@ project:
 model: &default_model
   path: "models/fillpac_yolo26n_best.pt"
 
-  confidence: 0.25
+  confidence: 0.35
   iou: 0.45
 
   # CPU deployment
   # Change to "cuda" only if NVIDIA CUDA is available
   device: "cpu"
 
-  image_size: 640
+  image_size: 512
 
   # FP16 should remain false when using CPU
   half: false
 
-  max_detections: 50
+  max_detections: 20
 
   min_bbox_area: 800
 
@@ -131,6 +131,7 @@ print_detection: &default_print_detection
   enabled: true
 
   confidence: 0.25
+  iou: 0.45
 
   # Minimum IoU
   iou_threshold: 0.00
@@ -181,6 +182,9 @@ cameras:
 
     buffer_size: 1
 
+    # Inference timeout for this camera (seconds)
+    inference_timeout: 15
+
     # Dashboard updates maximum twice per second
     dashboard_publish_interval: 0.5
 
@@ -190,7 +194,7 @@ cameras:
 
     print_detection:
       enabled: true
-      confidence: 0.25
+      confidence: 0.35
 
     # Counting line
     roi:
@@ -216,6 +220,9 @@ cameras:
     source: "data/videos/camera 2.mp4"
 
     buffer_size: 1
+
+    # Inference timeout for this camera (seconds)
+    inference_timeout: 15
 
     dashboard_publish_interval: 0.5
 
@@ -252,6 +259,9 @@ cameras:
 
     buffer_size: 1
 
+    # Inference timeout for this camera (seconds)
+    inference_timeout: 15
+
     dashboard_publish_interval: 0.5
 
     model: *default_model
@@ -286,6 +296,9 @@ cameras:
     source: "data/videos/camera 4.mp4"
 
     buffer_size: 1
+
+    # Inference timeout for this camera (seconds)
+    inference_timeout: 15
 
     dashboard_publish_interval: 0.5
 
@@ -387,7 +400,7 @@ dashboard:
   state_file: "dashboard/backend/state.json"
 
   # Write state maximum approximately once per second
-  persist_interval_seconds: 1.0
+  persist_interval_seconds: 0.25
 
 
 # ----------------------------------------------------------

@@ -37,10 +37,15 @@ Each camera must maintain its own:
 from pathlib import Path
 import threading
 import time
+import os
 
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+# Limit CPU threads to reduce contention on multi-core machines
+torch.set_num_threads(max(1, (os.cpu_count() or 1) // 2))
+torch.set_num_interop_threads(2)
 
 
 class Detector:
@@ -314,8 +319,10 @@ class Detector:
             )
 
             # ----------------------------------------------
-            # YOLO INFERENCE
+            # YOLO INFERENCE (timed)
             # ----------------------------------------------
+
+            start = time.perf_counter()
 
             with torch.inference_mode():
                 results = (
@@ -330,8 +337,17 @@ class Detector:
                         device=
                             self.device,
                         verbose=False,
+                        stream=False,
                         **predict_kwargs,
                     )
+                )
+
+            elapsed = time.perf_counter() - start
+
+            if elapsed > 1:
+                self._log(
+                    "warning",
+                    f"Inference time {elapsed:.2f}s",
                 )
 
         # ==================================================

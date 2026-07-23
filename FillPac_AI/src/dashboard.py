@@ -6,34 +6,39 @@ Dashboard State Module
 
 Purpose
 -------
-Thread-safe central state manager for the FillPac AI dashboard.
+Thread-safe dashboard state manager.
 
 Architecture
 ------------
-AI Application
+Pipeline
     |
     v
-DashboardState (in-memory)
+DashboardState
     |
-    | Single persistence worker
     v
 dashboard/backend/state.json
     |
     v
-Dashboard Backend
+FastAPI Dashboard Backend
     |
-    v
-FastAPI + Socket.IO
+    +---- REST API
+    |
+    +---- Socket.IO
     |
     v
 Dashboard Frontend
 
-Important
----------
-- Pipeline threads update in-memory state only.
-- Pipeline threads NEVER write state.json directly.
-- Only one background persistence thread writes state.json.
-- The dashboard backend reads state.json with retry handling.
+Features
+--------
+- Thread-safe camera updates
+- Global production totals
+- Printed / not-printed totals
+- Camera FPS/status
+- Service health
+- Background persistence
+- Graceful shutdown
+- Existing-state restoration
+- Absolute project-relative state path
 ==========================================================
 """
 
@@ -46,23 +51,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# ==========================================================
+# PROJECT PATHS
+# ==========================================================
+
+PROJECT_ROOT = (
+    Path(__file__)
+    .resolve()
+    .parent
+    .parent
+)
+
+DEFAULT_STATE_FILE = (
+    PROJECT_ROOT
+    / "dashboard"
+    / "backend"
+    / "state.json"
+)
+
+
+# ==========================================================
+# DASHBOARD STATE
+# ==========================================================
+
 class DashboardState:
-    """
-    Thread-safe dashboard state manager.
-
-    Pipeline threads update the in-memory state.
-
-    A dedicated persistence thread periodically writes
-    the latest state to disk.
-    """
 
     def __init__(
         self,
         enabled=True,
-        state_file="dashboard/backend/state.json",
+        state_file=None,
         logger=None,
-        persist_interval_seconds=0.5,
+        persist_interval_seconds=0.25,
     ):
+
         # ==================================================
         # CONFIGURATION
         # ==================================================
@@ -71,20 +92,42 @@ class DashboardState:
 
         self.logger = logger
 
-        self.state_file = Path(
-            state_file
-        )
-
-        # Prevent excessive disk writes.
         self.persist_interval_seconds = max(
-            float(
-                persist_interval_seconds
-            ),
-            0.25,
+            float(persist_interval_seconds),
+            0.1,
         )
 
         # ==================================================
-        # RUNTIME STATE
+        # STATE FILE
+        # ==================================================
+
+        if state_file:
+
+            state_path = Path(
+                state_file
+            )
+
+            if state_path.is_absolute():
+
+                self.state_file = (
+                    state_path.resolve()
+                )
+
+            else:
+
+                self.state_file = (
+                    PROJECT_ROOT
+                    / state_path
+                ).resolve()
+
+        else:
+
+            self.state_file = (
+                DEFAULT_STATE_FILE.resolve()
+            )
+
+        # ==================================================
+        # APPLICATION STATE
         # ==================================================
 
         self.system_status = "idle"
@@ -93,18 +136,9 @@ class DashboardState:
 
         self.service_status = {}
 
-        # New startup timestamp for every application run.
         self.start_time = datetime.now(
             timezone.utc
         )
-
-        # ==================================================
-        # PERSISTENCE STATE
-        # ==================================================
-
-        self.last_persist_time = 0.0
-
-        self._dirty = False
 
         # ==================================================
         # THREADING
@@ -118,6 +152,12 @@ class DashboardState:
 
         self._persistence_thread = None
 
+        self._dirty = False
+
+        self._closed = False
+
+        self.last_persist_time = 0.0
+
         # ==================================================
         # INITIALIZATION
         # ==================================================
@@ -129,9 +169,22 @@ class DashboardState:
                 exist_ok=True,
             )
 
+            self._log(
+                "info",
+                (
+                    "Dashboard state file: "
+                    f"{self.state_file}"
+                ),
+            )
+
+            # Restore previous counts if state exists.
             self._load_existing_state()
 
+            # Start single persistence worker.
             self._start_background_persistence()
+
+            # Force initial state write.
+            self._mark_dirty()
 
     # ======================================================
     # SYSTEM STATUS
@@ -141,17 +194,9 @@ class DashboardState:
         self,
         status,
     ):
-        """
-        Update global FillPac AI system status.
 
-        Expected values may include:
-        - starting
-        - running
-        - idle
-        - stopping
-        - stopped
-        - error
-        """
+        if not self.enabled:
+            return
 
         status = str(
             status
@@ -187,58 +232,100 @@ class DashboardState:
         printed_bags_count=0,
         not_printed_bags_count=0,
     ):
-        """
-        Update one camera's current dashboard state.
 
-        This updates memory only.
+        if not self.enabled:
+            return
 
-        The background persistence worker writes the state
-        to disk.
-        """
+        if self._closed:
+            return
 
         camera_name = str(
             camera_name
         )
 
+        # ==================================================
+        # NORMALIZE VALUES
+        # ==================================================
+
+        count = self._safe_int(
+            count
+        )
+
+        fps = self._safe_float(
+            fps
+        )
+
+        printed_count = self._safe_int(
+            printed_count
+        )
+
+        missing_count = self._safe_int(
+            missing_count
+        )
+
+        printed_bags_count = self._safe_int(
+            printed_bags_count
+        )
+
+        not_printed_bags_count = self._safe_int(
+            not_printed_bags_count
+        )
+
+        # ==================================================
+        # COMPATIBILITY ALIASES
+        # ==================================================
+
+        if (
+            printed_count == 0
+            and printed_bags_count > 0
+        ):
+
+            printed_count = (
+                printed_bags_count
+            )
+
+        if (
+            missing_count == 0
+            and not_printed_bags_count > 0
+        ):
+
+            missing_count = (
+                not_printed_bags_count
+            )
+
+        # ==================================================
+        # BUILD CAMERA STATE
+        # ==================================================
+
         camera_state = {
 
             "count":
-                self._safe_int(
-                    count
-                ),
+                count,
 
             "printed_count":
-                self._safe_int(
-                    printed_count
-                ),
+                printed_count,
 
             "missing_count":
-                self._safe_int(
-                    missing_count
-                ),
+                missing_count,
 
-            # Compatibility aliases
+            # Backward-compatible names
             "printed_bags_count":
-                self._safe_int(
-                    printed_bags_count
-                ),
+                printed_count,
 
             "not_printed_bags_count":
-                self._safe_int(
-                    not_printed_bags_count
-                ),
+                missing_count,
 
             "fps":
                 round(
-                    self._safe_float(
-                        fps
-                    ),
+                    fps,
                     2,
                 ),
 
             "status":
                 str(
                     status
+                    or
+                    "offline"
                 ),
 
             "print_status":
@@ -248,7 +335,12 @@ class DashboardState:
                 datetime.now(
                     timezone.utc
                 ).isoformat(),
+
         }
+
+        # ==================================================
+        # STORE CAMERA STATE
+        # ==================================================
 
         with self._lock:
 
@@ -262,131 +354,66 @@ class DashboardState:
                 camera_name
             ] = camera_state
 
-            state_changed = (
+            self._dirty = True
 
-                previous_state
-                is None
+        # Wake persistence worker.
+        self._persist_event.set()
 
-                or
+        # ==================================================
+        # COUNT CHANGE LOGGING
+        # ==================================================
 
-                self._camera_state_changed(
-                    previous_state,
-                    camera_state,
+        if previous_state is not None:
+
+            old_count = self._safe_int(
+
+                previous_state.get(
+                    "count",
+                    0,
                 )
 
             )
 
-            if state_changed:
+            if count != old_count:
 
-                self._dirty = True
-
-        if state_changed:
-
-            self._persist_event.set()
-
-    # ======================================================
-    # CAMERA CHANGE DETECTION
-    # ======================================================
-
-    @staticmethod
-    def _camera_state_changed(
-        previous_state,
-        current_state,
-    ):
-        """
-        Check whether meaningful camera data changed.
-
-        updated_at is ignored so timestamps alone do not
-        continuously trigger disk writes.
-        """
-
-        fields = (
-
-            "count",
-
-            "printed_count",
-
-            "missing_count",
-
-            "printed_bags_count",
-
-            "not_printed_bags_count",
-
-            "fps",
-
-            "status",
-
-            "print_status",
-
-        )
-
-        return any(
-
-            previous_state.get(
-                field
-            )
-
-            !=
-
-            current_state.get(
-                field
-            )
-
-            for field
-            in fields
-
-        )
+                self._log(
+                    "info",
+                    (
+                        f"Dashboard {camera_name}: "
+                        f"{old_count} -> {count}"
+                    ),
+                )
 
     # ======================================================
-    # HEALTH UPDATE
+    # SERVICE HEALTH
     # ======================================================
 
     def update_health(
         self,
         health_info,
     ):
-        """
-        Update FillPac AI service health information.
-        """
 
-        if (
-            not health_info
-            or not isinstance(
-                health_info,
-                dict,
-            )
+        if not self.enabled:
+            return
+
+        if self._closed:
+            return
+
+        if not isinstance(
+            health_info,
+            dict,
         ):
             return
 
-        changed = False
-
         with self._lock:
 
-            for (
-                key,
-                value,
-            ) in health_info.items():
+            self.service_status.update(
+                health_info
+            )
 
-                if (
-                    self.service_status.get(
-                        key
-                    )
-                    != value
-                ):
+            self._dirty = True
 
-                    self.service_status[
-                        key
-                    ] = value
-
-                    changed = True
-
-            if changed:
-
-                self._dirty = True
-
-        if changed:
-
-            self._persist_event.set()
+        self._persist_event.set()
 
     # ======================================================
     # SNAPSHOT
@@ -395,15 +422,10 @@ class DashboardState:
     def snapshot(
         self,
     ):
-        """
-        Return a thread-safe dashboard state snapshot.
-        """
 
         with self._lock:
 
-            return (
-                self._snapshot_in_memory()
-            )
+            return self._snapshot_in_memory()
 
     # ======================================================
     # BUILD SNAPSHOT
@@ -412,53 +434,82 @@ class DashboardState:
     def _snapshot_in_memory(
         self,
     ):
-        """
-        Build the complete dashboard state.
 
-        Caller must hold self._lock.
-        """
+        # ==================================================
+        # TOTAL BAG COUNT
+        # ==================================================
 
         total_count = sum(
 
             self._safe_int(
+
                 camera.get(
                     "count",
                     0,
                 )
+
             )
 
             for camera
             in self.cameras.values()
 
         )
+
+        # ==================================================
+        # TOTAL PRINTED
+        # ==================================================
 
         total_printed_count = sum(
 
             self._safe_int(
+
                 camera.get(
+
                     "printed_count",
-                    0,
+
+                    camera.get(
+                        "printed_bags_count",
+                        0,
+                    ),
+
                 )
+
             )
 
             for camera
             in self.cameras.values()
 
         )
+
+        # ==================================================
+        # TOTAL NOT PRINTED
+        # ==================================================
 
         total_missing_count = sum(
 
             self._safe_int(
+
                 camera.get(
+
                     "missing_count",
-                    0,
+
+                    camera.get(
+                        "not_printed_bags_count",
+                        0,
+                    ),
+
                 )
+
             )
 
             for camera
             in self.cameras.values()
 
         )
+
+        # ==================================================
+        # FINAL SNAPSHOT
+        # ==================================================
 
         return {
 
@@ -482,7 +533,7 @@ class DashboardState:
             "total_missing_count":
                 total_missing_count,
 
-            # Dashboard compatibility aliases
+            # Compatibility fields
 
             "total_printed_bags_count":
                 total_printed_count,
@@ -494,18 +545,35 @@ class DashboardState:
                 deepcopy(
                     self.cameras
                 ),
+
+            "updated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
         }
 
     # ======================================================
-    # START PERSISTENCE THREAD
+    # MARK DIRTY
+    # ======================================================
+
+    def _mark_dirty(
+        self,
+    ):
+
+        with self._lock:
+
+            self._dirty = True
+
+        self._persist_event.set()
+
+    # ======================================================
+    # START BACKGROUND PERSISTENCE
     # ======================================================
 
     def _start_background_persistence(
         self,
     ):
-        """
-        Start one dashboard persistence worker.
-        """
 
         if (
 
@@ -517,6 +585,7 @@ class DashboardState:
             self._persistence_thread.is_alive()
 
         ):
+
             return
 
         self._persistence_thread = (
@@ -535,6 +604,14 @@ class DashboardState:
 
         self._persistence_thread.start()
 
+        self._log(
+            "info",
+            (
+                "Dashboard persistence "
+                "worker started."
+            ),
+        )
+
     # ======================================================
     # PERSISTENCE WORKER
     # ======================================================
@@ -542,48 +619,39 @@ class DashboardState:
     def _persistence_worker(
         self,
     ):
-        """
-        Single worker responsible for writing state.json.
-        """
 
         while (
             not self._stop_event.is_set()
         ):
 
             self._persist_event.wait(
-
                 timeout=
                     self.persist_interval_seconds
-
             )
 
             self._persist_event.clear()
 
-            if (
-                self._stop_event.is_set()
-            ):
+            if self._stop_event.is_set():
                 break
 
             self._persist()
 
-        # Final write before thread exits.
+        # ==================================================
+        # FINAL WRITE
+        # ==================================================
+
         self._persist(
             force=True
         )
 
     # ======================================================
-    # PERSIST STATE
+    # PERSIST
     # ======================================================
 
     def _persist(
         self,
         force=False,
     ):
-        """
-        Persist current dashboard state.
-
-        State remains dirty if writing fails.
-        """
 
         if not self.enabled:
             return
@@ -591,19 +659,20 @@ class DashboardState:
         with self._lock:
 
             if (
-
                 not force
-
                 and
-
                 not self._dirty
-
             ):
+
                 return
 
             snapshot = (
                 self._snapshot_in_memory()
             )
+
+        # ==================================================
+        # WRITE
+        # ==================================================
 
         try:
 
@@ -611,37 +680,27 @@ class DashboardState:
                 snapshot
             )
 
-        except OSError as error:
-
-            self._log(
-                "warning",
-                "Dashboard state write failed: "
-                f"{error}",
-            )
-
-            # Keep state dirty so next cycle retries.
-            with self._lock:
-
-                self._dirty = True
-
-            return
-
         except Exception as error:
 
             self._log(
                 "warning",
-                "Unexpected dashboard state "
-                "write failure: "
-                f"{error}",
+                (
+                    "Dashboard state write failed: "
+                    f"{error}"
+                ),
             )
 
+            # Keep dirty so next persistence cycle retries.
             with self._lock:
 
                 self._dirty = True
 
             return
 
-        # Only mark clean after successful write.
+        # ==================================================
+        # SUCCESS
+        # ==================================================
+
         with self._lock:
 
             self._dirty = False
@@ -658,22 +717,20 @@ class DashboardState:
         self,
         data,
     ):
-        """
-        Write dashboard state directly to state.json.
-
-        There is only one writer:
-        DashboardPersistence.
-
-        The dashboard backend handles temporary incomplete
-        JSON reads using retry logic.
-
-        This avoids Windows/OneDrive os.replace() errors.
-        """
 
         self.state_file.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
+
+        # Direct write is intentionally used here.
+        #
+        # Previous os.replace() implementation caused
+        # WinError 5 on Windows/OneDrive when the backend
+        # simultaneously accessed state.json.
+        #
+        # The dashboard backend uses retry logic when
+        # reading this file.
 
         with open(
             self.state_file,
@@ -684,7 +741,11 @@ class DashboardState:
             json.dump(
                 data,
                 file,
-                indent=2,
+                ensure_ascii=False,
+                separators=(
+                    ",",
+                    ":",
+                ),
             )
 
             file.flush()
@@ -696,16 +757,8 @@ class DashboardState:
     def _load_existing_state(
         self,
     ):
-        """
-        Restore existing camera counters and service state.
 
-        startup_time is intentionally reset because every
-        application launch is considered a new runtime session.
-        """
-
-        if (
-            not self.state_file.exists()
-        ):
+        if not self.state_file.exists():
 
             self._dirty = True
 
@@ -713,8 +766,9 @@ class DashboardState:
 
         state = None
 
-        # Retry because another process may temporarily
-        # interact with the file.
+        # ==================================================
+        # RETRY READ
+        # ==================================================
 
         for attempt in range(
             3
@@ -749,61 +803,29 @@ class DashboardState:
 
                     self._log(
                         "warning",
-                        "Dashboard state read failed: "
-                        f"{error}",
+                        (
+                            "Could not restore "
+                            "dashboard state: "
+                            f"{error}"
+                        ),
                     )
 
-        if (
-            not isinstance(
-                state,
-                dict,
-            )
+        if not isinstance(
+            state,
+            dict,
         ):
 
             self._dirty = True
 
             return
 
-        # --------------------------------------------------
-        # Restore previous system status
-        # --------------------------------------------------
+        # ==================================================
+        # RESTORE CAMERA COUNTS
+        # ==================================================
 
-        self.system_status = str(
-            state.get(
-                "system_status",
-                self.system_status,
-            )
-        )
-
-        # --------------------------------------------------
-        # Restore service state
-        # --------------------------------------------------
-
-        service_status = (
-            state.get(
-                "service_status",
-                {},
-            )
-        )
-
-        if isinstance(
-            service_status,
-            dict,
-        ):
-
-            self.service_status = (
-                service_status
-            )
-
-        # --------------------------------------------------
-        # Restore camera counters
-        # --------------------------------------------------
-
-        cameras = (
-            state.get(
-                "cameras",
-                {},
-            )
+        cameras = state.get(
+            "cameras",
+            {},
         )
 
         if isinstance(
@@ -811,15 +833,142 @@ class DashboardState:
             dict,
         ):
 
-            self.cameras = cameras
+            self.cameras = deepcopy(
+                cameras
+            )
 
-        # Always use current runtime startup time.
+        # ==================================================
+        # RESTORE SERVICE STATUS
+        # ==================================================
+
+        service_status = state.get(
+            "service_status",
+            {},
+        )
+
+        if isinstance(
+            service_status,
+            dict,
+        ):
+
+            self.service_status = deepcopy(
+                service_status
+            )
+
+        # ==================================================
+        # DO NOT RESTORE OLD SYSTEM STATUS
+        # ==================================================
+        #
+        # A previous run may have ended with:
+        #
+        # stopped
+        # error
+        # running
+        #
+        # New Application controls current status.
+
+        self.system_status = "idle"
+
+        # New run gets new startup time.
+
         self.start_time = datetime.now(
             timezone.utc
         )
 
-        self.last_persist_time = (
-            time.monotonic()
+        self._dirty = True
+
+        self._log(
+            "info",
+            (
+                "Previous dashboard camera "
+                "state restored."
+            ),
+        )
+
+    # ======================================================
+    # FLUSH
+    # ======================================================
+
+    def flush(
+        self,
+    ):
+
+        if not self.enabled:
+            return
+
+        self._persist(
+            force=True
+        )
+
+    # ======================================================
+    # STOP
+    # ======================================================
+
+    def stop(
+        self,
+    ):
+
+        if not self.enabled:
+            return
+
+        # Prevent duplicate shutdown.
+        if self._closed:
+            return
+
+        self._log(
+            "info",
+            "Stopping DashboardState.",
+        )
+
+        # ==================================================
+        # SIGNAL WORKER
+        # ==================================================
+
+        self._stop_event.set()
+
+        self._persist_event.set()
+
+        # ==================================================
+        # WAIT FOR WORKER
+        # ==================================================
+
+        thread = (
+            self._persistence_thread
+        )
+
+        if (
+
+            thread is not None
+
+            and
+
+            thread.is_alive()
+
+            and
+
+            thread
+            is not
+            threading.current_thread()
+
+        ):
+
+            thread.join(
+                timeout=2.0
+            )
+
+        # ==================================================
+        # FINAL WRITE
+        # ==================================================
+
+        self._persist(
+            force=True
+        )
+
+        self._closed = True
+
+        self._log(
+            "info",
+            "DashboardState stopped.",
         )
 
     # ======================================================
@@ -830,38 +979,18 @@ class DashboardState:
         self,
     ):
         """
-        Stop persistence worker gracefully.
+        Compatibility shutdown method.
 
-        The worker performs one final state write.
+        Application.stop() calls:
+
+            self.dashboard_state.close()
+
+        DashboardState internally performs shutdown using
+        stop(). Keeping close() prevents Application and
+        DashboardState interfaces from becoming inconsistent.
         """
 
-        if not self.enabled:
-            return
-
-        self._stop_event.set()
-
-        self._persist_event.set()
-
-        if (
-            self._persistence_thread
-            is not None
-        ):
-
-            self._persistence_thread.join(
-                timeout=5
-            )
-
-            if (
-                self._persistence_thread.is_alive()
-            ):
-
-                self._log(
-                    "warning",
-                    "Dashboard persistence thread "
-                    "did not stop within timeout.",
-                )
-
-        self._persistence_thread = None
+        self.stop()
 
     # ======================================================
     # SAFE INTEGER
@@ -871,6 +1000,7 @@ class DashboardState:
     def _safe_int(
         value,
     ):
+
         try:
 
             return int(
@@ -880,6 +1010,7 @@ class DashboardState:
         except (
             TypeError,
             ValueError,
+            OverflowError,
         ):
 
             return 0
@@ -892,15 +1023,32 @@ class DashboardState:
     def _safe_float(
         value,
     ):
+
         try:
 
-            return float(
+            value = float(
                 value
             )
+
+            # NaN check
+            if value != value:
+
+                return 0.0
+
+            # Infinity check
+            if value in (
+                float("inf"),
+                float("-inf"),
+            ):
+
+                return 0.0
+
+            return value
 
         except (
             TypeError,
             ValueError,
+            OverflowError,
         ):
 
             return 0.0
@@ -914,30 +1062,29 @@ class DashboardState:
         level,
         message,
     ):
-        """
-        Log dashboard messages.
-        """
 
-        if (
-            self.logger
-            is not None
-        ):
+        if self.logger is None:
 
-            log_method = getattr(
+            return
+
+        try:
+
+            method = getattr(
                 self.logger,
                 level,
                 None,
             )
 
-            if log_method:
+            if callable(
+                method
+            ):
 
-                log_method(
+                method(
                     message
                 )
 
-                return
+        except Exception:
 
-        print(
-            f"[{level.upper()}] "
-            f"{message}"
-        )
+            # Logging must never crash the production
+            # application.
+            pass

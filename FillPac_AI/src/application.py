@@ -705,19 +705,15 @@ class Application:
             }
         )
 
-        # --------------------------------------------------
-        # Release reference to Detector
-        #
-        # Python / PyTorch will release the model resources
-        # when no longer referenced.
+                # --------------------------------------------------
+        # Release Detector Reference
         # --------------------------------------------------
 
         self.detector = None
 
         self.dashboard_state.update_health(
             {
-                "model_loaded":
-                    False
+                "model_loaded": False,
             }
         )
 
@@ -740,27 +736,30 @@ class Application:
 
         self.dashboard_state.update_health(
             {
-                "elasticsearch_connected":
-                    False
+                "elasticsearch_connected": False,
             }
         )
 
         # --------------------------------------------------
-        # IMPORTANT
+        # Final Dashboard State
         #
-        # Set STOPPED before DashboardState.close().
-        #
-        # DashboardState.close() performs final persistence.
+        # IMPORTANT:
+        # Update all final values BEFORE closing
+        # DashboardState.
         # --------------------------------------------------
 
         self.dashboard_state.set_system_status(
             "stopped"
         )
 
+        # Explicitly persist final state.
+        self.dashboard_state.flush()
+
+        # Stop persistence worker and close DashboardState.
         self.dashboard_state.close()
 
         # --------------------------------------------------
-        # Close OpenCV windows
+        # Close OpenCV Windows
         # --------------------------------------------------
 
         cv2.destroyAllWindows()

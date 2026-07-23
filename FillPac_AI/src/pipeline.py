@@ -382,6 +382,10 @@ class Pipeline:
 
             self.frame_index += 1
 
+            # Skip alternate frames to reduce CPU usage
+            if self.frame_index % 2 != 0:
+                return True
+
             # ----------------------------------------------
             # SHARED YOLO INFERENCE
             # ----------------------------------------------
@@ -495,7 +499,9 @@ class Pipeline:
                 force=True,
             )
 
-            return False
+            # Return True so pipeline stays active and does not
+            # fall further behind when inference times out.
+            return True
 
         except Exception:
             self.logger.error(
