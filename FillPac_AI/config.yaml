@@ -1,418 +1,736 @@
-# ==========================================================
-# FillPac AI - Bag Counting & Print Detection Configuration
-# ==========================================================
-
 project:
-  name: "FillPac AI"
-  version: "1.0.0"
+  name: FillPac AI
+  version: 1.1.0
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # MODEL
-# ----------------------------------------------------------
+# ==========================================================
 
-model: &default_model
-  path: "models/fillpac_yolo26n_best.pt"
+model:
+  path: models/fillpac_yolo26n_best.pt
 
-  confidence: 0.35
+  # Global YOLO confidence must be <= lowest class threshold.
+  confidence: 0.20
   iou: 0.45
 
-  # CPU deployment
-  # Change to "cuda" only if NVIDIA CUDA is available
-  device: "cpu"
+  device: cpu
 
-  image_size: 512
+  # Better resolution for relatively small print objects.
+  image_size: 640
 
-  # FP16 should remain false when using CPU
   half: false
-
   max_detections: 20
-
   min_bbox_area: 800
 
-  # Detection area
   detection_roi:
     x1: 0
     y1: 120
     x2: 1920
     y2: 1080
 
-  # Class 0 = Bag
-  # Class 1 = Print
   allowed_classes:
     - 0
     - 1
 
+  # Class-specific thresholds
   bag_confidence: 0.35
+  print_confidence: 0.20
 
-  print_confidence: 0.25
 
-
-# ----------------------------------------------------------
+# ==========================================================
 # TRACKER
-# ----------------------------------------------------------
+# ==========================================================
 
 tracker:
-
-  type: "bytetrack"
+  type: bytetrack
 
   track_high_thresh: 0.45
-
-  # These parameters may not be supported directly by
-  # the installed supervision.ByteTrack version.
   track_low_thresh: 0.10
-
   new_track_thresh: 0.60
 
   track_buffer: 60
-
   match_thresh: 0.85
 
   frame_rate: 30
-
   minimum_consecutive_frames: 1
 
   min_track_age: 4
 
   min_bbox_area: 4000
-
   min_bbox_area_ratio: 0.002
-
   min_track_confidence: 0.25
 
   max_jump_distance: 250
-
   min_iou_warning: 0.10
 
   unstable_frame_threshold: 3
-
   history_ttl_frames: 120
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # COUNTING
-# ----------------------------------------------------------
+# ==========================================================
 
-counting: &default_counting
+counting:
+  method: center
 
-  # Count using bag center crossing
-  method: "center"
+  # Preserve current movement direction
+  direction: up
 
-  # Bag movement direction
-  direction: "up"
-
-  # Duplicate suppression
   duplicate_distance: 30
-
   duplicate_time: 0.8
 
-  # Counting line tolerance
   line_tolerance: 12
-
-  # Allow tracks that appear near counting line
   late_start_margin: 40
 
-  # Minimum movement required before count
   minimum_cross_distance: 15
-
-  # Minimum track lifetime
   min_track_frames: 4
 
-  # Remove stale track information
   stale_track_frames: 120
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # PRINT DETECTION
-# ----------------------------------------------------------
+# ==========================================================
 
-print_detection: &default_print_detection
-
+print_detection:
   enabled: true
 
-  confidence: 0.25
+  confidence: 0.20
   iou: 0.45
 
-  # Minimum IoU
-  iou_threshold: 0.00
-
-  # Required print/bag overlap ratio
+  iou_threshold: 0.0
   min_overlap_ratio: 0.30
 
-  # Minimum print bounding box area
   min_print_area: 80
-
-  # 0 = disabled
   max_print_area: 0
 
   min_aspect_ratio: 0
-
   max_aspect_ratio: 0
-
   max_center_distance: 0
 
-  # Print voting configuration
+  # Temporal voting
   vote_threshold: 0.60
-
   min_votes: 4
+  min_observations: 4
 
+  history_size: 30
   history_ttl_frames: 120
 
+  min_observation_speed: 0.0
+  skip_motion_jump_observations: true
 
-# ----------------------------------------------------------
+
+# ==========================================================
+# JAM DETECTION
+# ==========================================================
+#
+# Current normal-video observations:
+#
+# Far bags:
+#   approximately 12-15 px/s
+#
+# Mid / near bags:
+#   approximately 35-100+ px/s
+#
+# Therefore:
+#
+# <= 4 px/s     = potentially stationary
+# 4-9 px/s      = slow
+# > 9 px/s      = normal
+#
+# A JAM is NOT triggered only by low speed.
+# Low movement must persist for the configured time.
+#
+# ==========================================================
+
+jam_detection:
+  enabled: true
+
+  # Current same-angle test-video monitoring area
+  roi:
+    x1: 0
+    y1: 150
+    x2: 477
+    y2: 500
+
+  # Trajectory history
+  history_seconds: 1.0
+  min_history_seconds: 0.5
+
+  # Motion thresholds
+  stationary_speed_threshold: 4.0
+  slow_speed_threshold: 9.0
+
+  # Temporal decision
+  warning_time_seconds: 3.0
+  jam_time_seconds: 5.0
+
+  recovery_time_seconds: 1.0
+
+  # Track validation
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  track_ttl_seconds: 2.0
+
+
+# ==========================================================
 # CAMERAS
-# ----------------------------------------------------------
+# ==========================================================
 
 cameras:
 
   # ========================================================
   # CAMERA 1
-  # Bag Counting + Print Detection
+  # COUNT + PRINT + JAM
   # ========================================================
 
   - id: 1
-
-    name: "Camera 1"
+    name: Camera 1
 
     enabled: true
 
-    mode: "video"
-
+    mode: video
     source: "data/videos/camera 1.mp4"
 
     buffer_size: 1
 
-    # Inference timeout for this camera (seconds)
     inference_timeout: 15
-
-    # Dashboard updates maximum twice per second
     dashboard_publish_interval: 0.5
 
-    model: *default_model
+    model:
+      path: models/fillpac_yolo26n_best.pt
 
-    counting: *default_counting
+      confidence: 0.20
+      iou: 0.45
+
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      direction: up
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      minimum_cross_distance: 15
+      min_track_frames: 4
+
+      stale_track_frames: 120
 
     print_detection:
       enabled: true
-      confidence: 0.35
 
-    # Counting line
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
+    # Counting line moved upward from Y=350 to Y=300
     roi:
       x1: 0
-      y1: 350
+      y1: 380
       x2: 477
-      y2: 350
+      y2: 380
 
 
   # ========================================================
   # CAMERA 2
-  # Bag Counting + Print Detection
+  # COUNT + PRINT + JAM
   # ========================================================
 
   - id: 2
-
-    name: "Camera 2"
+    name: Camera 2
 
     enabled: true
 
-    mode: "video"
-
+    mode: video
     source: "data/videos/camera 2.mp4"
 
     buffer_size: 1
 
-    # Inference timeout for this camera (seconds)
     inference_timeout: 15
-
     dashboard_publish_interval: 0.5
 
-    model: *default_model
+    model:
+      path: models/fillpac_yolo26n_best.pt
 
-    counting: *default_counting
+      confidence: 0.20
+      iou: 0.45
+
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      direction: up
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      minimum_cross_distance: 15
+      min_track_frames: 4
+
+      stale_track_frames: 120
 
     print_detection:
       enabled: true
-      confidence: 0.25
 
-    # Counting line
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
     roi:
       x1: 0
-      y1: 350
+      y1: 380
       x2: 477
-      y2: 350
+      y2: 380
 
 
   # ========================================================
   # CAMERA 3
-  # Bag Counting Only
+  # COUNT + JAM
+  # PRINT DISABLED
   # ========================================================
 
   - id: 3
-
-    name: "Camera 3"
+    name: Camera 3
 
     enabled: true
 
-    mode: "video"
-
+    mode: video
     source: "data/videos/camera 3.mp4"
 
     buffer_size: 1
 
-    # Inference timeout for this camera (seconds)
     inference_timeout: 15
-
     dashboard_publish_interval: 0.5
 
-    model: *default_model
+    model:
+      path: models/fillpac_yolo26n_best.pt
 
-    counting: *default_counting
+      confidence: 0.20
+      iou: 0.45
 
-    # Camera 3 does NOT perform print detection
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      direction: up
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      minimum_cross_distance: 15
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
     print_detection:
       enabled: false
 
-    # Counting line
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
     roi:
-      x1: 150
-      y1: 350
-      x2: 1200
-      y2: 350
+      x1: 0
+      y1: 380
+      x2: 477
+      y2: 380
 
 
   # ========================================================
   # CAMERA 4
-  # Bag Counting Only
+  # COUNT + JAM
+  # PRINT DISABLED
   # ========================================================
 
   - id: 4
-
-    name: "Camera 4"
+    name: Camera 4
 
     enabled: true
 
-    mode: "video"
-
+    mode: video
     source: "data/videos/camera 4.mp4"
 
     buffer_size: 1
 
-    # Inference timeout for this camera (seconds)
     inference_timeout: 15
-
     dashboard_publish_interval: 0.5
 
-    model: *default_model
+    model:
+      path: models/fillpac_yolo26n_best.pt
 
-    counting: *default_counting
+      confidence: 0.20
+      iou: 0.45
 
-    # Camera 4 does NOT perform print detection
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      direction: up
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      minimum_cross_distance: 15
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
     print_detection:
       enabled: false
 
-    # Counting line
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
     roi:
-      x1: 150
-      y1: 350
-      x2: 1200
-      y2: 350
+      x1: 0
+      y1: 380
+      x2: 477
+      y2: 380
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # DISPLAY
-# ----------------------------------------------------------
+# ==========================================================
 
 display:
-
-  # Draw YOLO bounding boxes
   show_boxes: true
-
-  # Show detection labels
   show_labels: true
-
-  # Show bag center point
   show_center: true
-
-  # Show counting line
   show_roi: true
 
-  # Show camera FPS
   show_fps: true
-
-  # Show total count
   show_count: true
 
+  show_jam_roi: true
+  show_jam_status: true
+  show_jam_speed: true
+  show_stationary_time: true
 
-# ----------------------------------------------------------
+
+# ==========================================================
 # OUTPUT
-# ----------------------------------------------------------
+# ==========================================================
 
 output:
-
-  # Save processed video
   save_video: false
-
-  # Save detection images
   save_images: false
 
-  # Output directory
-  output_path: "data/output"
+  output_path: data/output
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # ELASTICSEARCH
-# ----------------------------------------------------------
+# ==========================================================
 
 elasticsearch:
-
-  # Keep false until Elasticsearch is running
   enabled: false
 
-  host: "localhost"
-
+  host: localhost
   port: 9200
 
   indices:
-
-    count: "fillpac-count"
-
-    print: "fillpac-print"
-
-    camera: "fillpac-camera"
+    count: fillpac-count
+    print: fillpac-print
+    camera: fillpac-camera
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # DASHBOARD
-# ----------------------------------------------------------
+# ==========================================================
 
 dashboard:
-
-  # Enable DashboardState
   enabled: true
 
-  # Dashboard backend host
-  host: "0.0.0.0"
-
-  # FastAPI dashboard port
+  host: 0.0.0.0
   port: 8000
 
-  # Dashboard persistent state
-  state_file: "dashboard/backend/state.json"
+  state_file: dashboard/backend/state.json
 
-  # Write state maximum approximately once per second
-  persist_interval_seconds: 0.25
+  publish_interval: 0.25
+  stale_timeout: 10.0
 
 
-# ----------------------------------------------------------
+# ==========================================================
 # LOGGING
-# ----------------------------------------------------------
+# ==========================================================
 
 logging:
+  level: INFO
 
-  level: "INFO"
+  file: logs/application.log
 
-  # Main application logs
-  file: "logs/application.log"
+  count_events_enabled: true
+  count_file: logs/count_events.jsonl
 
-  # Individual bag count events
-  count_file: "logs/count_events.jsonl"
+  count_flush_immediately: true

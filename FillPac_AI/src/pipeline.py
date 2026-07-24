@@ -1,7 +1,7 @@
 """
 ==========================================================
 FillPac AI
-Pipeline
+Production Camera Pipeline
 ==========================================================
 
 Each camera owns:
@@ -9,13 +9,61 @@ Each camera owns:
 - Tracker
 - Counter
 - PrintDetector
+- JamDetector
 - Print history
+- Latest annotated frame
 
-YOLO model is NOT loaded here.
+YOLO is NOT loaded inside this class.
 
 All camera pipelines use ONE shared InferenceManager.
+
+Counting Principle
+------------------
+The physical bag CENTER crossing the configured counting
+line is the counting trigger.
+
+Track ID is used only for:
+- temporal movement history
+- print-vote association
+- jam movement analysis
+- duplicate protection
+- diagnostics
+
+Track ID itself does NOT trigger a count.
+
+Jam Detection
+-------------
+JamDetector operates independently from Counter.
+
+Tracker
+    |
+    +---- Counter
+    |
+    +---- PrintDetector
+    |
+    +---- JamDetector
+
+Jam detection NEVER changes the physical-center counting
+logic.
+
+Print Classification
+--------------------
+After a physical bag crossing is confirmed:
+
+- Enough observations + print ratio >= threshold
+    -> PRINTED
+
+- Enough observations + print ratio < threshold
+    -> MISSING
+
+- Not enough observations
+    -> UNKNOWN
+
+UNKNOWN does not increase the missing count.
 ==========================================================
 """
+
+from datetime import datetime, timezone
 
 import threading
 import time
@@ -24,12 +72,18 @@ import cv2
 
 from src.camera import Camera
 from src.counter import Counter
+from src.jam_detector import JamDetector
 from src.print_detector import PrintDetector
 from src.tracker import Tracker
 from src.visualizer import Visualizer
 
 
 class Pipeline:
+
+    # ======================================================
+    # INITIALIZATION
+    # ======================================================
+
     def __init__(
         self,
         camera_config,
@@ -41,6 +95,7 @@ class Pipeline:
         elasticsearch=None,
         count_logger=None,
     ):
+
         # ==================================================
         # BASIC CONFIGURATION
         # ==================================================
@@ -53,20 +108,40 @@ class Pipeline:
         self.count_logger = count_logger
 
         self.name = camera_config["name"]
+
+        self.camera_id = camera_config.get(
+            "id"
+        )
+
         self.roi = camera_config["roi"]
+
         self.window_name = self.name
 
         if self.inference_manager is None:
+
             raise ValueError(
-                f"{self.name}: Pipeline requires a valid InferenceManager."
+                f"{self.name}: Pipeline requires "
+                "a valid InferenceManager."
             )
+
+        # ==================================================
+        # CAMERA MODE
+        # ==================================================
+
+        self.camera_mode = camera_config.get(
+            "mode",
+            "video",
+        )
 
         # ==================================================
         # RUNTIME STATE
         # ==================================================
 
         self.connected = False
-        self.previous_time = time.time()
+
+        self.previous_time = (
+            time.perf_counter()
+        )
 
         self.last_count = 0
         self.last_print_status = None
@@ -75,6 +150,9 @@ class Pipeline:
         self.missing_count = 0
 
         self.frame_index = 0
+        self.processed_frame_count = 0
+
+        self.last_error = None
 
         # ==================================================
         # DASHBOARD UPDATE CONTROL
@@ -110,14 +188,28 @@ class Pipeline:
         # CONFIGURATION
         # ==================================================
 
-        counting_config = camera_config.get(
-            "counting",
-            {},
+        counting_config = (
+            camera_config.get(
+                "counting",
+                {},
+            )
+            or {}
         )
 
-        print_config = camera_config.get(
-            "print_detection",
-            {},
+        print_config = (
+            camera_config.get(
+                "print_detection",
+                {},
+            )
+            or {}
+        )
+
+        jam_config = (
+            camera_config.get(
+                "jam_detection",
+                {},
+            )
+            or {}
         )
 
         # ==================================================
@@ -133,6 +225,7 @@ class Pipeline:
                 "display",
                 {},
             )
+            or {}
         )
 
         # ==================================================
@@ -141,79 +234,135 @@ class Pipeline:
 
         self.camera = Camera(
             name=self.name,
-            source=camera_config["source"],
-            mode=camera_config.get(
-                "mode",
-                "video",
+            source=camera_config.get(
+                "source"
             ),
+            mode=self.camera_mode,
             buffer_size=camera_config.get(
                 "buffer_size",
                 1,
             ),
-            logger=logger,
+            reconnect_attempts=camera_config.get(
+                "reconnect_attempts",
+                5,
+            ),
+            reconnect_delay=camera_config.get(
+                "reconnect_delay",
+                2.0,
+            ),
+            logger=self.logger,
         )
 
         # ==================================================
         # TRACKER
-        #
-        # Each camera owns an independent ByteTrack instance.
         # ==================================================
 
         self.tracker = Tracker(
-            tracker_config=tracker_config
+            tracker_config=tracker_config,
         )
 
         # ==================================================
         # COUNTER
         #
-        # Each camera owns an independent physical bag
-        # center counter.
+        # Physical bag CENTER crossing is the counting
+        # trigger.
         # ==================================================
 
+        if isinstance(self.roi, dict):
+
+            if self.roi.get("y") is not None:
+                counting_line_y = self.roi["y"]
+
+            elif self.roi.get("roi_y") is not None:
+                counting_line_y = self.roi["roi_y"]
+
+            elif self.roi.get("y1") is not None:
+                counting_line_y = self.roi["y1"]
+
+            elif self.roi.get("y2") is not None:
+                counting_line_y = self.roi["y2"]
+
+            else:
+                counting_line_y = None
+
+        else:
+            counting_line_y = self.roi
+
+        if counting_line_y is None:
+
+            raise ValueError(
+                f"{self.name}: counting ROI Y coordinate "
+                f"is missing. ROI={self.roi}"
+            )
+
         self.counter = Counter(
-            roi_y=self.roi["y1"],
+
+            roi_y=int(counting_line_y),
+
             direction=counting_config.get(
                 "direction",
                 "down",
             ),
+
             duplicate_distance=counting_config.get(
                 "duplicate_distance",
-                30,
+                40,
             ),
+
             duplicate_time=counting_config.get(
                 "duplicate_time",
                 0.8,
             ),
+
+            max_history=counting_config.get(
+                "max_history",
+                200,
+            ),
+
             line_tolerance=counting_config.get(
                 "line_tolerance",
                 20,
             ),
+
             late_start_margin=counting_config.get(
                 "late_start_margin",
                 40,
             ),
+
             min_track_frames=counting_config.get(
                 "min_track_frames",
                 4,
             ),
+
             stale_track_frames=counting_config.get(
                 "stale_track_frames",
                 120,
             ),
+
             minimum_cross_distance=counting_config.get(
                 "minimum_cross_distance",
-                0,
+                counting_config.get(
+                    "min_cross_distance",
+                    0,
+                ),
             ),
         )
 
         # ==================================================
-        # PRINT DETECTOR
+        # PRINT DETECTION
         # ==================================================
+
+        self.print_detection_enabled = bool(
+            print_config.get(
+                "enabled",
+                False,
+            )
+        )
 
         self.print_detector = PrintDetector(
             confidence_threshold=print_config.get(
-                "confidence",
-                0.4,
+                "confidence_threshold",
+                print_config.get("confidence", 0.4),
             ),
             iou_threshold=print_config.get(
                 "iou_threshold",
@@ -246,39 +395,62 @@ class Pipeline:
         )
 
         # ==================================================
+        # JAM DETECTION V1
+        #
+        # One JamDetector per camera.
+        #
+        # It receives tracker output only.
+        # It does NOT modify Counter.
+        # ==================================================
+
+        self.jam_detector = JamDetector(
+            config=jam_config,
+        )
+
+        self.jam_detection_enabled = bool(
+            self.jam_detector.enabled
+        )
+
+        self.jam_roi = dict(
+            self.jam_detector.roi
+        )
+
+        self.jam_result = (
+            self.jam_detector._empty_result()
+        )
+
+        # ==================================================
         # VISUALIZER
         # ==================================================
 
         self.visualizer = Visualizer()
 
         # ==================================================
-        # PRINT DETECTION CONFIGURATION
+        # PRINT CLASSIFICATION CONFIG
         # ==================================================
 
-        self.print_detection_enabled = bool(
+        self.print_vote_threshold = float(
             print_config.get(
-                "enabled",
-                True,
+                "vote_threshold",
+                print_config.get(
+                    "required_ratio",
+                    0.5,
+                ),
             )
         )
 
         self.print_vote_threshold = min(
             max(
-                float(
-                    print_config.get(
-                        "vote_threshold",
-                        0.5,
-                    )
-                ),
+                self.print_vote_threshold,
                 0.0,
             ),
             1.0,
         )
 
-        self.min_print_votes = max(
+        self.min_print_observations = max(
             int(
                 print_config.get(
-                    "min_votes",
+                    "min_observations",
                     1,
                 )
             ),
@@ -304,6 +476,10 @@ class Pipeline:
             ),
             1,
         )
+
+        # ==================================================
+        # PRINT OBSERVATION FILTERING
+        # ==================================================
 
         self.min_print_observation_speed = max(
             float(
@@ -334,6 +510,7 @@ class Pipeline:
         # ==================================================
 
         self._frame_lock = threading.Lock()
+
         self._latest_frame = None
 
         # ==================================================
@@ -342,39 +519,294 @@ class Pipeline:
 
         self._restore_persisted_counts()
 
+        # ==================================================
+        # REGISTER CAMERA
+        # ==================================================
+
+        self._register_dashboard_camera()
+
+    # ======================================================
+    # RESTORE PERSISTED COUNTS
+    # ======================================================
+
+    def _restore_persisted_counts(
+        self,
+    ):
+
+        if self.dashboard_state is None:
+            return
+
+        try:
+
+            snapshot = (
+                self.dashboard_state.snapshot()
+            )
+
+            cameras = snapshot.get(
+                "cameras",
+                {},
+            )
+
+            camera_state = cameras.get(
+                self.name,
+                {},
+            )
+
+            restored_count = int(
+                camera_state.get(
+                    "total_count",
+                    camera_state.get(
+                        "count",
+                        0,
+                    ),
+                )
+                or 0
+            )
+
+            restored_printed = int(
+                camera_state.get(
+                    "printed_count",
+                    camera_state.get(
+                        "printed_bags_count",
+                        0,
+                    ),
+                )
+                or 0
+            )
+
+            restored_missing = int(
+                camera_state.get(
+                    "missing_count",
+                    camera_state.get(
+                        "not_printed_bags_count",
+                        0,
+                    ),
+                )
+                or 0
+            )
+
+            if restored_count > 0:
+
+                self.counter.total_count = (
+                    restored_count
+                )
+
+                self.last_count = (
+                    restored_count
+                )
+
+            self.printed_count = max(
+                restored_printed,
+                0,
+            )
+
+            self.missing_count = max(
+                restored_missing,
+                0,
+            )
+
+        except Exception as error:
+
+            self.logger.warning(
+                f"{self.name}: persisted count "
+                f"restore failed: {error}"
+            )
+
+    # ======================================================
+    # REGISTER CAMERA
+    # ======================================================
+
+    def _register_dashboard_camera(
+        self,
+    ):
+
+        if self.dashboard_state is None:
+            return
+
+        try:
+
+            self.dashboard_state.register_camera(
+
+                camera_name=self.name,
+
+                camera_id=self.camera_id,
+
+                enabled=self.camera_config.get(
+                    "enabled",
+                    True,
+                ),
+
+                configured=True,
+
+                mode=self.camera_mode,
+
+                print_detection_enabled=(
+                    self.print_detection_enabled
+                ),
+
+                # --------------------------------------
+                # JAM DETECTION
+                # --------------------------------------
+
+                jam_detection_enabled=(
+                    self.jam_detection_enabled
+                ),
+
+                source_type=self.camera_mode,
+
+                metadata={
+
+                    "roi":
+                        self.roi,
+
+                    "counting_method":
+                        "physical_center",
+
+                    "counting_direction":
+                        self.camera_config
+                        .get(
+                            "counting",
+                            {},
+                        )
+                        .get(
+                            "direction",
+                            "down",
+                        ),
+
+                    # --------------------------------------
+                    # JAM V1
+                    # --------------------------------------
+
+                    "jam_detection_enabled":
+                        self.jam_detection_enabled,
+
+                    "jam_roi":
+                        self.jam_roi,
+                },
+            )
+
+            self.dashboard_state.update_camera(
+
+                camera_name=self.name,
+
+                count=self.counter.total_count,
+
+                total_count=(
+                    self.counter.total_count
+                ),
+
+                printed_count=self.printed_count,
+
+                missing_count=self.missing_count,
+
+                print_detection_enabled=(
+                    self.print_detection_enabled
+                ),
+
+                print_status=(
+                    "unknown"
+                    if self.print_detection_enabled
+                    else "disabled"
+                ),
+
+                status="offline",
+
+                fps=0.0,
+
+                frame_count=0,
+
+                # --------------------------------------
+                # JAM V1
+                # --------------------------------------
+
+                jam_detection_enabled=(
+                    self.jam_detection_enabled
+                ),
+
+                jam_status=(
+                    "normal"
+                    if self.jam_detection_enabled
+                    else "disabled"
+                ),
+
+                jam_detected=False,
+
+                jam_warning=False,
+
+                active_jam_count=0,
+
+                active_jam_track_ids=[],
+            )
+
+        except Exception as error:
+
+            self.logger.warning(
+                f"{self.name}: dashboard camera "
+                f"registration failed: {error}"
+            )
+
     # ======================================================
     # PROCESS FRAME
     # ======================================================
 
-    def process(self):
+    def process(
+        self,
+    ):
+
         try:
-            # ----------------------------------------------
+
+            # ==============================================
             # CONNECT CAMERA
-            # ----------------------------------------------
+            # ==============================================
 
             if not self.connected:
-                self.connected = self.camera.connect()
+
+                self.connected = (
+                    self.camera.connect()
+                )
 
                 if not self.connected:
+
                     self._publish_runtime_status(
                         fps=0.0,
                         print_status="offline",
+                        runtime_status="offline",
                         force=True,
                     )
+
                     return False
 
-            # ----------------------------------------------
+                self.previous_time = (
+                    time.perf_counter()
+                )
+
+                self.last_error = None
+
+                self._publish_runtime_status(
+                    fps=0.0,
+                    print_status=(
+                        "unknown"
+                        if self.print_detection_enabled
+                        else "disabled"
+                    ),
+                    runtime_status="online",
+                    force=True,
+                )
+
+            # ==============================================
             # READ FRAME
-            # ----------------------------------------------
+            # ==============================================
 
             frame = self.read_frame()
 
             if frame is None:
+
                 self.release()
 
                 self._publish_runtime_status(
                     fps=0.0,
                     print_status="offline",
+                    runtime_status="offline",
                     force=True,
                 )
 
@@ -382,82 +814,110 @@ class Pipeline:
 
             self.frame_index += 1
 
-            # Skip alternate frames to reduce CPU usage
+            # ==============================================
+            # CPU OPTIMIZATION
+            #
+            # Process every second frame.
+            # ==============================================
+
             if self.frame_index % 2 != 0:
                 return True
 
-            # ----------------------------------------------
-            # SHARED YOLO INFERENCE
-            # ----------------------------------------------
+            self.processed_frame_count += 1
+
+            # ==============================================
+            # YOLO INFERENCE
+            # ==============================================
 
             detections = self.detect(
                 frame
             )
 
-            # ----------------------------------------------
-            # UPDATE TRACKER FRAME SIZE
-            #
-            # Required for min_bbox_area_ratio.
-            # ----------------------------------------------
+            # ==============================================
+            # TRACKER FRAME SIZE
+            # ==============================================
 
-            height, width = frame.shape[:2]
+            height, width = (
+                frame.shape[:2]
+            )
 
             self.tracker.set_frame_size(
                 width=width,
                 height=height,
             )
 
-            # ----------------------------------------------
-            # CAMERA-SPECIFIC TRACKING
-            # ----------------------------------------------
+            # ==============================================
+            # TRACK BAGS
+            # ==============================================
 
             tracks = self.track(
                 detections
             )
 
-            # ----------------------------------------------
+            # ==============================================
             # PRINT DETECTION
-            # ----------------------------------------------
+            # ==============================================
 
-            print_results = self.print_detection(
-                tracks,
-                detections,
+            print_results = (
+                self.print_detection(
+                    tracks,
+                    detections,
+                )
             )
 
-            # ----------------------------------------------
-            # STORE PRINT OBSERVATIONS
-            # ----------------------------------------------
+            # ==============================================
+            # RECORD PRINT VOTES
+            # ==============================================
 
             self.record_print_observations(
                 print_results,
                 tracks,
             )
 
-            # ----------------------------------------------
-            # FILTER UNSTABLE TRACKS
-            # ----------------------------------------------
+            # ==============================================
+            # JAM DETECTION V1
+            #
+            # IMPORTANT:
+            # This branch is completely independent from
+            # physical-center counting.
+            # ==============================================
 
-            countable_tracks = self.countable_tracks(
-                tracks
+            self.jam_result = (
+                self.jam_detector.update(
+                    tracks,
+                    timestamp=time.perf_counter(),
+                )
             )
 
-            # ----------------------------------------------
+            # ==============================================
+            # FILTER UNSTABLE TRACKS FOR COUNTING
+            # ==============================================
+
+            countable_tracks = (
+                self.countable_tracks(
+                    tracks
+                )
+            )
+
+            # ==============================================
             # COUNT PHYSICAL BAG CENTER CROSSING
-            # ----------------------------------------------
+            #
+            # JAM STATE DOES NOT BLOCK COUNTING.
+            # ==============================================
 
             count = self.count(
                 countable_tracks
             )
 
-            # ----------------------------------------------
+            # ==============================================
             # FPS
-            # ----------------------------------------------
+            # ==============================================
 
             fps = self.calculate_fps()
 
-            # ----------------------------------------------
+            # ==============================================
             # VISUALIZATION
-            # ----------------------------------------------
+            # ==============================================
 
             self.draw(
                 frame,
@@ -468,17 +928,17 @@ class Pipeline:
                 fps,
             )
 
-            # ----------------------------------------------
+            # ==============================================
             # STORE LATEST ANNOTATED FRAME
-            # ----------------------------------------------
+            # ==============================================
 
             self._set_latest_frame(
                 frame
             )
 
-            # ----------------------------------------------
+            # ==============================================
             # DASHBOARD / ELASTICSEARCH EVENTS
-            # ----------------------------------------------
+            # ==============================================
 
             self._publish_events(
                 count,
@@ -486,27 +946,39 @@ class Pipeline:
                 print_results,
             )
 
+            self.last_error = None
+
             return True
 
         except TimeoutError as error:
+
+            self.last_error = str(
+                error
+            )
+
             self.logger.warning(
-                f"{self.name} inference timeout: {error}"
+                f"{self.name} inference timeout: "
+                f"{error}"
             )
 
             self._publish_runtime_status(
                 fps=0.0,
                 print_status="inference_timeout",
+                runtime_status="online",
                 force=True,
             )
 
-            # Return True so pipeline stays active and does not
-            # fall further behind when inference times out.
             return True
 
-        except Exception:
+        except Exception as error:
+
+            self.last_error = str(
+                error
+            )
+
             self.logger.error(
-                f"Unhandled exception in pipeline {self.name}.",
-                exc_info=True,
+                f"Unhandled exception in pipeline "
+                f"{self.name}: {error}"
             )
 
             self.release()
@@ -514,6 +986,7 @@ class Pipeline:
             self._publish_runtime_status(
                 fps=0.0,
                 print_status="error",
+                runtime_status="error",
                 force=True,
             )
 
@@ -527,14 +1000,17 @@ class Pipeline:
         self,
         stop_event,
     ):
+
         self.logger.info(
             f"{self.name} pipeline thread started."
         )
 
         while not stop_event.is_set():
+
             active = self.process()
 
             if not active:
+
                 time.sleep(
                     0.1
                 )
@@ -543,32 +1019,53 @@ class Pipeline:
             f"{self.name} pipeline thread stopping."
         )
 
+        self.release()
+
+        self._publish_runtime_status(
+            fps=0.0,
+            print_status="offline",
+            runtime_status="offline",
+            force=True,
+        )
+
     # ======================================================
     # READ FRAME
     # ======================================================
 
-    def read_frame(self):
-        success, frame = self.camera.read()
+    def read_frame(
+        self,
+    ):
+
+        success, frame = (
+            self.camera.read()
+        )
 
         if not success:
+
             self.logger.warning(
-                f"{self.name} frame read failed or stream ended."
+                f"{self.name} frame read failed "
+                "or stream ended."
             )
+
             return None
 
         return frame
 
     # ======================================================
-    # SHARED DETECTION
+    # DETECT
     # ======================================================
 
     def detect(
         self,
         frame,
     ):
+
         return self.inference_manager.infer(
+
             camera_name=self.name,
+
             frame=frame,
+
             timeout=self.inference_timeout,
         )
 
@@ -580,13 +1077,16 @@ class Pipeline:
         self,
         detections,
     ):
+
         bag_detections = [
+
             detection
+
             for detection in detections
+
             if detection.get(
                 "class_id"
-            )
-            == 0
+            ) == 0
         ]
 
         return self.tracker.update(
@@ -601,9 +1101,13 @@ class Pipeline:
     def countable_tracks(
         tracks,
     ):
+
         return [
+
             track
+
             for track in tracks
+
             if not track.get(
                 "unstable",
                 False,
@@ -618,6 +1122,7 @@ class Pipeline:
         self,
         tracks,
     ):
+
         return self.counter.update(
             tracks
         )
@@ -631,7 +1136,9 @@ class Pipeline:
         tracks,
         detections,
     ):
+
         if not self.print_detection_enabled:
+
             return []
 
         return self.print_detector.update(
@@ -648,17 +1155,26 @@ class Pipeline:
         print_results,
         tracks,
     ):
+
         if not self.print_detection_enabled:
             return
 
         track_lookup = {
+
             track.get(
                 "track_id"
-            ): track
+            ):
+                track
+
             for track in tracks
+
+            if track.get(
+                "track_id"
+            ) is not None
         }
 
         for result in print_results:
+
             track_id = result.get(
                 "track_id"
             )
@@ -674,25 +1190,31 @@ class Pipeline:
             if not self._is_valid_print_observation(
                 track
             ):
+
                 continue
 
-            votes = self.track_print_votes.setdefault(
-                track_id,
-                [],
+            print_present = result.get(
+                "print_present"
+            )
+
+            if print_present is None:
+                continue
+
+            votes = (
+                self.track_print_votes.setdefault(
+                    track_id,
+                    [],
+                )
             )
 
             votes.append(
                 bool(
-                    result.get(
-                        "print_present",
-                        False,
-                    )
+                    print_present
                 )
             )
 
-            if len(
-                votes
-            ) > self.print_history_size:
+            if len(votes) > self.print_history_size:
+
                 del votes[
                     :-self.print_history_size
                 ]
@@ -715,31 +1237,142 @@ class Pipeline:
         self,
         track,
     ):
+
         if track.get(
             "unstable",
             False,
         ):
+
             return False
 
         if (
             self.skip_motion_jump_print_observations
-            and track.get(
+            and
+            track.get(
                 "motion_jump",
                 False,
             )
         ):
+
             return False
 
         if (
-            track.get(
-                "speed",
-                0.0,
+            float(
+                track.get(
+                    "speed",
+                    0.0,
+                )
+                or 0.0
             )
-            < self.min_print_observation_speed
+            <
+            self.min_print_observation_speed
         ):
+
             return False
 
         return True
+
+    # ======================================================
+    # TRIM PRINT HISTORY
+    # ======================================================
+
+    def _trim_print_history(
+        self,
+        active_track_ids=None,
+    ):
+
+        active_track_ids = (
+            active_track_ids
+            or set()
+        )
+
+        stale_ids = []
+
+        for (
+            track_id,
+            last_seen,
+        ) in self.track_print_last_seen.items():
+
+            age = (
+                self.frame_index
+                -
+                last_seen
+            )
+
+            if (
+                track_id not in active_track_ids
+                and
+                age > self.print_history_ttl_frames
+            ):
+
+                stale_ids.append(
+                    track_id
+                )
+
+        for track_id in stale_ids:
+
+            self.track_print_votes.pop(
+                track_id,
+                None,
+            )
+
+            self.track_print_last_seen.pop(
+                track_id,
+                None,
+            )
+
+    # ======================================================
+    # CLASSIFY PRINT HISTORY
+    # ======================================================
+
+    def _classify_print_history(
+        self,
+        track_id,
+    ):
+
+        if not self.print_detection_enabled:
+
+            return None
+
+        votes = (
+            self.track_print_votes.get(
+                track_id,
+                [],
+            )
+        )
+
+        observation_count = len(
+            votes
+        )
+
+        if (
+            observation_count
+            <
+            self.min_print_observations
+        ):
+
+            return None
+
+        positive_count = sum(
+            1
+            for vote in votes
+            if vote
+        )
+
+        ratio = (
+            positive_count
+            /
+            max(
+                observation_count,
+                1,
+            )
+        )
+
+        return (
+            ratio
+            >=
+            self.print_vote_threshold
+        )
 
     # ======================================================
     # DRAW
@@ -754,27 +1387,53 @@ class Pipeline:
         count,
         fps,
     ):
+
         self.visualizer.visualize(
+
             frame=frame,
+
             camera_name=self.name,
+
             count=count,
+
             printed_count=self.printed_count,
+
             missing_count=self.missing_count,
+
             fps=fps,
+
             roi=self.roi,
+
             bag_tracks=tracks,
+
             all_detections=detections,
+
             print_results=print_results,
+
             display_config=self.display_config,
-            counted_bags=self.counter.last_counted_bags,
+
+            counted_bags=(
+                self.counter.last_counted_bags
+            ),
+
+            # ==========================================
+            # JAM V1
+            # ==========================================
+
+            jam_result=self.jam_result,
+
+            jam_roi=self.jam_roi,
         )
 
     # ======================================================
-    # DISPLAY FRAME
+    # DISPLAY
     # ======================================================
 
-    def publish(self):
-        frame = self._get_latest_frame()
+    def publish(
+        self,
+    ):
+
+        frame = self.get_latest_frame()
 
         if frame is None:
             return
@@ -792,22 +1451,46 @@ class Pipeline:
         self,
         frame,
     ):
+
         with self._frame_lock:
+
             self._latest_frame = (
+
                 frame.copy()
+
                 if frame is not None
+
                 else None
             )
+
+    # ======================================================
+    # PUBLIC LATEST FRAME
+    # ======================================================
+
+    def get_latest_frame(
+        self,
+    ):
+
+        with self._frame_lock:
+
+            return (
+
+                self._latest_frame.copy()
+
+                if self._latest_frame is not None
+
+                else None
+            )
+
+    # ======================================================
+    # BACKWARD COMPATIBILITY
+    # ======================================================
 
     def _get_latest_frame(
         self,
     ):
-        with self._frame_lock:
-            return (
-                self._latest_frame.copy()
-                if self._latest_frame is not None
-                else None
-            )
+
+        return self.get_latest_frame()
 
     # ======================================================
     # FPS
@@ -816,33 +1499,68 @@ class Pipeline:
     def calculate_fps(
         self,
     ):
-        current_time = time.time()
 
-        fps = (
-            1.0
-            / max(
-                current_time
-                - self.previous_time,
-                1e-6,
-            )
+        current_time = (
+            time.perf_counter()
         )
 
-        self.previous_time = current_time
+        elapsed = max(
+            current_time
+            -
+            self.previous_time,
+            1e-6,
+        )
 
-        return fps
+        self.previous_time = (
+            current_time
+        )
+
+        return (
+            1.0
+            /
+            elapsed
+        )
 
     # ======================================================
-    # RELEASE CAMERA
+    # RELEASE
     # ======================================================
 
     def release(
         self,
     ):
-        self.camera.release()
+
+        try:
+
+            self.camera.release()
+
+        except Exception:
+
+            self.logger.warning(
+                f"{self.name}: camera release failed."
+            )
 
         self.connected = False
 
+        # ----------------------------------------------
+        # Reset jam temporal memory when stream ends.
+        # ----------------------------------------------
+
+        try:
+
+            self.jam_detector.reset()
+
+            self.jam_result = (
+                self.jam_detector._empty_result()
+            )
+
+        except Exception:
+
+            self.logger.warning(
+                f"{self.name}: JamDetector reset failed."
+            )
+
         with self._frame_lock:
+
             self._latest_frame = None
 
     # ======================================================
@@ -855,9 +1573,19 @@ class Pipeline:
         fps,
         print_results,
     ):
+
+        # --------------------------------------------------
+        # Finalize print result ONLY for bags that crossed
+        # during this frame.
+        # --------------------------------------------------
+
         counted_results = (
             self._update_print_totals()
         )
+
+        # --------------------------------------------------
+        # Current live print status
+        # --------------------------------------------------
 
         live_print_status = (
             self._summarize_print_status(
@@ -865,167 +1593,184 @@ class Pipeline:
             )
         )
 
+        # --------------------------------------------------
+        # Count-event print status
+        # --------------------------------------------------
+
         counted_print_status = (
-            self._summarize_print_status(
+
+            self._summarize_counted_print_status(
                 counted_results
             )
+
             if counted_results
+
             else None
         )
 
-        # ----------------------------------------------
+        # ==================================================
         # DASHBOARD
-        # ----------------------------------------------
+        # ==================================================
 
         self._publish_runtime_status(
+
             fps=fps,
+
             print_status=live_print_status,
+
+            runtime_status="online",
+
+            frame_processed=True,
+
+            count_event=bool(
+                counted_results
+            ),
         )
 
-        # ----------------------------------------------
-        # ELASTICSEARCH
-        # ----------------------------------------------
+        # ==================================================
+        # ELASTICSEARCH CAMERA EVENT
+        # ==================================================
 
         if self.elasticsearch is not None:
-            self.elasticsearch.create_camera_event(
-                self.name,
-                fps,
-                "online",
-            )
 
-            if (
-                counted_print_status is not None
-                and counted_print_status
-                != self.last_print_status
-            ):
-                self.elasticsearch.create_print_event(
+            try:
+
+                self.elasticsearch.create_camera_event(
                     self.name,
-                    counted_print_status == "ok",
+                    fps,
+                    "online",
                 )
 
-        # ----------------------------------------------
+            except Exception:
+
+                self.logger.warning(
+                    f"{self.name}: failed publishing "
+                    "camera event to Elasticsearch."
+                )
+
+        # ==================================================
+        # ELASTICSEARCH PRINT EVENT
+        # ==================================================
+
+        if (
+            self.elasticsearch is not None
+            and
+            counted_print_status
+            in {
+                "printed",
+                "missing",
+            }
+            and
+            counted_print_status
+            != self.last_print_status
+        ):
+
+            try:
+
+                self.elasticsearch.create_print_event(
+
+                    self.name,
+
+                    counted_print_status
+                    == "printed",
+                )
+
+            except Exception:
+
+                self.logger.warning(
+                    f"{self.name}: failed publishing "
+                    "print event to Elasticsearch."
+                )
+
+        # ==================================================
         # COUNT EVENTS
-        # ----------------------------------------------
+        # ==================================================
 
         for counted_bag in counted_results:
+
+            # ----------------------------------------------
+            # ELASTICSEARCH COUNT EVENT
+            # ----------------------------------------------
+
             if self.elasticsearch is not None:
-                self.elasticsearch.create_count_event(
-                    self.name,
-                    counted_bag[
-                        "total_count"
-                    ],
-                    counted_bag[
-                        "center"
-                    ],
-                )
+
+                try:
+
+                    self.elasticsearch.create_count_event(
+
+                        self.name,
+
+                        counted_bag[
+                            "total_count"
+                        ],
+
+                        counted_bag[
+                            "center"
+                        ],
+                    )
+
+                except Exception:
+
+                    self.logger.warning(
+                        f"{self.name}: failed publishing "
+                        "count event to Elasticsearch."
+                    )
+
+            # ----------------------------------------------
+            # JSONL COUNT EVENT
+            # ----------------------------------------------
 
             if self.count_logger is not None:
-                self.count_logger.log_count_event(
-                    camera_name=self.name,
-                    total_count=counted_bag[
-                        "total_count"
-                    ],
-                    track_id=counted_bag[
-                        "track_id"
-                    ],
-                    center=counted_bag[
-                        "center"
-                    ],
-                    print_present=counted_bag[
-                        "print_present"
-                    ],
-                    printed_count=self.printed_count,
-                    missing_count=self.missing_count,
-                )
+
+                try:
+
+                    self.count_logger.log_count(
+
+                        camera_name=self.name,
+
+                        total_count=counted_bag[
+                            "total_count"
+                        ],
+
+                        track_id=counted_bag[
+                            "track_id"
+                        ],
+
+                        center=counted_bag[
+                            "center"
+                        ],
+
+                        print_present=counted_bag[
+                            "print_present"
+                        ],
+
+                        printed_count=counted_bag[
+                            "printed_count"
+                        ],
+
+                        missing_count=counted_bag[
+                            "missing_count"
+                        ],
+
+                        print_detection_enabled=(
+                            self.print_detection_enabled
+                        ),
+                    )
+
+                except Exception:
+
+                    self.logger.warning(
+                        f"{self.name}: failed writing "
+                        "count event."
+                    )
 
         self.last_count = count
 
         if counted_print_status is not None:
+
             self.last_print_status = (
                 counted_print_status
             )
-
-    # ======================================================
-    # DASHBOARD RUNTIME STATUS
-    # ======================================================
-
-    def _publish_runtime_status(
-        self,
-        fps,
-        print_status,
-        force=False,
-    ):
-        if self.dashboard_state is None:
-            return
-
-        current_time = time.monotonic()
-
-        if (
-            not force
-            and (
-                current_time
-                - self.last_dashboard_publish_time
-            )
-            < self.dashboard_publish_interval
-        ):
-            return
-
-        status = (
-            "online"
-            if self.connected
-            else "offline"
-        )
-
-        self.dashboard_state.update_camera(
-            camera_name=self.name,
-            count=self.counter.total_count,
-            fps=fps,
-            status=status,
-            print_status=print_status,
-            printed_count=self.printed_count,
-            missing_count=self.missing_count,
-            printed_bags_count=self.printed_count,
-            not_printed_bags_count=self.missing_count,
-        )
-
-        self.last_dashboard_publish_time = (
-            current_time
-        )
-
-    # ======================================================
-    # SUMMARIZE PRINT STATUS
-    # ======================================================
-
-    def _summarize_print_status(
-        self,
-        print_results,
-    ):
-        if not self.print_detection_enabled:
-            return "disabled"
-
-        if not print_results:
-            return "no_bag"
-
-        print_values = [
-            result.get(
-                "print_present"
-            )
-            for result in print_results
-            if result.get(
-                "print_present"
-            )
-            is not None
-        ]
-
-        if not print_values:
-            return "unknown"
-
-        if all(
-            print_values
-        ):
-            return "ok"
-
-        return "missing"
 
     # ======================================================
     # UPDATE PRINT TOTALS
@@ -1034,230 +1779,377 @@ class Pipeline:
     def _update_print_totals(
         self,
     ):
-        if not self.counter.last_counted_bags:
-            return []
-
-        # ----------------------------------------------
-        # PRINT DETECTION DISABLED
-        # ----------------------------------------------
-
-        if not self.print_detection_enabled:
-            return [
-                {
-                    "track_id":
-                        counted_bag[
-                            "track_id"
-                        ],
-                    "center":
-                        counted_bag[
-                            "center"
-                        ],
-                    "print_present":
-                        None,
-                    "total_count":
-                        self.last_count
-                        + index
-                        + 1,
-                }
-                for index, counted_bag
-                in enumerate(
-                    self.counter.last_counted_bags
-                )
-            ]
 
         counted_results = []
 
-        # ----------------------------------------------
-        # PRINT DETECTION ENABLED
-        # ----------------------------------------------
-
-        for index, counted_bag in enumerate(
+        counted_bags = (
             self.counter.last_counted_bags
-        ):
-            print_present = (
-                self._finalize_print_status(
-                    counted_bag[
-                        "track_id"
-                    ]
-                )
+            or []
+        )
+
+        for counted_bag in counted_bags:
+
+            track_id = counted_bag.get(
+                "track_id"
             )
 
-            if print_present is True:
-                self.printed_count += 1
+            print_present = None
 
-            elif print_present is False:
-                self.missing_count += 1
+            if self.print_detection_enabled:
+
+                print_present = (
+                    self._classify_print_history(
+                        track_id
+                    )
+                )
+
+                if print_present is True:
+
+                    self.printed_count += 1
+
+                elif print_present is False:
+
+                    self.missing_count += 1
+
+            result = dict(
+                counted_bag
+            )
+
+            result[
+                "print_present"
+            ] = print_present
+
+            result[
+                "printed_count"
+            ] = self.printed_count
+
+            result[
+                "missing_count"
+            ] = self.missing_count
 
             counted_results.append(
-                {
-                    "track_id":
-                        counted_bag[
-                            "track_id"
-                        ],
-                    "center":
-                        counted_bag[
-                            "center"
-                        ],
-                    "print_present":
-                        print_present,
-                    "total_count":
-                        self.last_count
-                        + index
-                        + 1,
-                }
+                result
             )
+
+            # ----------------------------------------------
+            # This bag is already finalized.
+            # Its print-vote history is no longer needed.
+            # ----------------------------------------------
+
+            if track_id is not None:
+
+                self.track_print_votes.pop(
+                    track_id,
+                    None,
+                )
+
+                self.track_print_last_seen.pop(
+                    track_id,
+                    None,
+                )
 
         return counted_results
 
     # ======================================================
-    # FINALIZE PRINT STATUS
+    # SUMMARIZE LIVE PRINT STATUS
     # ======================================================
 
-    def _finalize_print_status(
+    def _summarize_print_status(
         self,
-        track_id,
+        print_results,
     ):
-        votes = self.track_print_votes.get(
-            track_id,
-            [],
-        )
 
-        self.track_print_votes.pop(
-            track_id,
-            None,
-        )
+        if not self.print_detection_enabled:
 
-        self.track_print_last_seen.pop(
-            track_id,
-            None,
-        )
+            return "disabled"
 
-        # Insufficient observations = unknown.
-        if len(
-            votes
-        ) < self.min_print_votes:
+        if not print_results:
+
+            return "unknown"
+
+        statuses = []
+
+        for result in print_results:
+
+            value = result.get(
+                "print_present"
+            )
+
+            if value is True:
+
+                statuses.append(
+                    "printed"
+                )
+
+            elif value is False:
+
+                statuses.append(
+                    "missing"
+                )
+
+        if not statuses:
+
+            return "unknown"
+
+        if "missing" in statuses:
+
+            return "missing"
+
+        return "printed"
+
+    # ======================================================
+    # SUMMARIZE COUNTED PRINT STATUS
+    # ======================================================
+
+    @staticmethod
+    def _summarize_counted_print_status(
+        counted_results,
+    ):
+
+        if not counted_results:
             return None
 
-        positive_votes = sum(
-            1
-            for vote in votes
-            if vote
-        )
+        statuses = []
 
-        positive_ratio = (
-            positive_votes
-            / len(
-                votes
+        for result in counted_results:
+
+            value = result.get(
+                "print_present"
             )
-        )
 
-        return (
-            positive_ratio
-            >= self.print_vote_threshold
-        )
+            if value is True:
+
+                statuses.append(
+                    "printed"
+                )
+
+            elif value is False:
+
+                statuses.append(
+                    "missing"
+                )
+
+            else:
+
+                statuses.append(
+                    "unknown"
+                )
+
+        if "missing" in statuses:
+
+            return "missing"
+
+        if "printed" in statuses:
+
+            return "printed"
+
+        return "unknown"
 
     # ======================================================
-    # TRIM PRINT HISTORY
+    # PUBLISH RUNTIME STATUS
     # ======================================================
 
-    def _trim_print_history(
+    def _publish_runtime_status(
         self,
-        active_track_ids,
+        fps,
+        print_status,
+        runtime_status=None,
+        force=False,
+        frame_processed=False,
+        count_event=False,
     ):
-        fresh_ids = {
-            track_id
-            for (
-                track_id,
-                last_seen,
-            )
-            in self.track_print_last_seen.items()
-            if (
-                self.frame_index
-                - last_seen
-                <= self.print_history_ttl_frames
-            )
-        }
 
-        retained_ids = (
-            set(
-                active_track_ids
-            )
-            | fresh_ids
-        )
-
-        self.track_print_votes = {
-            track_id: votes
-            for (
-                track_id,
-                votes,
-            )
-            in self.track_print_votes.items()
-            if track_id in retained_ids
-        }
-
-        self.track_print_last_seen = {
-            track_id: last_seen
-            for (
-                track_id,
-                last_seen,
-            )
-            in self.track_print_last_seen.items()
-            if track_id in retained_ids
-        }
-
-    # ======================================================
-    # RESTORE PERSISTED COUNTS
-    # ======================================================
-
-    def _restore_persisted_counts(
-        self,
-    ):
         if self.dashboard_state is None:
             return
 
-        snapshot = (
-            self.dashboard_state.snapshot()
+        current_time = (
+            time.monotonic()
         )
 
-        camera_state = (
-            snapshot
-            .get(
-                "cameras",
-                {},
+        # --------------------------------------------------
+        # Throttle ordinary dashboard updates.
+        #
+        # Count events, state transitions, startup/shutdown
+        # and explicit force updates bypass throttling.
+        # --------------------------------------------------
+
+        if (
+            not force
+            and
+            not count_event
+            and
+            (
+                current_time
+                -
+                self.last_dashboard_publish_time
             )
-            .get(
-                self.name,
-                {},
+            <
+            self.dashboard_publish_interval
+        ):
+
+            return
+
+        self.last_dashboard_publish_time = (
+            current_time
+        )
+
+        now_iso = (
+            datetime.now(
+                timezone.utc
+            )
+            .isoformat()
+        )
+
+        runtime_status = (
+            runtime_status
+            or
+            (
+                "online"
+                if self.connected
+                else "offline"
             )
         )
 
-        self.counter.total_count = int(
-            camera_state.get(
-                "count",
+        jam_result = (
+            self.jam_result
+            if isinstance(
+                self.jam_result,
+                dict,
+            )
+            else {}
+        )
+
+        jam_status = (
+            jam_result.get(
+                "status",
+                "normal",
+            )
+            if self.jam_detection_enabled
+            else "disabled"
+        )
+
+        jam_detected = bool(
+            jam_result.get(
+                "jam_detected",
+                False,
+            )
+        )
+
+        jam_warning = bool(
+            jam_result.get(
+                "warning",
+                False,
+            )
+        )
+
+        active_jam_track_ids = (
+            jam_result.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        active_jam_count = int(
+            jam_result.get(
+                "active_jam_count",
                 0,
             )
             or 0
         )
 
-        # Print totals are restored only for
-        # print-enabled cameras.
-        if self.print_detection_enabled:
-            self.printed_count = int(
-                camera_state.get(
-                    "printed_count",
-                    0,
-                )
-                or 0
+        jam_tracks = (
+            jam_result.get(
+                "tracks",
+                [],
+            )
+            or []
+        )
+
+        try:
+
+            self.dashboard_state.update_camera(
+
+                camera_name=self.name,
+
+                count=self.counter.total_count,
+
+                total_count=(
+                    self.counter.total_count
+                ),
+
+                fps=fps,
+
+                status=runtime_status,
+
+                print_status=print_status,
+
+                printed_count=self.printed_count,
+
+                missing_count=self.missing_count,
+
+                printed_bags_count=(
+                    self.printed_count
+                ),
+
+                not_printed_bags_count=(
+                    self.missing_count
+                ),
+
+                print_detection_enabled=(
+                    self.print_detection_enabled
+                ),
+
+                frame_count=(
+                    self.processed_frame_count
+                ),
+
+                last_frame_at=(
+                    now_iso
+                    if frame_processed
+                    else None
+                ),
+
+                last_count_at=(
+                    now_iso
+                    if count_event
+                    else None
+                ),
+
+                last_error=(
+                    self.last_error
+                    if self.last_error
+                    else ""
+                ),
+
+                # ==========================================
+                # JAM V1 DASHBOARD STATE
+                # ==========================================
+
+                jam_detection_enabled=(
+                    self.jam_detection_enabled
+                ),
+
+                jam_status=jam_status,
+
+                jam_detected=jam_detected,
+
+                jam_warning=jam_warning,
+
+                active_jam_count=(
+                    active_jam_count
+                ),
+
+                active_jam_track_ids=(
+                    active_jam_track_ids
+                ),
+
+                jam_tracks=jam_tracks,
             )
 
-            self.missing_count = int(
-                camera_state.get(
-                    "missing_count",
-                    0,
-                )
-                or 0
-            )
+        except Exception:
 
-        else:
-            self.printed_count = 0
-            self.missing_count = 0
+            self.logger.warning(
+                f"{self.name}: dashboard runtime "
+                "update failed."
+            )

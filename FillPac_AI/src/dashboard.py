@@ -1,54 +1,78 @@
 """
 ==========================================================
 FillPac AI
-Dashboard State Module
+Production Dashboard State Manager
 ==========================================================
 
 Purpose
 -------
-Thread-safe dashboard state manager.
+Maintains the runtime state consumed by the dashboard
+backend.
 
 Architecture
 ------------
-Pipeline
-    |
-    v
+Camera Pipeline
+      |
+      | update_camera(...)
+      v
 DashboardState
-    |
-    v
+      |
+      +---- Camera Runtime State
+      +---- Production Totals
+      +---- Service Health
+      +---- Jam Runtime State
+      +---- System Status
+      |
+      v
 dashboard/backend/state.json
-    |
-    v
-FastAPI Dashboard Backend
-    |
-    +---- REST API
-    |
-    +---- Socket.IO
-    |
-    v
-Dashboard Frontend
+      |
+      v
+Dashboard Backend
+      |
+      +---- REST API
+      +---- Socket.IO
+      +---- Production Dashboard
+      +---- Live Monitor
+      +---- Camera Management
+      +---- Jam Monitoring
 
-Features
---------
-- Thread-safe camera updates
-- Global production totals
-- Printed / not-printed totals
-- Camera FPS/status
-- Service health
-- Background persistence
-- Graceful shutdown
-- Existing-state restoration
-- Absolute project-relative state path
+
+Important
+---------
+DashboardState does NOT perform:
+
+- YOLO inference
+- Bag counting
+- Tracking
+- Print detection
+- Jam detection
+
+It only stores and publishes the latest runtime state.
+
+Counting remains controlled by the existing physical
+bag-center crossing logic.
+
+Jam detection remains controlled by JamDetector inside
+the camera pipeline.
 ==========================================================
 """
 
 import json
+import logging
+import math
+import os
+import tempfile
 import threading
 import time
 
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+logger = logging.getLogger(
+    "fillpac.dashboard_state"
+)
 
 
 # ==========================================================
@@ -71,120 +95,1560 @@ DEFAULT_STATE_FILE = (
 
 
 # ==========================================================
+# HELPERS
+# ==========================================================
+
+def utc_now():
+    """
+    Current UTC datetime.
+    """
+
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def utc_now_iso():
+    """
+    Current UTC ISO timestamp.
+    """
+
+    return (
+        utc_now()
+        .isoformat()
+    )
+
+
+def safe_int(
+    value,
+    default=0,
+):
+    """
+    Safely convert a value to int.
+    """
+
+    try:
+        return int(value)
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return default
+
+
+def safe_float(
+    value,
+    default=0.0,
+):
+    """
+    Safely convert a value to finite float.
+    """
+
+    try:
+
+        result = float(
+            value
+        )
+
+        if not math.isfinite(
+            result
+        ):
+            return default
+
+        return result
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return default
+
+
+def safe_bool(
+    value,
+    default=False,
+):
+    """
+    Safely normalize common boolean representations.
+    """
+
+    if isinstance(
+        value,
+        bool,
+    ):
+        return value
+
+    if value is None:
+        return default
+
+    if isinstance(
+        value,
+        str,
+    ):
+
+        normalized = (
+            value
+            .strip()
+            .lower()
+        )
+
+        if normalized in {
+            "true",
+            "1",
+            "yes",
+            "on",
+            "enabled",
+        }:
+            return True
+
+        if normalized in {
+            "false",
+            "0",
+            "no",
+            "off",
+            "disabled",
+        }:
+            return False
+
+    return bool(
+        value
+    )
+
+
+# ==========================================================
+# JAM HELPERS
+# ==========================================================
+
+JAM_STATUSES = {
+    "normal",
+    "slow",
+    "warning",
+    "jam",
+    "recovering",
+    "disabled",
+}
+
+
+def normalize_jam_status(
+    value,
+    enabled=True,
+):
+    """
+    Normalize jam detector state for dashboard storage.
+    """
+
+    if not enabled:
+        return "disabled"
+
+    status = str(
+        value or "normal"
+    ).strip().lower()
+
+    if status not in JAM_STATUSES:
+        return "normal"
+
+    return status
+
+
+def normalize_track_ids(
+    value,
+):
+    """
+    Normalize active jam Track IDs into a JSON-safe list.
+    """
+
+    if value is None:
+        return []
+
+    if isinstance(
+        value,
+        (
+            list,
+            tuple,
+            set,
+        ),
+    ):
+
+        result = []
+
+        for item in value:
+
+            try:
+                item = int(item)
+
+            except (
+                TypeError,
+                ValueError,
+                OverflowError,
+            ):
+                continue
+
+            if item not in result:
+                result.append(item)
+
+        return result
+
+    try:
+
+        return [
+            int(value)
+        ]
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+
+        return []
+
+
+# ==========================================================
 # DASHBOARD STATE
 # ==========================================================
 
 class DashboardState:
+    """
+    Thread-safe FillPac dashboard runtime state manager.
+
+    One instance should be shared by all camera pipelines
+    and the main application.
+
+    The state is periodically written to:
+
+        dashboard/backend/state.json
+
+    The dashboard server reads that file and broadcasts
+    changes through Socket.IO.
+    """
+
+    # ======================================================
+    # INITIALIZATION
+    # ======================================================
 
     def __init__(
         self,
-        enabled=True,
         state_file=None,
-        logger=None,
-        persist_interval_seconds=0.25,
+        publish_interval=0.25,
+        stale_timeout=10.0,
+        auto_publish=True,
     ):
 
-        # ==================================================
-        # CONFIGURATION
-        # ==================================================
+        # --------------------------------------------------
+        # State file
+        # --------------------------------------------------
 
-        self.enabled = bool(enabled)
+        if state_file is None:
 
-        self.logger = logger
-
-        self.persist_interval_seconds = max(
-            float(persist_interval_seconds),
-            0.1,
-        )
-
-        # ==================================================
-        # STATE FILE
-        # ==================================================
-
-        if state_file:
-
-            state_path = Path(
-                state_file
+            self.state_file = (
+                DEFAULT_STATE_FILE
             )
-
-            if state_path.is_absolute():
-
-                self.state_file = (
-                    state_path.resolve()
-                )
-
-            else:
-
-                self.state_file = (
-                    PROJECT_ROOT
-                    / state_path
-                ).resolve()
 
         else:
 
-            self.state_file = (
-                DEFAULT_STATE_FILE.resolve()
+            self.state_file = Path(
+                state_file
             )
 
-        # ==================================================
-        # APPLICATION STATE
-        # ==================================================
+            if not self.state_file.is_absolute():
 
-        self.system_status = "idle"
+                self.state_file = (
+                    PROJECT_ROOT
+                    /
+                    self.state_file
+                )
 
-        self.cameras = {}
-
-        self.service_status = {}
-
-        self.start_time = datetime.now(
-            timezone.utc
+        self.state_file = (
+            self.state_file.resolve()
         )
 
-        # ==================================================
-        # THREADING
-        # ==================================================
 
-        self._lock = threading.RLock()
+        # --------------------------------------------------
+        # Configuration
+        # --------------------------------------------------
 
-        self._stop_event = threading.Event()
+        self.publish_interval = max(
+            0.05,
+            safe_float(
+                publish_interval,
+                0.25,
+            ),
+        )
 
-        self._persist_event = threading.Event()
+        self.stale_timeout = max(
+            1.0,
+            safe_float(
+                stale_timeout,
+                10.0,
+            ),
+        )
 
-        self._persistence_thread = None
+        self.auto_publish = bool(
+            auto_publish
+        )
 
-        self._dirty = False
 
-        self._closed = False
+        # --------------------------------------------------
+        # Synchronization
+        # --------------------------------------------------
 
-        self.last_persist_time = 0.0
+        self._lock = (
+            threading.RLock()
+        )
 
-        # ==================================================
-        # INITIALIZATION
-        # ==================================================
+        self._stop_event = (
+            threading.Event()
+        )
 
-        if self.enabled:
+        self._publisher_thread = None
 
-            self.state_file.parent.mkdir(
-                parents=True,
-                exist_ok=True,
+
+        # --------------------------------------------------
+        # Internal publishing state
+        # --------------------------------------------------
+
+        self._dirty = True
+
+        self._last_publish_monotonic = 0.0
+
+        self._last_publish_time = None
+
+        self._publish_count = 0
+
+        self._publish_errors = 0
+
+        self._last_error = None
+
+
+        # --------------------------------------------------
+        # Runtime timestamps
+        # --------------------------------------------------
+
+        self._startup_datetime = (
+            utc_now()
+        )
+
+        self._startup_monotonic = (
+            time.monotonic()
+        )
+
+
+        # --------------------------------------------------
+        # Main state
+        # --------------------------------------------------
+
+        self._state = {
+
+            "system_status":
+                "starting",
+
+            "startup_time":
+                self._startup_datetime.isoformat(),
+
+            "updated_at":
+                utc_now_iso(),
+
+            "service_status": {
+
+                "model_loaded":
+                    False,
+
+                "inference_manager_running":
+                    False,
+
+                "elasticsearch_connected":
+                    False,
+
+                "dashboard_enabled":
+                    True,
+            },
+
+            "total_count":
+                0,
+
+            "total_printed_count":
+                0,
+
+            "total_missing_count":
+                0,
+
+            # ----------------------------------------------
+            # Backward-compatible aliases
+            # ----------------------------------------------
+
+            "total_printed_bags_count":
+                0,
+
+            "total_not_printed_bags_count":
+                0,
+
+            "cameras":
+                {},
+        }
+
+
+        # --------------------------------------------------
+        # Prepare directory
+        # --------------------------------------------------
+
+        self.state_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+
+        # --------------------------------------------------
+        # Initial publish
+        # --------------------------------------------------
+
+        self.publish(
+            force=True
+        )
+
+
+        # --------------------------------------------------
+        # Background publisher
+        # --------------------------------------------------
+
+        if self.auto_publish:
+
+            self.start()
+
+
+        logger.info(
+            "DashboardState initialized."
+        )
+
+        logger.info(
+            "Dashboard state file: %s",
+            self.state_file,
+        )
+
+        logger.info(
+            "Dashboard publish interval: %.3fs",
+            self.publish_interval,
+        )
+
+
+    # ======================================================
+    # CAMERA REGISTRATION
+    # ======================================================
+
+    def register_camera(
+        self,
+        camera_name,
+        *,
+        camera_id=None,
+        enabled=True,
+        configured=True,
+        mode=None,
+        print_detection_enabled=False,
+        jam_detection_enabled=False,
+        source_type=None,
+        metadata=None,
+    ):
+        """
+        Register a camera in dashboard state.
+
+        This should normally be called once while building
+        each camera pipeline.
+
+        Jam fields are initialized here so every camera has
+        a predictable schema before the first processed
+        frame arrives.
+        """
+
+        name = str(
+            camera_name
+        )
+
+        now = utc_now_iso()
+
+        with self._lock:
+
+            existing = (
+                self._state[
+                    "cameras"
+                ].get(
+                    name,
+                    {}
+                )
             )
 
-            self._log(
-                "info",
-                (
-                    "Dashboard state file: "
-                    f"{self.state_file}"
-                ),
+            normalized_jam_enabled = (
+                safe_bool(
+                    existing.get(
+                        "jam_detection_enabled",
+                        jam_detection_enabled,
+                    )
+                )
             )
 
-            # Restore previous counts if state exists.
-            self._load_existing_state()
+            camera_state = {
 
-            # Start single persistence worker.
-            self._start_background_persistence()
+                "id":
+                    camera_id,
 
-            # Force initial state write.
-            self._mark_dirty()
+                "name":
+                    name,
+
+                "enabled":
+                    safe_bool(
+                        enabled,
+                        True,
+                    ),
+
+                "configured":
+                    safe_bool(
+                        configured,
+                        True,
+                    ),
+
+                "mode":
+                    mode,
+
+                "source_type":
+                    source_type,
+
+                "status":
+                    existing.get(
+                        "status",
+                        "offline",
+                    ),
+
+                "count":
+                    safe_int(
+                        existing.get(
+                            "count",
+                            0,
+                        )
+                    ),
+
+                "total_count":
+                    safe_int(
+                        existing.get(
+                            "total_count",
+                            existing.get(
+                                "count",
+                                0,
+                            ),
+                        )
+                    ),
+
+                "printed_count":
+                    safe_int(
+                        existing.get(
+                            "printed_count",
+                            0,
+                        )
+                    ),
+
+                "missing_count":
+                    safe_int(
+                        existing.get(
+                            "missing_count",
+                            0,
+                        )
+                    ),
+
+                # ------------------------------------------
+                # Compatibility aliases
+                # ------------------------------------------
+
+                "printed_bags_count":
+                    safe_int(
+                        existing.get(
+                            "printed_bags_count",
+                            existing.get(
+                                "printed_count",
+                                0,
+                            ),
+                        )
+                    ),
+
+                "not_printed_bags_count":
+                    safe_int(
+                        existing.get(
+                            "not_printed_bags_count",
+                            existing.get(
+                                "missing_count",
+                                0,
+                            ),
+                        )
+                    ),
+
+                # ------------------------------------------
+                # PRINT DETECTION
+                # ------------------------------------------
+
+                "print_detection_enabled":
+                    safe_bool(
+                        print_detection_enabled
+                    ),
+
+                "print_status":
+                    existing.get(
+                        "print_status",
+                        (
+                            "unknown"
+                            if print_detection_enabled
+                            else "disabled"
+                        ),
+                    ),
+
+                # ------------------------------------------
+                # JAM DETECTION
+                # ------------------------------------------
+
+                "jam_detection_enabled":
+                    normalized_jam_enabled,
+
+                "jam_status":
+                    normalize_jam_status(
+                        existing.get(
+                            "jam_status",
+                            "normal",
+                        ),
+                        normalized_jam_enabled,
+                    ),
+
+                "jam_detected":
+                    safe_bool(
+                        existing.get(
+                            "jam_detected",
+                            False,
+                        )
+                    ),
+
+                "jam_warning":
+                    safe_bool(
+                        existing.get(
+                            "jam_warning",
+                            False,
+                        )
+                    ),
+
+                "active_jam_count":
+                    max(
+                        0,
+                        safe_int(
+                            existing.get(
+                                "active_jam_count",
+                                0,
+                            )
+                        ),
+                    ),
+
+                "active_jam_track_ids":
+                    normalize_track_ids(
+                        existing.get(
+                            "active_jam_track_ids",
+                            [],
+                        )
+                    ),
+
+                # ------------------------------------------
+                # FPS
+                # ------------------------------------------
+
+                "fps":
+                    safe_float(
+                        existing.get(
+                            "fps",
+                            0.0,
+                        )
+                    ),
+
+                "frame_count":
+                    safe_int(
+                        existing.get(
+                            "frame_count",
+                            0,
+                        )
+                    ),
+
+                "last_frame_at":
+                    existing.get(
+                        "last_frame_at"
+                    ),
+
+                "last_detection_at":
+                    existing.get(
+                        "last_detection_at"
+                    ),
+
+                "last_count_at":
+                    existing.get(
+                        "last_count_at"
+                    ),
+
+                "last_error":
+                    existing.get(
+                        "last_error"
+                    ),
+
+                "registered_at":
+                    existing.get(
+                        "registered_at",
+                        now,
+                    ),
+
+                "updated_at":
+                    now,
+
+                "metadata":
+                    (
+                        deepcopy(
+                            metadata
+                        )
+                        if isinstance(
+                            metadata,
+                            dict,
+                        )
+                        else {}
+                    ),
+            }
+
+            self._state[
+                "cameras"
+            ][name] = camera_state
+
+            self._touch_locked()
+
+            self._recalculate_totals_locked()
+
+
+    # ======================================================
+    # CAMERA UPDATE
+    # ======================================================
+
+    def update_camera(
+        self,
+        camera_name,
+        *,
+        status=None,
+        count=None,
+        total_count=None,
+        printed_count=None,
+        missing_count=None,
+        printed_bags_count=None,
+        not_printed_bags_count=None,
+        fps=None,
+        frame_count=None,
+        print_status=None,
+        print_detection_enabled=None,
+
+        # --------------------------------------------------
+        # JAM DETECTION
+        # --------------------------------------------------
+
+        jam_detection_enabled=None,
+        jam_status=None,
+        jam_detected=None,
+        jam_warning=None,
+        active_jam_count=None,
+        active_jam_track_ids=None,
+
+        enabled=None,
+        configured=None,
+        mode=None,
+        source_type=None,
+        last_frame_at=None,
+        last_detection_at=None,
+        last_count_at=None,
+        last_error=None,
+        metadata=None,
+        **extra_fields,
+    ):
+        """
+        Update camera runtime state.
+
+        The common jam fields are explicit parameters.
+
+        Additional future fields are still supported through
+        **extra_fields, so the method remains extensible.
+        """
+
+        name = str(
+            camera_name
+        )
+
+        with self._lock:
+
+            if (
+                name
+                not in
+                self._state[
+                    "cameras"
+                ]
+            ):
+
+                self.register_camera(
+                    name,
+                    print_detection_enabled=(
+                        print_detection_enabled
+                        if print_detection_enabled
+                        is not None
+                        else False
+                    ),
+                    jam_detection_enabled=(
+                        jam_detection_enabled
+                        if jam_detection_enabled
+                        is not None
+                        else False
+                    ),
+                )
+
+
+            camera = (
+                self._state[
+                    "cameras"
+                ][name]
+            )
+
+
+            # ----------------------------------------------
+            # Status
+            # ----------------------------------------------
+
+            if status is not None:
+
+                camera[
+                    "status"
+                ] = str(
+                    status
+                ).lower()
+
+
+            # ----------------------------------------------
+            # Count
+            # ----------------------------------------------
+
+            if total_count is not None:
+
+                normalized_count = (
+                    max(
+                        0,
+                        safe_int(
+                            total_count
+                        ),
+                    )
+                )
+
+                camera[
+                    "count"
+                ] = normalized_count
+
+                camera[
+                    "total_count"
+                ] = normalized_count
+
+            elif count is not None:
+
+                normalized_count = (
+                    max(
+                        0,
+                        safe_int(
+                            count
+                        ),
+                    )
+                )
+
+                camera[
+                    "count"
+                ] = normalized_count
+
+                camera[
+                    "total_count"
+                ] = normalized_count
+
+
+            # ----------------------------------------------
+            # Printed count
+            # ----------------------------------------------
+
+            if printed_count is not None:
+
+                normalized_printed = (
+                    max(
+                        0,
+                        safe_int(
+                            printed_count
+                        ),
+                    )
+                )
+
+                camera[
+                    "printed_count"
+                ] = normalized_printed
+
+                camera[
+                    "printed_bags_count"
+                ] = normalized_printed
+
+            elif printed_bags_count is not None:
+
+                normalized_printed = (
+                    max(
+                        0,
+                        safe_int(
+                            printed_bags_count
+                        ),
+                    )
+                )
+
+                camera[
+                    "printed_count"
+                ] = normalized_printed
+
+                camera[
+                    "printed_bags_count"
+                ] = normalized_printed
+
+
+            # ----------------------------------------------
+            # Missing print count
+            # ----------------------------------------------
+
+            if missing_count is not None:
+
+                normalized_missing = (
+                    max(
+                        0,
+                        safe_int(
+                            missing_count
+                        ),
+                    )
+                )
+
+                camera[
+                    "missing_count"
+                ] = normalized_missing
+
+                camera[
+                    "not_printed_bags_count"
+                ] = normalized_missing
+
+            elif (
+                not_printed_bags_count
+                is not None
+            ):
+
+                normalized_missing = (
+                    max(
+                        0,
+                        safe_int(
+                            not_printed_bags_count
+                        ),
+                    )
+                )
+
+                camera[
+                    "missing_count"
+                ] = normalized_missing
+
+                camera[
+                    "not_printed_bags_count"
+                ] = normalized_missing
+
+
+            # ----------------------------------------------
+            # FPS
+            # ----------------------------------------------
+
+            if fps is not None:
+
+                camera[
+                    "fps"
+                ] = max(
+                    0.0,
+                    safe_float(
+                        fps
+                    ),
+                )
+
+
+            # ----------------------------------------------
+            # Frame count
+            # ----------------------------------------------
+
+            if frame_count is not None:
+
+                camera[
+                    "frame_count"
+                ] = max(
+                    0,
+                    safe_int(
+                        frame_count
+                    ),
+                )
+
+
+            # ----------------------------------------------
+            # PRINT DETECTION
+            # ----------------------------------------------
+
+            if (
+                print_detection_enabled
+                is not None
+            ):
+
+                camera[
+                    "print_detection_enabled"
+                ] = safe_bool(
+                    print_detection_enabled
+                )
+
+                if not camera[
+                    "print_detection_enabled"
+                ]:
+
+                    camera[
+                        "print_status"
+                    ] = "disabled"
+
+
+            if print_status is not None:
+
+                camera[
+                    "print_status"
+                ] = str(
+                    print_status
+                ).lower()
+
+
+            # ----------------------------------------------
+            # JAM DETECTION ENABLED
+            # ----------------------------------------------
+
+            if (
+                jam_detection_enabled
+                is not None
+            ):
+
+                camera[
+                    "jam_detection_enabled"
+                ] = safe_bool(
+                    jam_detection_enabled
+                )
+
+                if not camera[
+                    "jam_detection_enabled"
+                ]:
+
+                    camera[
+                        "jam_status"
+                    ] = "disabled"
+
+                    camera[
+                        "jam_detected"
+                    ] = False
+
+                    camera[
+                        "jam_warning"
+                    ] = False
+
+                    camera[
+                        "active_jam_count"
+                    ] = 0
+
+                    camera[
+                        "active_jam_track_ids"
+                    ] = []
+
+
+            # ----------------------------------------------
+            # JAM STATUS
+            # ----------------------------------------------
+
+            if jam_status is not None:
+
+                camera[
+                    "jam_status"
+                ] = normalize_jam_status(
+                    jam_status,
+                    camera.get(
+                        "jam_detection_enabled",
+                        False,
+                    ),
+                )
+
+
+            # ----------------------------------------------
+            # JAM DETECTED
+            # ----------------------------------------------
+
+            if jam_detected is not None:
+
+                camera[
+                    "jam_detected"
+                ] = safe_bool(
+                    jam_detected
+                )
+
+
+            # ----------------------------------------------
+            # JAM WARNING
+            # ----------------------------------------------
+
+            if jam_warning is not None:
+
+                camera[
+                    "jam_warning"
+                ] = safe_bool(
+                    jam_warning
+                )
+
+
+            # ----------------------------------------------
+            # ACTIVE JAM TRACK IDS
+            # ----------------------------------------------
+
+            if (
+                active_jam_track_ids
+                is not None
+            ):
+
+                normalized_ids = (
+                    normalize_track_ids(
+                        active_jam_track_ids
+                    )
+                )
+
+                camera[
+                    "active_jam_track_ids"
+                ] = normalized_ids
+
+                # If active_jam_count was not supplied,
+                # derive it from the track ID collection.
+
+                if active_jam_count is None:
+
+                    camera[
+                        "active_jam_count"
+                    ] = len(
+                        normalized_ids
+                    )
+
+
+            # ----------------------------------------------
+            # ACTIVE JAM COUNT
+            # ----------------------------------------------
+
+            if active_jam_count is not None:
+
+                camera[
+                    "active_jam_count"
+                ] = max(
+                    0,
+                    safe_int(
+                        active_jam_count
+                    ),
+                )
+
+
+            # ----------------------------------------------
+            # Keep jam flags consistent with JAM state
+            # ----------------------------------------------
+
+            current_jam_status = (
+                normalize_jam_status(
+                    camera.get(
+                        "jam_status",
+                        "normal",
+                    ),
+                    camera.get(
+                        "jam_detection_enabled",
+                        False,
+                    ),
+                )
+            )
+
+            camera[
+                "jam_status"
+            ] = current_jam_status
+
+
+            if current_jam_status == "jam":
+
+                camera[
+                    "jam_detected"
+                ] = True
+
+                camera[
+                    "jam_warning"
+                ] = False
+
+            elif current_jam_status == "warning":
+
+                camera[
+                    "jam_detected"
+                ] = False
+
+                camera[
+                    "jam_warning"
+                ] = True
+
+            elif current_jam_status in {
+                "normal",
+                "slow",
+                "recovering",
+                "disabled",
+            }:
+
+                camera[
+                    "jam_detected"
+                ] = False
+
+                camera[
+                    "jam_warning"
+                ] = False
+
+
+            # ----------------------------------------------
+            # Configuration state
+            # ----------------------------------------------
+
+            if enabled is not None:
+
+                camera[
+                    "enabled"
+                ] = safe_bool(
+                    enabled
+                )
+
+
+            if configured is not None:
+
+                camera[
+                    "configured"
+                ] = safe_bool(
+                    configured
+                )
+
+
+            if mode is not None:
+
+                camera[
+                    "mode"
+                ] = mode
+
+
+            if source_type is not None:
+
+                camera[
+                    "source_type"
+                ] = source_type
+
+
+            # ----------------------------------------------
+            # Runtime timestamps
+            # ----------------------------------------------
+
+            if last_frame_at is not None:
+
+                camera[
+                    "last_frame_at"
+                ] = self._normalize_timestamp(
+                    last_frame_at
+                )
+
+
+            if last_detection_at is not None:
+
+                camera[
+                    "last_detection_at"
+                ] = self._normalize_timestamp(
+                    last_detection_at
+                )
+
+
+            if last_count_at is not None:
+
+                camera[
+                    "last_count_at"
+                ] = self._normalize_timestamp(
+                    last_count_at
+                )
+
+
+            # ----------------------------------------------
+            # Error
+            # ----------------------------------------------
+
+            if last_error is not None:
+
+                camera[
+                    "last_error"
+                ] = (
+                    str(
+                        last_error
+                    )
+                    if last_error
+                    else None
+                )
+
+
+            # ----------------------------------------------
+            # Metadata
+            # ----------------------------------------------
+
+            if isinstance(
+                metadata,
+                dict,
+            ):
+
+                current_metadata = (
+                    camera.setdefault(
+                        "metadata",
+                        {},
+                    )
+                )
+
+                current_metadata.update(
+                    deepcopy(
+                        metadata
+                    )
+                )
+
+
+            # ----------------------------------------------
+            # Additional future fields
+            #
+            # Examples:
+            #
+            # jam_track_id
+            # jam_speed_px_s
+            # jam_stationary_seconds
+            # jam_distance_pixels
+            # jam_center_x
+            # jam_center_y
+            # ----------------------------------------------
+
+            for (
+                key,
+                value,
+            ) in extra_fields.items():
+
+                if key.startswith(
+                    "_"
+                ):
+                    continue
+
+                camera[
+                    key
+                ] = self._json_safe(
+                    value
+                )
+
+
+            # ----------------------------------------------
+            # Update timestamp
+            # ----------------------------------------------
+
+            camera[
+                "updated_at"
+            ] = utc_now_iso()
+
+
+            self._touch_locked()
+
+            self._recalculate_totals_locked()
+
+
+    # ======================================================
+    # CAMERA ONLINE
+    # ======================================================
+
+    def camera_online(
+        self,
+        camera_name,
+        **kwargs,
+    ):
+        """
+        Mark camera online.
+        """
+
+        self.update_camera(
+            camera_name,
+            status="online",
+            last_error="",
+            **kwargs,
+        )
+
+
+    # ======================================================
+    # CAMERA OFFLINE
+    # ======================================================
+
+    def camera_offline(
+        self,
+        camera_name,
+        error=None,
+        **kwargs,
+    ):
+        """
+        Mark camera offline.
+        """
+
+        self.update_camera(
+            camera_name,
+            status="offline",
+            fps=0.0,
+            last_error=error,
+            **kwargs,
+        )
+
+
+    # ======================================================
+    # CAMERA ERROR
+    # ======================================================
+
+    def camera_error(
+        self,
+        camera_name,
+        error,
+        **kwargs,
+    ):
+        """
+        Mark camera in error state.
+        """
+
+        self.update_camera(
+            camera_name,
+            status="error",
+            fps=0.0,
+            last_error=error,
+            **kwargs,
+        )
+
+
+    # ======================================================
+    # CAMERA FRAME
+    # ======================================================
+
+    def camera_frame(
+        self,
+        camera_name,
+        *,
+        fps=None,
+        frame_count=None,
+    ):
+        """
+        Convenience update when a frame is successfully
+        processed.
+        """
+
+        self.update_camera(
+            camera_name,
+            status="online",
+            fps=fps,
+            frame_count=frame_count,
+            last_frame_at=utc_now_iso(),
+        )
+
+
+    # ======================================================
+    # COUNT EVENT UPDATE
+    # ======================================================
+
+    def update_count(
+        self,
+        camera_name,
+        total_count,
+        *,
+        printed_count=None,
+        missing_count=None,
+        print_status=None,
+    ):
+        """
+        Convenience method after a confirmed physical
+        bag-center crossing.
+        """
+
+        self.update_camera(
+            camera_name,
+            total_count=total_count,
+            printed_count=printed_count,
+            missing_count=missing_count,
+            print_status=print_status,
+            last_count_at=utc_now_iso(),
+        )
+
+
+    # ======================================================
+    # HEALTH UPDATE
+    # ======================================================
+
+    def update_health(
+        self,
+        health=None,
+        **kwargs,
+    ):
+        """
+        Update application/service health.
+        """
+
+        updates = {}
+
+        if isinstance(
+            health,
+            dict,
+        ):
+
+            updates.update(
+                health
+            )
+
+
+        updates.update(
+            kwargs
+        )
+
+
+        with self._lock:
+
+            service_status = (
+                self._state[
+                    "service_status"
+                ]
+            )
+
+
+            for (
+                key,
+                value,
+            ) in updates.items():
+
+                if key in {
+                    "model_loaded",
+                    "inference_manager_running",
+                    "elasticsearch_connected",
+                    "dashboard_enabled",
+                }:
+
+                    service_status[
+                        key
+                    ] = safe_bool(
+                        value
+                    )
+
+                else:
+
+                    service_status[
+                        key
+                    ] = self._json_safe(
+                        value
+                    )
+
+
+            self._touch_locked()
+
+            self._update_system_status_locked()
+
 
     # ======================================================
     # SYSTEM STATUS
@@ -194,467 +1658,495 @@ class DashboardState:
         self,
         status,
     ):
-
-        if not self.enabled:
-            return
-
-        status = str(
-            status
-        )
+        """
+        Explicitly set application system status.
+        """
 
         with self._lock:
 
-            if (
-                self.system_status
-                == status
+            self._state[
+                "system_status"
+            ] = str(
+                status
+            ).lower()
+
+            self._touch_locked()
+
+
+    # ======================================================
+    # MARK RUNNING
+    # ======================================================
+
+    def mark_running(
+        self,
+    ):
+
+        self.set_system_status(
+            "online"
+        )
+
+
+    # ======================================================
+    # MARK STOPPING
+    # ======================================================
+
+    def mark_stopping(
+        self,
+    ):
+
+        self.set_system_status(
+            "stopping"
+        )
+
+
+    # ======================================================
+    # MARK OFFLINE
+    # ======================================================
+
+    def mark_offline(
+        self,
+    ):
+
+        with self._lock:
+
+            self._state[
+                "system_status"
+            ] = "offline"
+
+            for camera in (
+                self._state[
+                    "cameras"
+                ].values()
             ):
-                return
 
-            self.system_status = status
+                camera[
+                    "status"
+                ] = "offline"
 
-            self._dirty = True
+                camera[
+                    "fps"
+                ] = 0.0
 
-        self._persist_event.set()
+                camera[
+                    "updated_at"
+                ] = utc_now_iso()
 
-    # ======================================================
-    # CAMERA UPDATE
-    # ======================================================
 
-    def update_camera(
-        self,
-        camera_name,
-        count,
-        fps,
-        status,
-        print_status=None,
-        printed_count=0,
-        missing_count=0,
-        printed_bags_count=0,
-        not_printed_bags_count=0,
-    ):
+            self._touch_locked()
 
-        if not self.enabled:
-            return
-
-        if self._closed:
-            return
-
-        camera_name = str(
-            camera_name
-        )
-
-        # ==================================================
-        # NORMALIZE VALUES
-        # ==================================================
-
-        count = self._safe_int(
-            count
-        )
-
-        fps = self._safe_float(
-            fps
-        )
-
-        printed_count = self._safe_int(
-            printed_count
-        )
-
-        missing_count = self._safe_int(
-            missing_count
-        )
-
-        printed_bags_count = self._safe_int(
-            printed_bags_count
-        )
-
-        not_printed_bags_count = self._safe_int(
-            not_printed_bags_count
-        )
-
-        # ==================================================
-        # COMPATIBILITY ALIASES
-        # ==================================================
-
-        if (
-            printed_count == 0
-            and printed_bags_count > 0
-        ):
-
-            printed_count = (
-                printed_bags_count
-            )
-
-        if (
-            missing_count == 0
-            and not_printed_bags_count > 0
-        ):
-
-            missing_count = (
-                not_printed_bags_count
-            )
-
-        # ==================================================
-        # BUILD CAMERA STATE
-        # ==================================================
-
-        camera_state = {
-
-            "count":
-                count,
-
-            "printed_count":
-                printed_count,
-
-            "missing_count":
-                missing_count,
-
-            # Backward-compatible names
-            "printed_bags_count":
-                printed_count,
-
-            "not_printed_bags_count":
-                missing_count,
-
-            "fps":
-                round(
-                    fps,
-                    2,
-                ),
-
-            "status":
-                str(
-                    status
-                    or
-                    "offline"
-                ),
-
-            "print_status":
-                print_status,
-
-            "updated_at":
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
-
-        }
-
-        # ==================================================
-        # STORE CAMERA STATE
-        # ==================================================
-
-        with self._lock:
-
-            previous_state = (
-                self.cameras.get(
-                    camera_name
-                )
-            )
-
-            self.cameras[
-                camera_name
-            ] = camera_state
-
-            self._dirty = True
-
-        # Wake persistence worker.
-        self._persist_event.set()
-
-        # ==================================================
-        # COUNT CHANGE LOGGING
-        # ==================================================
-
-        if previous_state is not None:
-
-            old_count = self._safe_int(
-
-                previous_state.get(
-                    "count",
-                    0,
-                )
-
-            )
-
-            if count != old_count:
-
-                self._log(
-                    "info",
-                    (
-                        f"Dashboard {camera_name}: "
-                        f"{old_count} -> {count}"
-                    ),
-                )
-
-    # ======================================================
-    # SERVICE HEALTH
-    # ======================================================
-
-    def update_health(
-        self,
-        health_info,
-    ):
-
-        if not self.enabled:
-            return
-
-        if self._closed:
-            return
-
-        if not isinstance(
-            health_info,
-            dict,
-        ):
-            return
-
-        with self._lock:
-
-            self.service_status.update(
-                health_info
-            )
-
-            self._dirty = True
-
-        self._persist_event.set()
-
-    # ======================================================
-    # SNAPSHOT
-    # ======================================================
-
-    def snapshot(
-        self,
-    ):
-
-        with self._lock:
-
-            return self._snapshot_in_memory()
-
-    # ======================================================
-    # BUILD SNAPSHOT
-    # ======================================================
-
-    def _snapshot_in_memory(
-        self,
-    ):
-
-        # ==================================================
-        # TOTAL BAG COUNT
-        # ==================================================
-
-        total_count = sum(
-
-            self._safe_int(
-
-                camera.get(
-                    "count",
-                    0,
-                )
-
-            )
-
-            for camera
-            in self.cameras.values()
-
-        )
-
-        # ==================================================
-        # TOTAL PRINTED
-        # ==================================================
-
-        total_printed_count = sum(
-
-            self._safe_int(
-
-                camera.get(
-
-                    "printed_count",
-
-                    camera.get(
-                        "printed_bags_count",
-                        0,
-                    ),
-
-                )
-
-            )
-
-            for camera
-            in self.cameras.values()
-
-        )
-
-        # ==================================================
-        # TOTAL NOT PRINTED
-        # ==================================================
-
-        total_missing_count = sum(
-
-            self._safe_int(
-
-                camera.get(
-
-                    "missing_count",
-
-                    camera.get(
-                        "not_printed_bags_count",
-                        0,
-                    ),
-
-                )
-
-            )
-
-            for camera
-            in self.cameras.values()
-
-        )
-
-        # ==================================================
-        # FINAL SNAPSHOT
-        # ==================================================
-
-        return {
-
-            "system_status":
-                self.system_status,
-
-            "startup_time":
-                self.start_time.isoformat(),
-
-            "service_status":
-                deepcopy(
-                    self.service_status
-                ),
-
-            "total_count":
-                total_count,
-
-            "total_printed_count":
-                total_printed_count,
-
-            "total_missing_count":
-                total_missing_count,
-
-            # Compatibility fields
-
-            "total_printed_bags_count":
-                total_printed_count,
-
-            "total_not_printed_bags_count":
-                total_missing_count,
-
-            "cameras":
-                deepcopy(
-                    self.cameras
-                ),
-
-            "updated_at":
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
-
-        }
-
-    # ======================================================
-    # MARK DIRTY
-    # ======================================================
-
-    def _mark_dirty(
-        self,
-    ):
-
-        with self._lock:
-
-            self._dirty = True
-
-        self._persist_event.set()
-
-    # ======================================================
-    # START BACKGROUND PERSISTENCE
-    # ======================================================
-
-    def _start_background_persistence(
-        self,
-    ):
-
-        if (
-
-            self._persistence_thread
-            is not None
-
-            and
-
-            self._persistence_thread.is_alive()
-
-        ):
-
-            return
-
-        self._persistence_thread = (
-            threading.Thread(
-
-                target=
-                    self._persistence_worker,
-
-                daemon=True,
-
-                name=
-                    "DashboardPersistence",
-
-            )
-        )
-
-        self._persistence_thread.start()
-
-        self._log(
-            "info",
-            (
-                "Dashboard persistence "
-                "worker started."
-            ),
-        )
-
-    # ======================================================
-    # PERSISTENCE WORKER
-    # ======================================================
-
-    def _persistence_worker(
-        self,
-    ):
-
-        while (
-            not self._stop_event.is_set()
-        ):
-
-            self._persist_event.wait(
-                timeout=
-                    self.persist_interval_seconds
-            )
-
-            self._persist_event.clear()
-
-            if self._stop_event.is_set():
-                break
-
-            self._persist()
-
-        # ==================================================
-        # FINAL WRITE
-        # ==================================================
-
-        self._persist(
+        self.publish(
             force=True
         )
 
+
     # ======================================================
-    # PERSIST
+    # GET CAMERA
     # ======================================================
 
-    def _persist(
+    def get_camera(
+        self,
+        camera_name,
+    ):
+        """
+        Return safe copy of one camera.
+        """
+
+        with self._lock:
+
+            camera = (
+                self._state[
+                    "cameras"
+                ].get(
+                    str(
+                        camera_name
+                    )
+                )
+            )
+
+            if camera is None:
+                return None
+
+            return deepcopy(
+                camera
+            )
+
+
+    # ======================================================
+    # GET CAMERAS
+    # ======================================================
+
+    def get_cameras(
+        self,
+    ):
+        """
+        Return safe copy of all camera states.
+        """
+
+        with self._lock:
+
+            return deepcopy(
+                self._state[
+                    "cameras"
+                ]
+            )
+
+
+    # ======================================================
+    # GET STATE
+    # ======================================================
+
+    def get_state(
+        self,
+    ):
+        """
+        Return complete dashboard state.
+        """
+
+        with self._lock:
+
+            self._recalculate_totals_locked()
+
+            snapshot = deepcopy(
+                self._state
+            )
+
+        snapshot[
+            "state_stale"
+        ] = self._calculate_state_stale(
+            snapshot
+        )
+
+        snapshot[
+            "uptime_seconds"
+        ] = max(
+            0.0,
+            time.monotonic()
+            -
+            self._startup_monotonic,
+        )
+
+        return snapshot
+
+
+    # ======================================================
+    # GET STATUS
+    # ======================================================
+
+    def get_status(
+        self,
+    ):
+        """
+        Return DashboardState service information.
+        """
+
+        with self._lock:
+
+            return {
+
+                "running":
+                    (
+                        self._publisher_thread
+                        is not None
+                        and
+                        self._publisher_thread.is_alive()
+                    ),
+
+                "auto_publish":
+                    self.auto_publish,
+
+                "publish_interval":
+                    self.publish_interval,
+
+                "stale_timeout":
+                    self.stale_timeout,
+
+                "state_file":
+                    str(
+                        self.state_file
+                    ),
+
+                "publish_count":
+                    self._publish_count,
+
+                "publish_errors":
+                    self._publish_errors,
+
+                "last_publish_time":
+                    self._last_publish_time,
+
+                "last_error":
+                    self._last_error,
+            }
+
+
+    # ======================================================
+    # RECALCULATE TOTALS
+    # ======================================================
+
+    def _recalculate_totals_locked(
+        self,
+    ):
+        """
+        Calculate global production totals from cameras.
+        """
+
+        total_count = 0
+
+        total_printed = 0
+
+        total_missing = 0
+
+
+        for camera in (
+            self._state[
+                "cameras"
+            ].values()
+        ):
+
+            total_count += max(
+                0,
+                safe_int(
+                    camera.get(
+                        "count",
+                        camera.get(
+                            "total_count",
+                            0,
+                        ),
+                    )
+                ),
+            )
+
+            total_printed += max(
+                0,
+                safe_int(
+                    camera.get(
+                        "printed_count",
+                        camera.get(
+                            "printed_bags_count",
+                            0,
+                        ),
+                    )
+                ),
+            )
+
+            total_missing += max(
+                0,
+                safe_int(
+                    camera.get(
+                        "missing_count",
+                        camera.get(
+                            "not_printed_bags_count",
+                            0,
+                        ),
+                    )
+                ),
+            )
+
+
+        self._state[
+            "total_count"
+        ] = total_count
+
+        self._state[
+            "total_printed_count"
+        ] = total_printed
+
+        self._state[
+            "total_missing_count"
+        ] = total_missing
+
+
+        # --------------------------------------------------
+        # Compatibility aliases
+        # --------------------------------------------------
+
+        self._state[
+            "total_printed_bags_count"
+        ] = total_printed
+
+        self._state[
+            "total_not_printed_bags_count"
+        ] = total_missing
+
+
+    # ======================================================
+    # AUTOMATIC SYSTEM STATUS
+    # ======================================================
+
+    def _update_system_status_locked(
+        self,
+    ):
+        """
+        Update high-level status from application health.
+
+        Explicit stopping/offline/error states are preserved.
+        """
+
+        current = str(
+            self._state.get(
+                "system_status",
+                "",
+            )
+        ).lower()
+
+
+        if current in {
+            "stopping",
+            "offline",
+            "error",
+        }:
+            return
+
+
+        health = (
+            self._state[
+                "service_status"
+            ]
+        )
+
+
+        model_loaded = safe_bool(
+            health.get(
+                "model_loaded"
+            )
+        )
+
+        inference_running = safe_bool(
+            health.get(
+                "inference_manager_running"
+            )
+        )
+
+
+        if (
+            model_loaded
+            and
+            inference_running
+        ):
+
+            self._state[
+                "system_status"
+            ] = "online"
+
+        elif model_loaded:
+
+            self._state[
+                "system_status"
+            ] = "starting"
+
+        else:
+
+            self._state[
+                "system_status"
+            ] = "starting"
+
+
+    # ======================================================
+    # TOUCH STATE
+    # ======================================================
+
+    def _touch_locked(
+        self,
+    ):
+        """
+        Mark state as modified.
+        """
+
+        self._state[
+            "updated_at"
+        ] = utc_now_iso()
+
+        self._dirty = True
+
+
+    # ======================================================
+    # STALE STATE
+    # ======================================================
+
+    def _calculate_state_stale(
+        self,
+        snapshot,
+    ):
+        """
+        Determine whether state has stopped updating.
+        """
+
+        updated_at = snapshot.get(
+            "updated_at"
+        )
+
+        if not updated_at:
+            return True
+
+
+        try:
+
+            value = str(
+                updated_at
+            )
+
+            if value.endswith(
+                "Z"
+            ):
+
+                value = (
+                    value[:-1]
+                    + "+00:00"
+                )
+
+
+            updated = (
+                datetime.fromisoformat(
+                    value
+                )
+            )
+
+
+            if updated.tzinfo is None:
+
+                updated = (
+                    updated.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+
+
+            age = (
+                utc_now()
+                -
+                updated
+            ).total_seconds()
+
+
+            return (
+                age
+                >
+                self.stale_timeout
+            )
+
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return True
+
+
+    # ======================================================
+    # PUBLISH
+    # ======================================================
+
+    def publish(
         self,
         force=False,
     ):
+        """
+        Atomically publish dashboard state to JSON.
 
-        if not self.enabled:
-            return
+        A temporary file + os.replace() is used so the
+        dashboard server never reads half-written JSON.
+        """
 
         with self._lock:
 
@@ -664,241 +2156,242 @@ class DashboardState:
                 not self._dirty
             ):
 
-                return
+                return False
 
-            snapshot = (
-                self._snapshot_in_memory()
+
+            self._recalculate_totals_locked()
+
+
+            snapshot = deepcopy(
+                self._state
             )
 
-        # ==================================================
-        # WRITE
-        # ==================================================
+
+            snapshot[
+                "state_stale"
+            ] = False
+
+
+            snapshot[
+                "uptime_seconds"
+            ] = max(
+                0.0,
+                time.monotonic()
+                -
+                self._startup_monotonic,
+            )
+
+
+        temp_path = None
+
 
         try:
 
-            self._write_state(
-                snapshot
+            self.state_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
             )
+
+
+            fd, temp_name = (
+                tempfile.mkstemp(
+                    prefix=(
+                        self.state_file.name
+                        + "."
+                    ),
+                    suffix=".tmp",
+                    dir=str(
+                        self.state_file.parent
+                    ),
+                    text=True,
+                )
+            )
+
+
+            temp_path = Path(
+                temp_name
+            )
+
+
+            with os.fdopen(
+                fd,
+                "w",
+                encoding="utf-8",
+            ) as file:
+
+                json.dump(
+                    snapshot,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+
+                file.flush()
+
+                try:
+
+                    os.fsync(
+                        file.fileno()
+                    )
+
+                except OSError:
+
+                    pass
+
+
+            os.replace(
+                temp_path,
+                self.state_file,
+            )
+
+
+            with self._lock:
+
+                self._dirty = False
+
+                self._last_publish_monotonic = (
+                    time.monotonic()
+                )
+
+                self._last_publish_time = (
+                    utc_now_iso()
+                )
+
+                self._publish_count += 1
+
+                self._last_error = None
+
+
+            return True
+
 
         except Exception as error:
 
-            self._log(
-                "warning",
-                (
-                    "Dashboard state write failed: "
-                    f"{error}"
-                ),
-            )
-
-            # Keep dirty so next persistence cycle retries.
             with self._lock:
 
-                self._dirty = True
+                self._publish_errors += 1
 
-            return
+                self._last_error = str(
+                    error
+                )
 
-        # ==================================================
-        # SUCCESS
-        # ==================================================
 
-        with self._lock:
-
-            self._dirty = False
-
-            self.last_persist_time = (
-                time.monotonic()
+            logger.exception(
+                "Failed publishing dashboard state."
             )
 
-    # ======================================================
-    # WRITE STATE FILE
-    # ======================================================
 
-    def _write_state(
-        self,
-        data,
-    ):
+            if (
+                temp_path is not None
+                and
+                temp_path.exists()
+            ):
 
-        self.state_file.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+                try:
 
-        # Direct write is intentionally used here.
-        #
-        # Previous os.replace() implementation caused
-        # WinError 5 on Windows/OneDrive when the backend
-        # simultaneously accessed state.json.
-        #
-        # The dashboard backend uses retry logic when
-        # reading this file.
+                    temp_path.unlink()
 
-        with open(
-            self.state_file,
-            "w",
-            encoding="utf-8",
-        ) as file:
+                except OSError:
 
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                separators=(
-                    ",",
-                    ":",
-                ),
-            )
+                    pass
 
-            file.flush()
+
+            return False
+
 
     # ======================================================
-    # LOAD EXISTING STATE
-    # ======================================================
-
-    def _load_existing_state(
-        self,
-    ):
-
-        if not self.state_file.exists():
-
-            self._dirty = True
-
-            return
-
-        state = None
-
-        # ==================================================
-        # RETRY READ
-        # ==================================================
-
-        for attempt in range(
-            3
-        ):
-
-            try:
-
-                with open(
-                    self.state_file,
-                    "r",
-                    encoding="utf-8",
-                ) as file:
-
-                    state = json.load(
-                        file
-                    )
-
-                break
-
-            except (
-                json.JSONDecodeError,
-                OSError,
-            ) as error:
-
-                if attempt < 2:
-
-                    time.sleep(
-                        0.05
-                    )
-
-                else:
-
-                    self._log(
-                        "warning",
-                        (
-                            "Could not restore "
-                            "dashboard state: "
-                            f"{error}"
-                        ),
-                    )
-
-        if not isinstance(
-            state,
-            dict,
-        ):
-
-            self._dirty = True
-
-            return
-
-        # ==================================================
-        # RESTORE CAMERA COUNTS
-        # ==================================================
-
-        cameras = state.get(
-            "cameras",
-            {},
-        )
-
-        if isinstance(
-            cameras,
-            dict,
-        ):
-
-            self.cameras = deepcopy(
-                cameras
-            )
-
-        # ==================================================
-        # RESTORE SERVICE STATUS
-        # ==================================================
-
-        service_status = state.get(
-            "service_status",
-            {},
-        )
-
-        if isinstance(
-            service_status,
-            dict,
-        ):
-
-            self.service_status = deepcopy(
-                service_status
-            )
-
-        # ==================================================
-        # DO NOT RESTORE OLD SYSTEM STATUS
-        # ==================================================
-        #
-        # A previous run may have ended with:
-        #
-        # stopped
-        # error
-        # running
-        #
-        # New Application controls current status.
-
-        self.system_status = "idle"
-
-        # New run gets new startup time.
-
-        self.start_time = datetime.now(
-            timezone.utc
-        )
-
-        self._dirty = True
-
-        self._log(
-            "info",
-            (
-                "Previous dashboard camera "
-                "state restored."
-            ),
-        )
-
-    # ======================================================
-    # FLUSH
+    # FORCE PUBLISH
     # ======================================================
 
     def flush(
         self,
     ):
+        """
+        Immediately write latest state.
+        """
 
-        if not self.enabled:
-            return
-
-        self._persist(
+        return self.publish(
             force=True
         )
+
+
+    # ======================================================
+    # BACKGROUND PUBLISHER
+    # ======================================================
+
+    def _publisher_loop(
+        self,
+    ):
+        """
+        Background state publisher.
+        """
+
+        logger.info(
+            "Dashboard state publisher started."
+        )
+
+
+        while not self._stop_event.wait(
+            self.publish_interval
+        ):
+
+            try:
+
+                self.publish()
+
+            except Exception:
+
+                logger.exception(
+                    (
+                        "Unexpected dashboard "
+                        "publisher error."
+                    )
+                )
+
+
+        logger.info(
+            "Dashboard state publisher stopped."
+        )
+
+
+    # ======================================================
+    # START
+    # ======================================================
+
+    def start(
+        self,
+    ):
+        """
+        Start background publishing.
+        """
+
+        with self._lock:
+
+            if (
+                self._publisher_thread
+                is not None
+                and
+                self._publisher_thread.is_alive()
+            ):
+
+                return
+
+
+            self._stop_event.clear()
+
+
+            self._publisher_thread = (
+                threading.Thread(
+                    target=self._publisher_loop,
+                    name="DashboardStatePublisher",
+                    daemon=True,
+                )
+            )
+
+
+            self._publisher_thread.start()
+
 
     # ======================================================
     # STOP
@@ -906,185 +2399,337 @@ class DashboardState:
 
     def stop(
         self,
+        mark_offline=True,
     ):
+        """
+        Stop DashboardState cleanly.
+        """
 
-        if not self.enabled:
-            return
+        if mark_offline:
 
-        # Prevent duplicate shutdown.
-        if self._closed:
-            return
+            with self._lock:
 
-        self._log(
-            "info",
-            "Stopping DashboardState.",
-        )
+                self._state[
+                    "system_status"
+                ] = "offline"
 
-        # ==================================================
-        # SIGNAL WORKER
-        # ==================================================
+
+                for camera in (
+                    self._state[
+                        "cameras"
+                    ].values()
+                ):
+
+                    camera[
+                        "status"
+                    ] = "offline"
+
+                    camera[
+                        "fps"
+                    ] = 0.0
+
+                    camera[
+                        "updated_at"
+                    ] = utc_now_iso()
+
+
+                self._touch_locked()
+
+
+            self.publish(
+                force=True
+            )
+
 
         self._stop_event.set()
 
-        self._persist_event.set()
-
-        # ==================================================
-        # WAIT FOR WORKER
-        # ==================================================
 
         thread = (
-            self._persistence_thread
+            self._publisher_thread
         )
 
+
         if (
-
             thread is not None
-
             and
-
             thread.is_alive()
-
             and
-
             thread
             is not
             threading.current_thread()
-
         ):
 
             thread.join(
-                timeout=2.0
+                timeout=max(
+                    1.0,
+                    self.publish_interval * 4,
+                )
             )
 
-        # ==================================================
-        # FINAL WRITE
-        # ==================================================
 
-        self._persist(
-            force=True
-        )
+        self._publisher_thread = None
 
-        self._closed = True
-
-        self._log(
-            "info",
-            "DashboardState stopped.",
-        )
 
     # ======================================================
-    # CLOSE
+    # RESET COUNTS
     # ======================================================
 
-    def close(
+    def reset_counts(
         self,
+        camera_name=None,
     ):
         """
-        Compatibility shutdown method.
+        Reset dashboard production counters.
 
-        Application.stop() calls:
+        IMPORTANT:
+        This only resets DashboardState values.
 
-            self.dashboard_state.close()
-
-        DashboardState internally performs shutdown using
-        stop(). Keeping close() prevents Application and
-        DashboardState interfaces from becoming inconsistent.
+        It does NOT reset the actual Counter object inside
+        a running camera pipeline.
         """
 
-        self.stop()
+        with self._lock:
+
+            if camera_name is None:
+
+                cameras = (
+                    self._state[
+                        "cameras"
+                    ].values()
+                )
+
+            else:
+
+                camera = (
+                    self._state[
+                        "cameras"
+                    ].get(
+                        str(
+                            camera_name
+                        )
+                    )
+                )
+
+                if camera is None:
+                    return False
+
+                cameras = [
+                    camera
+                ]
+
+
+            for camera in cameras:
+
+                camera[
+                    "count"
+                ] = 0
+
+                camera[
+                    "total_count"
+                ] = 0
+
+                camera[
+                    "printed_count"
+                ] = 0
+
+                camera[
+                    "missing_count"
+                ] = 0
+
+                camera[
+                    "printed_bags_count"
+                ] = 0
+
+                camera[
+                    "not_printed_bags_count"
+                ] = 0
+
+                camera[
+                    "last_count_at"
+                ] = None
+
+                camera[
+                    "updated_at"
+                ] = utc_now_iso()
+
+
+            self._recalculate_totals_locked()
+
+            self._touch_locked()
+
+
+        return True
+
 
     # ======================================================
-    # SAFE INTEGER
+    # NORMALIZE TIMESTAMP
     # ======================================================
 
     @staticmethod
-    def _safe_int(
+    def _normalize_timestamp(
         value,
     ):
 
-        try:
+        if value is None:
+            return None
 
-            return int(
-                value
-            )
 
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
+        if isinstance(
+            value,
+            datetime,
         ):
 
-            return 0
+            if value.tzinfo is None:
+
+                value = (
+                    value.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+
+            return value.isoformat()
+
+
+        return str(
+            value
+        )
+
 
     # ======================================================
-    # SAFE FLOAT
+    # JSON SAFE
     # ======================================================
 
     @staticmethod
-    def _safe_float(
+    def _json_safe(
         value,
     ):
+        """
+        Convert common runtime values into JSON-safe data.
+        """
 
-        try:
+        if value is None:
+            return None
 
-            value = float(
-                value
-            )
 
-            # NaN check
-            if value != value:
-
-                return 0.0
-
-            # Infinity check
-            if value in (
-                float("inf"),
-                float("-inf"),
-            ):
-
-                return 0.0
+        if isinstance(
+            value,
+            (
+                str,
+                int,
+                float,
+                bool,
+            ),
+        ):
 
             return value
 
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
+
+        if isinstance(
+            value,
+            datetime,
         ):
 
-            return 0.0
+            return value.isoformat()
 
-    # ======================================================
-    # LOGGER
-    # ======================================================
 
-    def _log(
-        self,
-        level,
-        message,
-    ):
+        if isinstance(
+            value,
+            Path,
+        ):
 
-        if self.logger is None:
-
-            return
-
-        try:
-
-            method = getattr(
-                self.logger,
-                level,
-                None,
+            return str(
+                value
             )
 
-            if callable(
-                method
-            ):
 
-                method(
-                    message
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            return {
+
+                str(key):
+                    DashboardState._json_safe(
+                        item
+                    )
+
+                for (
+                    key,
+                    item,
+                )
+                in value.items()
+
+            }
+
+
+        if isinstance(
+            value,
+            (
+                list,
+                tuple,
+                set,
+            ),
+        ):
+
+            return [
+
+                DashboardState._json_safe(
+                    item
                 )
 
-        except Exception:
+                for item in value
 
-            # Logging must never crash the production
-            # application.
-            pass
+            ]
+
+
+        # --------------------------------------------------
+        # NumPy scalar compatibility
+        # --------------------------------------------------
+
+        item_method = getattr(
+            value,
+            "item",
+            None,
+        )
+
+
+        if callable(
+            item_method
+        ):
+
+            try:
+
+                return item_method()
+
+            except Exception:
+
+                pass
+
+
+        return str(
+            value
+        )
+
+
+    # ======================================================
+    # CONTEXT MANAGER
+    # ======================================================
+
+    def __enter__(
+        self,
+    ):
+
+        self.start()
+
+        return self
+
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+
+        self.stop()

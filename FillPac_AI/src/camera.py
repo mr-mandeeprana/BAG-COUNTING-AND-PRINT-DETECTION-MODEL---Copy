@@ -1,44 +1,87 @@
 """
 ============================================================
 FillPac AI
-Camera Module
+Low-Latency Camera Module
 ============================================================
 
 Supports:
 - Local video files
 - RTSP streams
 - USB / local cameras
+- Low-latency RTSP capture
+- Latest-frame-only architecture
 - Automatic RTSP reconnection
 - Configurable retry behavior
-- OpenCV buffer configuration
+- OpenCV / FFmpeg backend
 - Camera metadata
+- Thread-safe frame access
 - Graceful release
 
-Production Behavior
--------------------
-VIDEO:
-    End of video -> return False
+Architecture
+------------
 
-RTSP:
-    Read failure -> attempt reconnect
-    Reconnect success -> continue streaming
-    Reconnect failure -> return False
+VIDEO FILE:
 
-CAMERA:
-    Read failure -> attempt reconnect
+    Pipeline
+       |
+       v
+    cap.read()
+       |
+       v
+    Frame
 
-Important
----------
-RTSP reconnection is handled inside this module so the
-Pipeline does not need to manage low-level stream recovery.
+RTSP / CAMERA:
+
+    Camera Stream
+         |
+         v
+    Capture Thread
+         |
+         v
+    Latest Frame Only
+         |
+         v
+    Pipeline / YOLO
+
+Old frames are overwritten automatically.
+
+This prevents frame queues from creating increasing
+latency when inference FPS is lower than camera FPS.
+
 ============================================================
 """
 
+import os
 import threading
 import time
 from typing import Union
 
 import cv2
+
+
+# ==========================================================
+# LOW-LATENCY FFMPEG OPTIONS
+# ==========================================================
+
+# These options are used by OpenCV's FFmpeg backend.
+#
+# TCP is preferred for production reliability.
+#
+# nobuffer / low_delay reduce unnecessary buffering.
+#
+# IMPORTANT:
+# This environment variable should be configured before
+# creating the RTSP VideoCapture object.
+
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    (
+        "rtsp_transport;tcp|"
+        "fflags;nobuffer|"
+        "flags;low_delay|"
+        "max_delay;0"
+    ),
+)
 
 
 class Camera:
@@ -48,6 +91,10 @@ class Camera:
         "rtsp",
         "camera",
     }
+
+    # ======================================================
+    # INITIALIZATION
+    # ======================================================
 
     def __init__(
         self,
@@ -66,9 +113,7 @@ class Camera:
         # BASIC CONFIGURATION
         # ==================================================
 
-        self.name = str(
-            name
-        )
+        self.name = str(name)
 
         self.source = source
 
@@ -85,9 +130,7 @@ class Camera:
             )
 
         self.buffer_size = max(
-            int(
-                buffer_size
-            ),
+            int(buffer_size),
             1,
         )
 
@@ -98,31 +141,22 @@ class Camera:
         # ==================================================
 
         self.reconnect_attempts = max(
-            int(
-                reconnect_attempts
-            ),
+            int(reconnect_attempts),
             1,
         )
 
         self.reconnect_delay = max(
-            float(
-                reconnect_delay
-            ),
+            float(reconnect_delay),
             0.0,
         )
 
-        # Short retries before declaring a stream failure.
         self.read_retry_attempts = max(
-            int(
-                read_retry_attempts
-            ),
+            int(read_retry_attempts),
             1,
         )
 
         self.read_retry_delay = max(
-            float(
-                read_retry_delay
-            ),
+            float(read_retry_delay),
             0.0,
         )
 
@@ -146,25 +180,54 @@ class Camera:
 
         self._lock = threading.RLock()
 
+        self._frame_lock = threading.Lock()
+
         self._released = False
+
+        # ==================================================
+        # LATEST FRAME
+        # ==================================================
+
+        self._latest_frame = None
+
+        self._latest_frame_time = 0.0
+
+        self._frame_sequence = 0
+
+        self._last_read_sequence = -1
+
+        # ==================================================
+        # CAPTURE THREAD
+        # ==================================================
+
+        self._capture_thread = None
+
+        self._capture_stop_event = (
+            threading.Event()
+        )
+
+        # ==================================================
+        # RECONNECT STATE
+        # ==================================================
+
+        self._reconnecting = False
 
     # ======================================================
     # CONNECT
     # ======================================================
 
-    def connect(
-        self,
-    ) -> bool:
+    def connect(self) -> bool:
+
+        # Stop any old capture thread first.
+        self._stop_capture_thread()
 
         with self._lock:
-
-            # ----------------------------------------------
-            # Release previous capture safely
-            # ----------------------------------------------
 
             self._release_capture()
 
             self._released = False
+
+            self._clear_latest_frame()
 
             self._log(
                 "info",
@@ -172,70 +235,13 @@ class Camera:
                 f"({self.mode})...",
             )
 
-            try:
-
-                self.cap = cv2.VideoCapture(
-                    self.source
-                )
-
-            except Exception as error:
+            if not self._open_capture():
 
                 self.connected = False
 
-                self._log(
-                    "error",
-                    f"{self.name}: VideoCapture "
-                    f"creation failed: {error}",
-                )
-
                 return False
 
-            # ----------------------------------------------
-            # Validate connection
-            # ----------------------------------------------
-
-            if (
-                self.cap is None
-                or not self.cap.isOpened()
-            ):
-
-                self.connected = False
-
-                self._release_capture()
-
-                self._log(
-                    "error",
-                    f"{self.name}: connection failed.",
-                )
-
-                return False
-
-            # ----------------------------------------------
-            # Configure capture buffer
-            #
-            # Note:
-            # CAP_PROP_BUFFERSIZE support depends on the
-            # OpenCV backend. Failure is not fatal.
-            # ----------------------------------------------
-
-            try:
-
-                self.cap.set(
-                    cv2.CAP_PROP_BUFFERSIZE,
-                    self.buffer_size,
-                )
-
-            except Exception as error:
-
-                self._log(
-                    "warning",
-                    f"{self.name}: could not set "
-                    f"capture buffer size: {error}",
-                )
-
-            # ----------------------------------------------
-            # Read camera metadata
-            # ----------------------------------------------
+            self._configure_capture()
 
             self._update_metadata()
 
@@ -248,55 +254,366 @@ class Camera:
                 f"{self.fps:.2f} FPS).",
             )
 
-            return True
+        # ==================================================
+        # START BACKGROUND CAPTURE
+        #
+        # RTSP and physical camera streams continuously
+        # capture frames.
+        #
+        # VIDEO files remain synchronous so offline video
+        # testing processes every frame normally.
+        # ==================================================
+
+        if self.mode in {
+            "rtsp",
+            "camera",
+        }:
+
+            self._start_capture_thread()
+
+        return True
+
+    # ======================================================
+    # OPEN CAPTURE
+    # ======================================================
+
+    def _open_capture(self) -> bool:
+
+        try:
+
+            # ------------------------------------------------
+            # RTSP
+            # ------------------------------------------------
+
+            if self.mode == "rtsp":
+
+                self.cap = cv2.VideoCapture(
+                    self.source,
+                    cv2.CAP_FFMPEG,
+                )
+
+            # ------------------------------------------------
+            # VIDEO / USB CAMERA
+            # ------------------------------------------------
+
+            else:
+
+                self.cap = cv2.VideoCapture(
+                    self.source
+                )
+
+        except Exception as error:
+
+            self.cap = None
+
+            self._log(
+                "error",
+                f"{self.name}: VideoCapture "
+                f"creation failed: {error}",
+            )
+
+            return False
+
+        if (
+            self.cap is None
+            or not self.cap.isOpened()
+        ):
+
+            self._log(
+                "error",
+                f"{self.name}: connection failed.",
+            )
+
+            self._release_capture()
+
+            return False
+
+        return True
+
+    # ======================================================
+    # CONFIGURE CAPTURE
+    # ======================================================
+
+    def _configure_capture(self):
+
+        if self.cap is None:
+            return
+
+        # --------------------------------------------------
+        # BUFFER SIZE
+        # --------------------------------------------------
+
+        try:
+
+            self.cap.set(
+                cv2.CAP_PROP_BUFFERSIZE,
+                self.buffer_size,
+            )
+
+        except Exception as error:
+
+            self._log(
+                "warning",
+                f"{self.name}: could not set "
+                f"capture buffer size: {error}",
+            )
+
+        # --------------------------------------------------
+        # OPEN TIMEOUT
+        # --------------------------------------------------
+
+        if hasattr(
+            cv2,
+            "CAP_PROP_OPEN_TIMEOUT_MSEC",
+        ):
+
+            try:
+
+                self.cap.set(
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                    5000,
+                )
+
+            except Exception:
+
+                pass
+
+        # --------------------------------------------------
+        # READ TIMEOUT
+        # --------------------------------------------------
+
+        if hasattr(
+            cv2,
+            "CAP_PROP_READ_TIMEOUT_MSEC",
+        ):
+
+            try:
+
+                self.cap.set(
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                    5000,
+                )
+
+            except Exception:
+
+                pass
+
+    # ======================================================
+    # START CAPTURE THREAD
+    # ======================================================
+
+    def _start_capture_thread(self):
+
+        if self.mode == "video":
+            return
+
+        if (
+            self._capture_thread is not None
+            and self._capture_thread.is_alive()
+        ):
+
+            return
+
+        self._capture_stop_event.clear()
+
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name=f"{self.name}-Capture",
+            daemon=True,
+        )
+
+        self._capture_thread.start()
+
+        self._log(
+            "info",
+            f"{self.name}: low-latency "
+            "capture thread started.",
+        )
+
+    # ======================================================
+    # CAPTURE LOOP
+    # ======================================================
+
+    def _capture_loop(self):
+
+        """
+        Continuously read the RTSP/camera stream.
+
+        Only the newest frame is retained.
+
+        If the AI pipeline is slower than the camera,
+        intermediate frames are automatically discarded
+        because _latest_frame is overwritten.
+        """
+
+        consecutive_failures = 0
+
+        while not self._capture_stop_event.is_set():
+
+            if self._released:
+                break
+
+            # ------------------------------------------------
+            # CHECK CAPTURE
+            # ------------------------------------------------
+
+            with self._lock:
+
+                cap = self.cap
+
+                capture_available = bool(
+                    cap is not None
+                    and cap.isOpened()
+                )
+
+            if not capture_available:
+
+                self.connected = False
+
+                if not self._thread_reconnect():
+
+                    time.sleep(
+                        self.reconnect_delay
+                        or 0.5
+                    )
+
+                continue
+
+            # ------------------------------------------------
+            # READ FRAME
+            # ------------------------------------------------
+
+            try:
+
+                with self._lock:
+
+                    if (
+                        self.cap is None
+                        or not self.cap.isOpened()
+                    ):
+
+                        success = False
+                        frame = None
+
+                    else:
+
+                        success, frame = (
+                            self.cap.read()
+                        )
+
+            except Exception as error:
+
+                success = False
+
+                frame = None
+
+                self._log(
+                    "warning",
+                    f"{self.name}: capture "
+                    f"exception: {error}",
+                )
+
+            # ------------------------------------------------
+            # VALID FRAME
+            # ------------------------------------------------
+
+            if (
+                success
+                and frame is not None
+                and frame.size > 0
+            ):
+
+                consecutive_failures = 0
+
+                self.connected = True
+
+                with self._frame_lock:
+
+                    # Replace previous frame.
+                    #
+                    # There is intentionally NO queue.
+
+                    self._latest_frame = frame
+
+                    self._latest_frame_time = (
+                        time.monotonic()
+                    )
+
+                    self._frame_sequence += 1
+
+                continue
+
+            # ------------------------------------------------
+            # READ FAILURE
+            # ------------------------------------------------
+
+            consecutive_failures += 1
+
+            if (
+                consecutive_failures
+                <
+                self.read_retry_attempts
+            ):
+
+                if self.read_retry_delay > 0:
+
+                    time.sleep(
+                        self.read_retry_delay
+                    )
+
+                continue
+
+            consecutive_failures = 0
+
+            self.connected = False
+
+            self._log(
+                "warning",
+                f"{self.name}: stream read failed. "
+                "Attempting background reconnection.",
+            )
+
+            self._thread_reconnect()
+
+        self._log(
+            "info",
+            f"{self.name}: capture thread stopped.",
+        )
 
     # ======================================================
     # READ FRAME
     # ======================================================
 
-    def read(
-        self,
-    ):
-
-        # ----------------------------------------------
-        # Not connected
-        # ----------------------------------------------
-
-        if not self.is_open():
-
-            return (
-                False,
-                None,
-            )
-
-        # ----------------------------------------------
-        # Try reading frame
-        # ----------------------------------------------
-
-        success, frame = (
-            self._read_with_retry()
-        )
-
-        if (
-            success
-            and frame is not None
-        ):
-
-            return (
-                True,
-                frame,
-            )
+    def read(self):
 
         # ==================================================
         # VIDEO FILE
         #
-        # A failed read normally means EOF.
-        #
-        # Do NOT reconnect or restart automatically because
-        # that would unexpectedly replay the video.
+        # Video files remain synchronous.
         # ==================================================
 
         if self.mode == "video":
+
+            if not self.is_open():
+
+                return (
+                    False,
+                    None,
+                )
+
+            success, frame = (
+                self._read_video_frame()
+            )
+
+            if (
+                success
+                and frame is not None
+            ):
+
+                return (
+                    True,
+                    frame,
+                )
 
             self._log(
                 "info",
@@ -313,55 +630,16 @@ class Camera:
         # ==================================================
         # RTSP / CAMERA
         #
-        # A failed read may be temporary.
-        # Attempt automatic reconnection.
+        # Return latest available frame.
         # ==================================================
 
-        self._log(
-            "warning",
-            f"{self.name}: stream read failed. "
-            "Attempting reconnection.",
-        )
-
-        self.connected = False
-
-        if self.reconnect():
-
-            # ----------------------------------------------
-            # Try first frame after reconnection
-            # ----------------------------------------------
-
-            success, frame = (
-                self._read_with_retry()
-            )
-
-            if (
-                success
-                and frame is not None
-            ):
-
-                return (
-                    True,
-                    frame,
-                )
-
-        self._log(
-            "error",
-            f"{self.name}: stream recovery failed.",
-        )
-
-        return (
-            False,
-            None,
-        )
+        return self._read_latest_frame()
 
     # ======================================================
-    # READ WITH SHORT RETRY
+    # READ VIDEO FRAME
     # ======================================================
 
-    def _read_with_retry(
-        self,
-    ):
+    def _read_video_frame(self):
 
         for attempt in range(
             self.read_retry_attempts
@@ -389,8 +667,8 @@ class Camera:
 
                     self._log(
                         "warning",
-                        f"{self.name}: frame read "
-                        f"exception: {error}",
+                        f"{self.name}: video frame "
+                        f"read exception: {error}",
                     )
 
                     success = False
@@ -410,7 +688,8 @@ class Camera:
 
             if (
                 attempt
-                < self.read_retry_attempts - 1
+                <
+                self.read_retry_attempts - 1
             ):
 
                 time.sleep(
@@ -423,49 +702,185 @@ class Camera:
         )
 
     # ======================================================
-    # RECONNECT
+    # READ LATEST FRAME
     # ======================================================
 
-    def reconnect(
-        self,
-    ) -> bool:
+    def _read_latest_frame(self):
 
-        # Video files should never reconnect automatically.
-        if self.mode == "video":
+        """
+        Return the newest frame captured by the background
+        thread.
 
-            return False
+        The frame is copied so the pipeline cannot modify
+        the capture thread's internal frame.
+        """
 
-        for attempt in range(
-            1,
-            self.reconnect_attempts + 1,
+        # Wait briefly for the first frame after connection.
+        deadline = (
+            time.monotonic()
+            + 1.0
+        )
+
+        while (
+            time.monotonic()
+            <
+            deadline
         ):
 
             if self._released:
 
-                return False
-
-            self._log(
-                "warning",
-                f"{self.name}: reconnect attempt "
-                f"{attempt}/{self.reconnect_attempts}.",
-            )
-
-            # ----------------------------------------------
-            # Wait before reconnecting
-            #
-            # First attempt is immediate.
-            # ----------------------------------------------
-
-            if (
-                attempt > 1
-                and self.reconnect_delay > 0
-            ):
-
-                time.sleep(
-                    self.reconnect_delay
+                return (
+                    False,
+                    None,
                 )
 
-            if self.connect():
+            with self._frame_lock:
+
+                if self._latest_frame is not None:
+
+                    frame = (
+                        self._latest_frame.copy()
+                    )
+
+                    sequence = (
+                        self._frame_sequence
+                    )
+
+                    self._last_read_sequence = (
+                        sequence
+                    )
+
+                    return (
+                        True,
+                        frame,
+                    )
+
+            time.sleep(
+                0.005
+            )
+
+        return (
+            False,
+            None,
+        )
+
+    # ======================================================
+    # GET LATEST FRAME
+    # ======================================================
+
+    def get_latest_frame(self):
+
+        with self._frame_lock:
+
+            if self._latest_frame is None:
+
+                return None
+
+            return (
+                self._latest_frame.copy()
+            )
+
+    # ======================================================
+    # FRAME AGE
+    # ======================================================
+
+    def get_frame_age(self):
+
+        with self._frame_lock:
+
+            timestamp = (
+                self._latest_frame_time
+            )
+
+        if timestamp <= 0:
+
+            return None
+
+        return max(
+            0.0,
+            time.monotonic()
+            -
+            timestamp,
+        )
+
+    # ======================================================
+    # CLEAR LATEST FRAME
+    # ======================================================
+
+    def _clear_latest_frame(self):
+
+        with self._frame_lock:
+
+            self._latest_frame = None
+
+            self._latest_frame_time = 0.0
+
+            self._frame_sequence = 0
+
+            self._last_read_sequence = -1
+
+    # ======================================================
+    # BACKGROUND RECONNECT
+    # ======================================================
+
+    def _thread_reconnect(self) -> bool:
+
+        if self._released:
+
+            return False
+
+        if self._reconnecting:
+
+            return False
+
+        self._reconnecting = True
+
+        try:
+
+            for attempt in range(
+                1,
+                self.reconnect_attempts + 1,
+            ):
+
+                if (
+                    self._released
+                    or
+                    self._capture_stop_event.is_set()
+                ):
+
+                    return False
+
+                self._log(
+                    "warning",
+                    f"{self.name}: reconnect attempt "
+                    f"{attempt}/"
+                    f"{self.reconnect_attempts}.",
+                )
+
+                if (
+                    attempt > 1
+                    and self.reconnect_delay > 0
+                ):
+
+                    time.sleep(
+                        self.reconnect_delay
+                    )
+
+                with self._lock:
+
+                    self._release_capture()
+
+                    if not self._open_capture():
+
+                        continue
+
+                    self._configure_capture()
+
+                    self._update_metadata()
+
+                    self.connected = True
+
+                self._clear_latest_frame()
 
                 self._log(
                     "info",
@@ -475,17 +890,31 @@ class Camera:
 
                 return True
 
-        self.connected = False
+            self.connected = False
 
-        return False
+            return False
+
+        finally:
+
+            self._reconnecting = False
+
+    # ======================================================
+    # PUBLIC RECONNECT
+    # ======================================================
+
+    def reconnect(self) -> bool:
+
+        if self.mode == "video":
+
+            return False
+
+        return self._thread_reconnect()
 
     # ======================================================
     # RESET
     # ======================================================
 
-    def reset(
-        self,
-    ) -> bool:
+    def reset(self) -> bool:
 
         self._log(
             "info",
@@ -494,34 +923,67 @@ class Camera:
 
         self.release()
 
-        # release() marks the camera as intentionally
-        # released, but connect() clears that flag.
-
         return self.connect()
+
+    # ======================================================
+    # STOP CAPTURE THREAD
+    # ======================================================
+
+    def _stop_capture_thread(self):
+
+        self._capture_stop_event.set()
+
+        thread = (
+            self._capture_thread
+        )
+
+        # Avoid joining ourselves.
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread
+            is not threading.current_thread()
+        ):
+
+            thread.join(
+                timeout=2.0
+            )
+
+        self._capture_thread = None
 
     # ======================================================
     # RELEASE
     # ======================================================
 
-    def release(
-        self,
-    ):
+    def release(self):
+
+        self._released = True
+
+        self.connected = False
+
+        self._capture_stop_event.set()
+
+        # Release capture first. This helps unblock
+        # cap.read() if the stream is waiting for data.
 
         with self._lock:
 
-            self._released = True
-
             self._release_capture()
 
-            self.connected = False
+        self._stop_capture_thread()
+
+        self._clear_latest_frame()
+
+        self._log(
+            "info",
+            f"{self.name}: camera released.",
+        )
 
     # ======================================================
     # INTERNAL CAPTURE RELEASE
     # ======================================================
 
-    def _release_capture(
-        self,
-    ):
+    def _release_capture(self):
 
         if self.cap is not None:
 
@@ -543,9 +1005,7 @@ class Camera:
     # DISCONNECT
     # ======================================================
 
-    def disconnect(
-        self,
-    ):
+    def disconnect(self):
 
         self.release()
 
@@ -553,25 +1013,23 @@ class Camera:
     # CONNECTION STATUS
     # ======================================================
 
-    def is_open(
-        self,
-    ) -> bool:
+    def is_open(self) -> bool:
 
         with self._lock:
 
             return bool(
                 self.connected
-                and self.cap is not None
-                and self.cap.isOpened()
+                and
+                self.cap is not None
+                and
+                self.cap.isOpened()
             )
 
     # ======================================================
     # UPDATE METADATA
     # ======================================================
 
-    def _update_metadata(
-        self,
-    ):
+    def _update_metadata(self):
 
         if self.cap is None:
 
@@ -600,11 +1058,13 @@ class Camera:
                 or 0.0
             )
 
-            # Some RTSP backends return NaN or unrealistic
-            # values. Keep zero when FPS is unavailable.
+            # RTSP backends occasionally report invalid
+            # FPS values.
+
             if (
                 fps <= 0
                 or fps != fps
+                or fps > 240
             ):
 
                 fps = 0.0
@@ -623,21 +1083,15 @@ class Camera:
     # GETTERS
     # ======================================================
 
-    def get_width(
-        self,
-    ):
+    def get_width(self):
 
         return self.width
 
-    def get_height(
-        self,
-    ):
+    def get_height(self):
 
         return self.height
 
-    def get_fps(
-        self,
-    ):
+    def get_fps(self):
 
         return self.fps
 
@@ -645,11 +1099,20 @@ class Camera:
     # CAMERA INFORMATION
     # ======================================================
 
-    def info(
-        self,
-    ):
+    def info(self):
+
+        frame_age = (
+            self.get_frame_age()
+        )
+
+        capture_thread_alive = bool(
+            self._capture_thread is not None
+            and
+            self._capture_thread.is_alive()
+        )
 
         return {
+
             "name":
                 self.name,
 
@@ -679,6 +1142,22 @@ class Camera:
 
             "reconnect_delay":
                 self.reconnect_delay,
+
+            "capture_thread_alive":
+                capture_thread_alive,
+
+            "latest_frame_age_seconds":
+                (
+                    round(
+                        frame_age,
+                        3,
+                    )
+                    if frame_age is not None
+                    else None
+                ),
+
+            "frame_sequence":
+                self._frame_sequence,
         }
 
     # ======================================================

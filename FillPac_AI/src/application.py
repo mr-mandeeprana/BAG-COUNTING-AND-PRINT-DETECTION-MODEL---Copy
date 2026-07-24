@@ -1,17 +1,17 @@
 """
 ==========================================================
 FillPac AI
-Application
+Production Application Orchestrator
 ==========================================================
 
-Main application orchestrator.
-
-Production Architecture
------------------------
+Architecture
+------------
 
 Application
     |
     +-- DashboardState
+    |
+    +-- CountLogger
     |
     +-- Elasticsearch
     |
@@ -30,14 +30,23 @@ Application
             - Counter
             - PrintDetector
             - Print history
+            - Latest annotated frame
+
 
 Important
 ---------
-YOLO model is loaded exactly ONCE.
+YOLO is loaded exactly ONCE.
 
-All camera pipelines use the same InferenceManager.
+All enabled cameras share ONE InferenceManager.
 
-Trackers and counters remain independent per camera.
+Each camera still owns its own:
+- Camera connection
+- ByteTrack tracker
+- Physical-center Counter
+- PrintDetector
+- Print voting/history
+
+The dashboard does NOT perform inference.
 ==========================================================
 """
 
@@ -46,8 +55,8 @@ import time
 
 import cv2
 
-from src.count_logger import CountLogger
 from src.config import Config
+from src.count_logger import CountLogger
 from src.dashboard import DashboardState
 from src.detector import Detector
 from src.elasticsearch import ElasticSearch
@@ -58,38 +67,14 @@ from src.pipeline import Pipeline
 
 class Application:
 
+    # ======================================================
+    # INITIALIZATION
+    # ======================================================
+
     def __init__(self):
 
         # ==================================================
-        # CONFIGURATION
-        # ==================================================
-
-        self.config = Config()
-        self.config.validate()
-
-        # ==================================================
-        # LOGGER
-        # ==================================================
-
-        self.logger = Logger(
-            log_file=self.config.get(
-                "logging",
-                "file",
-                default="logs/application.log",
-            ),
-            level=self.config.get(
-                "logging",
-                "level",
-                default="INFO",
-            ),
-        )
-
-        self.logger.info(
-            "Starting FillPac AI"
-        )
-
-        # ==================================================
-        # APPLICATION STATE
+        # BASIC APPLICATION STATE
         # ==================================================
 
         self.stopped = False
@@ -106,230 +91,465 @@ class Application:
 
         self.elasticsearch = None
 
+        self.dashboard_state = None
+
+        self.count_logger = None
+
+
+        # ==================================================
+        # CONFIGURATION
+        # ==================================================
+
+        self.config = Config()
+
+        self.config.validate()
+
+
+        # ==================================================
+        # LOGGER
+        # ==================================================
+
+        self.logger = Logger(
+
+            log_file=self.config.get(
+                "logging",
+                "file",
+                default="logs/application.log",
+            ),
+
+            level=self.config.get(
+                "logging",
+                "level",
+                default="INFO",
+            ),
+        )
+
+
+        self.logger.info(
+            "================================================"
+        )
+
+        self.logger.info(
+            "Starting FillPac AI"
+        )
+
+        self.logger.info(
+            "================================================"
+        )
+
+
+        # ==================================================
+        # DASHBOARD CONFIGURATION
+        # ==================================================
+
+        dashboard_config = (
+            self.config.get(
+                "dashboard",
+                default={},
+            )
+            or {}
+        )
+
+
+        dashboard_enabled = bool(
+            dashboard_config.get(
+                "enabled",
+                True,
+            )
+        )
+
+
         # ==================================================
         # DASHBOARD STATE
         #
-        # This is the ONLY DashboardState writer used
-        # by the main AI application.
+        # DashboardState is the ONLY writer of state.json
+        # inside the AI application.
         # ==================================================
 
         self.dashboard_state = DashboardState(
-            enabled=self.config.get(
-                "dashboard",
-                "enabled",
-                default=True,
-            ),
-            state_file=self.config.get(
-                "dashboard",
+
+            state_file=dashboard_config.get(
                 "state_file",
-                default="dashboard/backend/state.json",
+                "dashboard/backend/state.json",
             ),
-            persist_interval_seconds=self.config.get(
-                "dashboard",
-                "persist_interval_seconds",
-                default=1.0,
+
+            publish_interval=dashboard_config.get(
+                "publish_interval",
+                dashboard_config.get(
+                    "persist_interval_seconds",
+                    0.25,
+                ),
             ),
-            logger=self.logger,
+
+            stale_timeout=dashboard_config.get(
+                "stale_timeout",
+                10.0,
+            ),
+
+            auto_publish=dashboard_enabled,
         )
+
+
+        self.dashboard_state.update_health(
+            {
+                "dashboard_enabled":
+                    dashboard_enabled,
+
+                "model_loaded":
+                    False,
+
+                "inference_manager_running":
+                    False,
+
+                "elasticsearch_connected":
+                    False,
+            }
+        )
+
 
         self.dashboard_state.set_system_status(
             "starting"
         )
 
-        # ==================================================
-        # ELASTICSEARCH
-        # ==================================================
-
-        elasticsearch_config = self.config.get(
-            "elasticsearch",
-            default={},
-        )
-
-        self.elasticsearch = ElasticSearch(
-            host=elasticsearch_config.get(
-                "host",
-                "localhost",
-            ),
-            port=elasticsearch_config.get(
-                "port",
-                9200,
-            ),
-            indices=elasticsearch_config.get(
-                "indices",
-            ),
-            enabled=elasticsearch_config.get(
-                "enabled",
-                False,
-            ),
-            logger=self.logger,
-        )
-
-        # ==================================================
-        # INITIAL DASHBOARD HEALTH
-        # ==================================================
-
-        self.dashboard_state.update_health(
-            {
-                "model_loaded": False,
-                "inference_manager_running": False,
-                "elasticsearch_connected":
-                    self.elasticsearch.is_connected(),
-                "dashboard_enabled":
-                    self.dashboard_state.enabled,
-            }
-        )
 
         # ==================================================
         # COUNT EVENT LOGGER
         # ==================================================
 
-        self.count_logger = CountLogger(
-            log_file=self.config.get(
+        logging_config = (
+            self.config.get(
                 "logging",
-                "count_file",
-                default="logs/count_events.jsonl",
-            ),
-            logger=self.logger,
+                default={},
+            )
+            or {}
         )
 
+
+        self.count_logger = CountLogger(
+
+            file_path=logging_config.get(
+                "count_file",
+                "logs/count_events.jsonl",
+            ),
+
+            enabled=logging_config.get(
+                "count_events_enabled",
+                True,
+            ),
+
+            flush_immediately=logging_config.get(
+                "count_flush_immediately",
+                True,
+            ),
+        )
+
+
         # ==================================================
-        # SHARED YOLO MODEL
-        #
-        # IMPORTANT:
-        # Read model configuration ONCE.
-        #
-        # We use the first enabled camera's model config
-        # because the current YAML references the same
-        # default model for all cameras.
+        # ELASTICSEARCH
         # ==================================================
+
+        elasticsearch_config = (
+            self.config.get(
+                "elasticsearch",
+                default={},
+            )
+            or {}
+        )
+
 
         try:
 
-            enabled_cameras = [
-                camera
-                for camera in self.config.get(
-                    "cameras",
-                    default=[],
-                )
-                if camera.get(
+            self.elasticsearch = ElasticSearch(
+
+                host=elasticsearch_config.get(
+                    "host",
+                    "localhost",
+                ),
+
+                port=elasticsearch_config.get(
+                    "port",
+                    9200,
+                ),
+
+                indices=elasticsearch_config.get(
+                    "indices"
+                ),
+
+                enabled=elasticsearch_config.get(
                     "enabled",
-                    True,
-                )
-            ]
+                    False,
+                ),
 
-            if not enabled_cameras:
+                logger=self.logger,
+            )
 
-                self.logger.warning(
-                    "No enabled cameras found "
-                    "in configuration."
-                )
 
-                self.dashboard_state.set_system_status(
-                    "idle"
-                )
+            elasticsearch_connected = (
+                self._is_elasticsearch_connected()
+            )
 
-                return
 
-            # ----------------------------------------------
-            # Shared model configuration
-            # ----------------------------------------------
+            self.dashboard_state.update_health(
+                {
+                    "elasticsearch_connected":
+                        elasticsearch_connected
+                }
+            )
 
-            model_config = enabled_cameras[
+
+        except Exception as error:
+
+            # Elasticsearch must not prevent the vision
+            # system from starting.
+
+            self.elasticsearch = None
+
+
+            self.dashboard_state.update_health(
+                {
+                    "elasticsearch_connected":
+                        False
+                }
+            )
+
+
+            self.logger.warning(
+                "Elasticsearch initialization failed: "
+                f"{error}"
+            )
+
+
+        # ==================================================
+        # ENABLED CAMERAS
+        # ==================================================
+
+        enabled_cameras = [
+
+            camera
+
+            for camera in self.config.get(
+                "cameras",
+                default=[],
+            )
+
+            if camera.get(
+                "enabled",
+                True,
+            )
+        ]
+
+
+        if not enabled_cameras:
+
+            self.logger.warning(
+                "No enabled cameras found "
+                "in configuration."
+            )
+
+
+            self.dashboard_state.set_system_status(
+                "idle"
+            )
+
+
+            self.dashboard_state.flush()
+
+            return
+
+
+        # ==================================================
+        # SHARED MODEL CONFIGURATION
+        #
+        # Current project architecture uses the same model
+        # for all cameras. Therefore model configuration is
+        # taken from the first enabled camera.
+        # ==================================================
+
+        model_config = (
+            enabled_cameras[
                 0
             ].get(
                 "model",
                 {},
             )
+            or {}
+        )
+
+
+        # ==================================================
+        # DETECTOR
+        #
+        # ONE Detector = ONE YOLO model.
+        # ==================================================
+
+        try:
+
+            model_device = model_config.get(
+                "device",
+                "cpu",
+            )
+
+
+            model_half = bool(
+                model_config.get(
+                    "half",
+                    False,
+                )
+            )
+
 
             # ----------------------------------------------
-            # Create ONE Detector
-            #
-            # This loads ONE YOLO model.
+            # FP16 should not be enabled for CPU inference.
             # ----------------------------------------------
+
+            if str(
+                model_device
+            ).lower() == "cpu":
+
+                model_half = False
+
+
+            self.logger.info(
+                "Initializing shared YOLO Detector."
+            )
+
+
+            self.logger.info(
+                f"Model device: {model_device}"
+            )
+
+
+            self.logger.info(
+                f"FP16 enabled: {model_half}"
+            )
+
 
             self.detector = Detector(
+
                 model_path=model_config[
                     "path"
                 ],
+
                 confidence=model_config.get(
                     "confidence",
                     0.5,
                 ),
+
                 iou=model_config.get(
                     "iou",
                     0.45,
                 ),
-                device=model_config.get(
-                    "device",
-                    "cpu",
-                ),
+
+                device=model_device,
+
                 image_size=model_config.get(
                     "image_size",
                     640,
                 ),
-                half=model_config.get(
-                    "half",
-                    True,
-                ),
+
+                half=model_half,
+
                 max_detections=model_config.get(
                     "max_detections",
                     100,
                 ),
+
                 allowed_classes=model_config.get(
-                    "allowed_classes",
+                    "allowed_classes"
                 ),
+
                 min_bbox_area=model_config.get(
                     "min_bbox_area",
                     0,
                 ),
+
                 bag_confidence=model_config.get(
-                    "bag_confidence",
+                    "bag_confidence"
                 ),
+
                 print_confidence=model_config.get(
-                    "print_confidence",
+                    "print_confidence"
                 ),
+
                 class_confidence_thresholds=
                     model_config.get(
-                        "class_confidence_thresholds",
+                        "class_confidence_thresholds"
                     ),
+
                 detection_roi=model_config.get(
-                    "detection_roi",
+                    "detection_roi"
                 ),
+
                 logger=self.logger,
             )
+
 
             self.logger.info(
                 "Shared YOLO Detector initialized."
             )
 
-            # ----------------------------------------------
-            # Update health
-            # ----------------------------------------------
 
             self.dashboard_state.update_health(
                 {
-                    "model_loaded": True
+                    "model_loaded":
+                        True
                 }
             )
 
-            # ==================================================
-            # INFERENCE MANAGER
-            #
-            # ONE manager owns access to the shared Detector.
-            # ==================================================
+
+        except Exception as error:
+
+            self.dashboard_state.update_health(
+                {
+                    "model_loaded":
+                        False,
+
+                    "inference_manager_running":
+                        False,
+                }
+            )
+
+
+            self.dashboard_state.set_system_status(
+                "error"
+            )
+
+
+            self.dashboard_state.flush()
+
+
+            self.logger.error(
+                "Shared YOLO initialization failed: "
+                f"{error}"
+            )
+
+
+            raise
+
+
+        # ==================================================
+        # SHARED INFERENCE MANAGER
+        # ==================================================
+
+        try:
 
             self.inference_manager = (
                 InferenceManager(
+
                     detector=self.detector,
+
                     logger=self.logger,
                 )
             )
 
+
             self.inference_manager.start()
+
 
             self.logger.info(
                 "Shared InferenceManager started."
             )
+
 
             self.dashboard_state.update_health(
                 {
@@ -338,66 +558,85 @@ class Application:
                 }
             )
 
+
         except Exception as error:
 
             self.dashboard_state.update_health(
                 {
-                    "model_loaded": False,
-                    "inference_manager_running": False,
+                    "inference_manager_running":
+                        False
                 }
             )
+
 
             self.dashboard_state.set_system_status(
                 "error"
             )
 
+
+            self.dashboard_state.flush()
+
+
             self.logger.error(
-                "Shared YOLO initialization "
-                f"failed: {error}"
+                "InferenceManager initialization failed: "
+                f"{error}"
             )
 
+
+            self.detector = None
+
+
             raise
+
 
         # ==================================================
         # PIPELINE CONFIGURATION
         # ==================================================
 
-        tracker_config = self.config.get(
-            "tracker",
-            default={},
+        tracker_config = (
+            self.config.get(
+                "tracker",
+                default={},
+            )
+            or {}
         )
 
-        display_config = self.config.get(
-            "display",
-            default={},
+
+        display_config = (
+            self.config.get(
+                "display",
+                default={},
+            )
+            or {}
         )
+
 
         # ==================================================
         # INITIALIZE CAMERA PIPELINES
-        #
-        # Every pipeline receives the SAME
-        # InferenceManager.
-        #
-        # Every pipeline still creates its OWN:
-        # - Camera
-        # - Tracker
-        # - Counter
-        # - PrintDetector
         # ==================================================
 
         try:
 
-            for camera in enabled_cameras:
+            for camera_config in enabled_cameras:
 
                 pipeline = Pipeline(
-                    camera_config=camera,
-                    tracker_config=tracker_config,
-                    display_config=display_config,
-                    logger=self.logger,
+
+                    camera_config=
+                        camera_config,
+
+                    tracker_config=
+                        tracker_config,
+
+                    display_config=
+                        display_config,
+
+                    logger=
+                        self.logger,
 
                     # --------------------------------------
-                    # SAME inference manager for all cameras
+                    # SAME shared inference manager
                     # --------------------------------------
+
                     inference_manager=
                         self.inference_manager,
 
@@ -411,14 +650,17 @@ class Application:
                         self.count_logger,
                 )
 
+
                 self.pipelines.append(
                     pipeline
                 )
 
+
                 self.logger.info(
-                    f'{camera["name"]} '
+                    f'{camera_config["name"]} '
                     "pipeline initialized."
                 )
+
 
         except Exception as error:
 
@@ -426,19 +668,40 @@ class Application:
                 "error"
             )
 
+
+            self.dashboard_state.flush()
+
+
             self.logger.error(
                 "Pipeline initialization failed: "
                 f"{error}"
             )
 
+
             # ----------------------------------------------
-            # Stop inference manager if pipeline
-            # initialization fails.
+            # Clean up anything initialized before failure.
             # ----------------------------------------------
+
+            for pipeline in self.pipelines:
+
+                try:
+
+                    pipeline.release()
+
+                except Exception:
+
+                    pass
+
 
             if self.inference_manager is not None:
 
                 try:
+
+                    self.inference_manager.stop(
+                        timeout=5
+                    )
+
+                except TypeError:
 
                     self.inference_manager.stop()
 
@@ -446,38 +709,84 @@ class Application:
 
                     pass
 
+
+            self.dashboard_state.update_health(
+                {
+                    "inference_manager_running":
+                        False
+                }
+            )
+
+
+            self.detector = None
+
+
+            self.dashboard_state.update_health(
+                {
+                    "model_loaded":
+                        False
+                }
+            )
+
+
             raise
+
+
+        # ==================================================
+        # INITIALIZATION COMPLETE
+        # ==================================================
+
+        self.dashboard_state.set_system_status(
+            "ready"
+        )
+
+
+        self.dashboard_state.flush()
+
+
+        self.logger.info(
+            f"{len(self.pipelines)} camera pipeline(s) "
+            "initialized."
+        )
+
 
     # ======================================================
     # RUN APPLICATION
     # ======================================================
 
-    def run(self):
+    def run(
+        self,
+    ):
 
         self.logger.info(
-            "Application running."
+            "Application run requested."
         )
 
-        # --------------------------------------------------
-        # Check pipelines
-        # --------------------------------------------------
+
+        # ==================================================
+        # CHECK PIPELINES
+        # ==================================================
 
         if not self.pipelines:
 
             self.logger.warning(
-                "No enabled camera pipelines "
-                "available."
+                "No enabled camera pipelines available."
             )
+
 
             self.dashboard_state.set_system_status(
                 "idle"
             )
 
+
+            self.dashboard_state.flush()
+
             return
 
-        # --------------------------------------------------
-        # Verify InferenceManager
-        # --------------------------------------------------
+
+        # ==================================================
+        # VERIFY INFERENCE MANAGER
+        # ==================================================
 
         if self.inference_manager is None:
 
@@ -485,58 +794,89 @@ class Application:
                 "InferenceManager is not available."
             )
 
+
             self.dashboard_state.set_system_status(
                 "error"
             )
 
+
+            self.dashboard_state.flush()
+
             return
 
-        # --------------------------------------------------
-        # System Running
-        # --------------------------------------------------
+
+        # ==================================================
+        # SYSTEM RUNNING
+        # ==================================================
 
         self.dashboard_state.set_system_status(
             "running"
         )
 
-        # --------------------------------------------------
-        # Start Pipeline Threads
-        # --------------------------------------------------
+
+        self.dashboard_state.update_health(
+            {
+                "model_loaded":
+                    self.detector is not None,
+
+                "inference_manager_running":
+                    True,
+
+                "elasticsearch_connected":
+                    self._is_elasticsearch_connected(),
+            }
+        )
+
+
+        self.dashboard_state.flush()
+
+
+        # ==================================================
+        # START PIPELINE THREADS
+        # ==================================================
 
         for pipeline in self.pipelines:
 
             thread = threading.Thread(
+
                 target=pipeline.run,
+
                 args=(
                     self.stop_event,
                 ),
+
                 daemon=True,
-                name=
-                    f"Pipeline-{pipeline.name}",
+
+                name=(
+                    f"Pipeline-{pipeline.name}"
+                ),
             )
 
+
             thread.start()
+
 
             self.pipeline_threads.append(
                 thread
             )
 
+
             self.logger.info(
-                f"{pipeline.name} "
-                "pipeline thread started."
+                f"{pipeline.name} pipeline thread started."
             )
 
-        # --------------------------------------------------
-        # Main Loop
-        # --------------------------------------------------
+
+        # ==================================================
+        # MAIN APPLICATION LOOP
+        # ==================================================
 
         try:
 
             while not self.stop_event.is_set():
 
-                # ------------------------------------------
-                # Publish latest annotated camera frames
-                # ------------------------------------------
+                # ==========================================
+                # DISPLAY LATEST ANNOTATED FRAMES
+                # ==========================================
 
                 for pipeline in self.pipelines:
 
@@ -548,101 +888,186 @@ class Application:
 
                         self.logger.warning(
                             f"{pipeline.name} "
-                            "publish failed: "
+                            "display publish failed: "
                             f"{error}"
                         )
 
-                # ------------------------------------------
-                # ESC key
-                # ------------------------------------------
 
-                if cv2.waitKey(
-                    1
-                ) == 27:
+                # ==========================================
+                # ESC KEY
+                # ==========================================
 
-                    self.logger.info(
-                        "Exit key pressed."
+                try:
+
+                    key = cv2.waitKey(
+                        1
                     )
 
-                    self.stop_event.set()
 
-                    break
+                    if (
+                        key
+                        &
+                        0xFF
+                    ) == 27:
+
+                        self.logger.info(
+                            "ESC key pressed."
+                        )
+
+
+                        self.stop_event.set()
+
+                        break
+
+
+                except cv2.error:
+
+                    # Headless OpenCV environments may not
+                    # support waitKey().
+                    pass
+
 
                 time.sleep(
                     0.01
                 )
 
-        # --------------------------------------------------
-        # Keyboard Interrupt
-        # --------------------------------------------------
+
+        # ==================================================
+        # KEYBOARD INTERRUPT
+        # ==================================================
 
         except KeyboardInterrupt:
 
             self.logger.info(
-                "Keyboard interrupt received, "
-                "shutting down."
+                "Keyboard interrupt received."
             )
+
 
             self.stop_event.set()
 
-        # --------------------------------------------------
-        # Unexpected Error
-        # --------------------------------------------------
+
+        # ==================================================
+        # UNEXPECTED APPLICATION ERROR
+        # ==================================================
 
         except Exception as error:
 
             self.logger.error(
-                "Unhandled exception in "
-                f"application run: {error}"
+                "Unhandled exception in application run: "
+                f"{error}"
             )
+
 
             self.dashboard_state.set_system_status(
                 "error"
             )
 
+
+            self.dashboard_state.flush()
+
+
             self.stop_event.set()
 
-        # --------------------------------------------------
-        # Shutdown
-        # --------------------------------------------------
+
+        # ==================================================
+        # SHUTDOWN
+        # ==================================================
 
         finally:
 
             self.stop()
 
+
     # ======================================================
     # STOP APPLICATION
     # ======================================================
 
-    def stop(self):
+    def stop(
+        self,
+    ):
 
         if self.stopped:
-
             return
+
 
         self.stopped = True
 
+
         self.logger.info(
-            "Stopping application."
+            "================================================"
         )
 
-        # --------------------------------------------------
-        # Dashboard status
-        # --------------------------------------------------
-
-        self.dashboard_state.set_system_status(
-            "stopping"
+        self.logger.info(
+            "Stopping FillPac AI"
         )
 
-        # --------------------------------------------------
-        # Tell pipeline loops to stop
-        # --------------------------------------------------
+        self.logger.info(
+            "================================================"
+        )
+
+
+        # ==================================================
+        # DASHBOARD STATUS
+        # ==================================================
+
+        if self.dashboard_state is not None:
+
+            try:
+
+                self.dashboard_state.set_system_status(
+                    "stopping"
+                )
+
+                self.dashboard_state.flush()
+
+            except Exception:
+
+                self.logger.warning(
+                    "Unable to publish stopping state."
+                )
+
+
+        # ==================================================
+        # SIGNAL PIPELINES
+        # ==================================================
 
         self.stop_event.set()
 
-        # --------------------------------------------------
-        # Release camera resources
-        # --------------------------------------------------
+
+        # ==================================================
+        # WAIT FOR PIPELINE THREADS
+        #
+        # Do this before shutting down InferenceManager.
+        # ==================================================
+
+        for thread in self.pipeline_threads:
+
+            try:
+
+                thread.join(
+                    timeout=5
+                )
+
+
+                if thread.is_alive():
+
+                    self.logger.warning(
+                        f"{thread.name} did not stop "
+                        "within timeout."
+                    )
+
+
+            except Exception as error:
+
+                self.logger.warning(
+                    f"Failed joining {thread.name}: "
+                    f"{error}"
+                )
+
+
+        # ==================================================
+        # RELEASE PIPELINES / CAMERAS
+        # ==================================================
 
         for pipeline in self.pipelines:
 
@@ -653,35 +1078,14 @@ class Application:
             except Exception as error:
 
                 self.logger.warning(
-                    f"{pipeline.name} "
-                    "release failed: "
+                    f"{pipeline.name} release failed: "
                     f"{error}"
                 )
 
-        # --------------------------------------------------
-        # Wait for pipeline threads
-        #
-        # Do this BEFORE stopping InferenceManager because
-        # pipeline threads may currently be waiting inside
-        # inference_manager.infer().
-        # --------------------------------------------------
 
-        for thread in self.pipeline_threads:
-
-            thread.join(
-                timeout=5
-            )
-
-            if thread.is_alive():
-
-                self.logger.warning(
-                    f"{thread.name} "
-                    "did not stop within timeout."
-                )
-
-        # --------------------------------------------------
-        # Stop shared InferenceManager
-        # --------------------------------------------------
+        # ==================================================
+        # STOP SHARED INFERENCE MANAGER
+        # ==================================================
 
         if self.inference_manager is not None:
 
@@ -691,35 +1095,84 @@ class Application:
                     timeout=5
                 )
 
+
+            except TypeError:
+
+                # Compatibility in case current manager
+                # stop() has no timeout parameter.
+
+                try:
+
+                    self.inference_manager.stop()
+
+                except Exception as error:
+
+                    self.logger.warning(
+                        "InferenceManager shutdown "
+                        f"failed: {error}"
+                    )
+
+
             except Exception as error:
 
                 self.logger.warning(
-                    "InferenceManager shutdown "
-                    f"failed: {error}"
+                    "InferenceManager shutdown failed: "
+                    f"{error}"
                 )
 
-        self.dashboard_state.update_health(
-            {
-                "inference_manager_running":
-                    False
-            }
-        )
 
-                # --------------------------------------------------
-        # Release Detector Reference
-        # --------------------------------------------------
+        self.inference_manager = None
+
+
+        # ==================================================
+        # UPDATE INFERENCE HEALTH
+        # ==================================================
+
+        if self.dashboard_state is not None:
+
+            try:
+
+                self.dashboard_state.update_health(
+                    {
+                        "inference_manager_running":
+                            False
+                    }
+                )
+
+            except Exception:
+
+                pass
+
+
+        # ==================================================
+        # RELEASE DETECTOR REFERENCE
+        #
+        # Python / PyTorch will release the model resources
+        # when no longer referenced.
+        # ==================================================
 
         self.detector = None
 
-        self.dashboard_state.update_health(
-            {
-                "model_loaded": False,
-            }
-        )
 
-        # --------------------------------------------------
-        # Close Elasticsearch
-        # --------------------------------------------------
+        if self.dashboard_state is not None:
+
+            try:
+
+                self.dashboard_state.update_health(
+                    {
+                        "model_loaded":
+                            False
+                    }
+                )
+
+            except Exception:
+
+                pass
+
+
+        # ==================================================
+        # CLOSE ELASTICSEARCH
+        # ==================================================
 
         if self.elasticsearch is not None:
 
@@ -730,40 +1183,182 @@ class Application:
             except Exception as error:
 
                 self.logger.warning(
-                    "Elasticsearch shutdown "
-                    f"failed: {error}"
+                    "Elasticsearch shutdown failed: "
+                    f"{error}"
                 )
 
-        self.dashboard_state.update_health(
-            {
-                "elasticsearch_connected": False,
-            }
-        )
 
-        # --------------------------------------------------
-        # Final Dashboard State
+        self.elasticsearch = None
+
+
+        if self.dashboard_state is not None:
+
+            try:
+
+                self.dashboard_state.update_health(
+                    {
+                        "elasticsearch_connected":
+                            False
+                    }
+                )
+
+            except Exception:
+
+                pass
+
+
+        # ==================================================
+        # FINAL DASHBOARD STATE
         #
-        # IMPORTANT:
-        # Update all final values BEFORE closing
-        # DashboardState.
-        # --------------------------------------------------
+        # DashboardState.stop(mark_offline=True) performs
+        # the final atomic state.json write and stops the
+        # background state publisher.
+        # ==================================================
 
-        self.dashboard_state.set_system_status(
-            "stopped"
-        )
+        if self.dashboard_state is not None:
 
-        # Explicitly persist final state.
-        self.dashboard_state.flush()
+            try:
 
-        # Stop persistence worker and close DashboardState.
-        self.dashboard_state.close()
+                self.dashboard_state.stop(
+                    mark_offline=True
+                )
 
-        # --------------------------------------------------
-        # Close OpenCV Windows
-        # --------------------------------------------------
+            except Exception as error:
 
-        cv2.destroyAllWindows()
+                self.logger.warning(
+                    "DashboardState shutdown failed: "
+                    f"{error}"
+                )
+
+
+        # ==================================================
+        # CLOSE OPENCV WINDOWS
+        # ==================================================
+
+        try:
+
+            cv2.destroyAllWindows()
+
+        except cv2.error:
+
+            pass
+
 
         self.logger.info(
-            "Application closed."
+            "FillPac AI application closed."
         )
+
+
+    # ======================================================
+    # ELASTICSEARCH CONNECTION STATUS
+    # ======================================================
+
+    def _is_elasticsearch_connected(
+        self,
+    ):
+
+        if self.elasticsearch is None:
+            return False
+
+
+        try:
+
+            checker = getattr(
+                self.elasticsearch,
+                "is_connected",
+                None,
+            )
+
+
+            if callable(
+                checker
+            ):
+
+                return bool(
+                    checker()
+                )
+
+
+            return False
+
+
+        except Exception:
+
+            return False
+
+
+    # ======================================================
+    # APPLICATION STATUS
+    # ======================================================
+
+    def get_status(
+        self,
+    ):
+
+        pipeline_status = []
+
+
+        for pipeline in self.pipelines:
+
+            try:
+
+                pipeline_status.append(
+                    pipeline.get_status()
+                )
+
+            except Exception:
+
+                pipeline_status.append(
+                    {
+                        "name":
+                            getattr(
+                                pipeline,
+                                "name",
+                                "unknown",
+                            ),
+
+                        "status":
+                            "unknown",
+                    }
+                )
+
+
+        return {
+
+            "stopped":
+                self.stopped,
+
+            "model_loaded":
+                self.detector is not None,
+
+            "inference_manager_running":
+                self.inference_manager
+                is not None,
+
+            "elasticsearch_connected":
+                self._is_elasticsearch_connected(),
+
+            "pipeline_count":
+                len(
+                    self.pipelines
+                ),
+
+            "pipelines":
+                pipeline_status,
+
+            "dashboard":
+                (
+                    self.dashboard_state.get_status()
+                    if self.dashboard_state
+                    is not None
+                    else None
+                ),
+
+            "count_logger":
+                (
+                    self.count_logger.get_status()
+                    if self.count_logger
+                    is not None
+                    else None
+                ),
+        }
