@@ -9,7 +9,8 @@ Each camera owns:
 - Tracker
 - Counter
 - PrintDetector
-- JamDetector
+- JamDetector              -> Condition A
+- BagSpacingDetector       -> Condition B
 - Print history
 - Latest annotated frame
 
@@ -26,6 +27,7 @@ Track ID is used only for:
 - temporal movement history
 - print-vote association
 - jam movement analysis
+- spacing pair association
 - duplicate protection
 - diagnostics
 
@@ -33,15 +35,14 @@ Track ID itself does NOT trigger a count.
 
 Jam Detection
 -------------
-JamDetector operates independently from Counter.
+Condition A:
+    Movement-based JamDetector.
 
-Tracker
-    |
-    +---- Counter
-    |
-    +---- PrintDetector
-    |
-    +---- JamDetector
+Condition B:
+    Calibrated physical edge-to-edge bag spacing.
+
+Final Jam:
+    Condition A OR Condition B
 
 Jam detection NEVER changes the physical-center counting
 logic.
@@ -70,6 +71,7 @@ import time
 
 import cv2
 
+from src.bag_spacing_detector import BagSpacingDetector
 from src.camera import Camera
 from src.counter import Counter
 from src.jam_detector import JamDetector
@@ -212,6 +214,14 @@ class Pipeline:
             or {}
         )
 
+        spacing_config = (
+            camera_config.get(
+                "bag_spacing",
+                {},
+            )
+            or {}
+        )
+
         # ==================================================
         # DISPLAY CONFIGURATION
         # ==================================================
@@ -263,9 +273,6 @@ class Pipeline:
 
         # ==================================================
         # COUNTER
-        #
-        # Physical bag CENTER crossing is the counting
-        # trigger.
         # ==================================================
 
         if isinstance(self.roi, dict):
@@ -362,7 +369,10 @@ class Pipeline:
         self.print_detector = PrintDetector(
             confidence_threshold=print_config.get(
                 "confidence_threshold",
-                print_config.get("confidence", 0.4),
+                print_config.get(
+                    "confidence",
+                    0.4,
+                ),
             ),
             iou_threshold=print_config.get(
                 "iou_threshold",
@@ -395,12 +405,9 @@ class Pipeline:
         )
 
         # ==================================================
-        # JAM DETECTION V1
+        # JAM DETECTION - CONDITION A
         #
-        # One JamDetector per camera.
-        #
-        # It receives tracker output only.
-        # It does NOT modify Counter.
+        # Existing movement/time based detector.
         # ==================================================
 
         self.jam_detector = JamDetector(
@@ -417,6 +424,44 @@ class Pipeline:
 
         self.jam_result = (
             self.jam_detector._empty_result()
+        )
+
+        # ==================================================
+        # BAG SPACING - CONDITION B
+        #
+        # No timer.
+        #
+        # Physical calibrated edge-to-edge distance:
+        #
+        # gap <= threshold -> JAM
+        # ==================================================
+
+        self.bag_spacing_detector = (
+            BagSpacingDetector(
+                config=spacing_config,
+            )
+        )
+
+        self.bag_spacing_enabled = bool(
+            self.bag_spacing_detector.enabled
+        )
+
+        self.spacing_roi = dict(
+            self.bag_spacing_detector.roi
+        )
+
+        self.spacing_result = (
+            self.bag_spacing_detector._empty_result()
+        )
+
+        # ==================================================
+        # FINAL JAM RESULT
+        #
+        # Condition A OR Condition B
+        # ==================================================
+
+        self.final_jam_result = (
+            self._build_final_jam_result()
         )
 
         # ==================================================
@@ -644,10 +689,6 @@ class Pipeline:
                     self.print_detection_enabled
                 ),
 
-                # --------------------------------------
-                # JAM DETECTION
-                # --------------------------------------
-
                 jam_detection_enabled=(
                     self.jam_detection_enabled
                 ),
@@ -673,15 +714,23 @@ class Pipeline:
                             "down",
                         ),
 
-                    # --------------------------------------
-                    # JAM V1
-                    # --------------------------------------
-
+                    # Condition A
                     "jam_detection_enabled":
                         self.jam_detection_enabled,
 
                     "jam_roi":
                         self.jam_roi,
+
+                    # Condition B
+                    "bag_spacing_enabled":
+                        self.bag_spacing_enabled,
+
+                    "spacing_roi":
+                        self.spacing_roi,
+
+                    "spacing_threshold_mm":
+                        self.bag_spacing_detector
+                        .jam_threshold_mm,
                 },
             )
 
@@ -715,23 +764,63 @@ class Pipeline:
 
                 frame_count=0,
 
-                # --------------------------------------
-                # JAM V1
-                # --------------------------------------
-
-                jam_detection_enabled=(
+                # Condition A
+                movement_jam_enabled=(
                     self.jam_detection_enabled
                 ),
 
-                jam_status=(
+                movement_jam_status=(
                     "normal"
                     if self.jam_detection_enabled
                     else "disabled"
                 ),
 
+                movement_jam_detected=False,
+
+                movement_jam_warning=False,
+
+                movement_jam_track_ids=[],
+
+                # Condition B
+                spacing_detection_enabled=(
+                    self.bag_spacing_enabled
+                ),
+
+                spacing_status=(
+                    "normal"
+                    if self.bag_spacing_enabled
+                    else "disabled"
+                ),
+
+                spacing_jam_detected=False,
+
+                spacing_threshold_mm=(
+                    self.bag_spacing_detector
+                    .jam_threshold_mm
+                ),
+
+                minimum_gap_mm=None,
+
+                spacing_pairs=[],
+
+                spacing_jam_pairs=[],
+
+                spacing_jam_track_ids=[],
+
+                # Final combined jam
+                jam_detection_enabled=bool(
+                    self.jam_detection_enabled
+                    or
+                    self.bag_spacing_enabled
+                ),
+
+                jam_status="normal",
+
                 jam_detected=False,
 
                 jam_warning=False,
+
+                jam_types=[],
 
                 active_jam_count=0,
 
@@ -816,8 +905,6 @@ class Pipeline:
 
             # ==============================================
             # CPU OPTIMIZATION
-            #
-            # Process every second frame.
             # ==============================================
 
             if self.frame_index % 2 != 0:
@@ -826,7 +913,7 @@ class Pipeline:
             self.processed_frame_count += 1
 
             # ==============================================
-            # YOLO INFERENCE
+            # YOLO
             # ==============================================
 
             detections = self.detect(
@@ -865,21 +952,13 @@ class Pipeline:
                 )
             )
 
-            # ==============================================
-            # RECORD PRINT VOTES
-            # ==============================================
-
             self.record_print_observations(
                 print_results,
                 tracks,
             )
 
             # ==============================================
-            # JAM DETECTION V1
-            #
-            # IMPORTANT:
-            # This branch is completely independent from
-            # physical-center counting.
+            # CONDITION A - MOVEMENT JAM
             # ==============================================
 
             self.jam_result = (
@@ -890,7 +969,30 @@ class Pipeline:
             )
 
             # ==============================================
-            # FILTER UNSTABLE TRACKS FOR COUNTING
+            # CONDITION B - BAG SPACING JAM
+            #
+            # No timer.
+            # Uses current live tracks.
+            # ==============================================
+
+            self.spacing_result = (
+                self.bag_spacing_detector.update(
+                    tracks
+                )
+            )
+
+            # ==============================================
+            # FINAL JAM
+            #
+            # A OR B
+            # ==============================================
+
+            self.final_jam_result = (
+                self._build_final_jam_result()
+            )
+
+            # ==============================================
+            # FILTER COUNTING TRACKS
             # ==============================================
 
             countable_tracks = (
@@ -900,9 +1002,9 @@ class Pipeline:
             )
 
             # ==============================================
-            # COUNT PHYSICAL BAG CENTER CROSSING
+            # PHYSICAL-CENTER COUNTING
             #
-            # JAM STATE DOES NOT BLOCK COUNTING.
+            # Jam does NOT block counting.
             # ==============================================
 
             count = self.count(
@@ -928,16 +1030,12 @@ class Pipeline:
                 fps,
             )
 
-            # ==============================================
-            # STORE LATEST ANNOTATED FRAME
-            # ==============================================
-
             self._set_latest_frame(
                 frame
             )
 
             # ==============================================
-            # DASHBOARD / ELASTICSEARCH EVENTS
+            # EVENTS
             # ==============================================
 
             self._publish_events(
@@ -991,6 +1089,172 @@ class Pipeline:
             )
 
             return False
+
+    # ======================================================
+    # BUILD FINAL JAM RESULT
+    # ======================================================
+
+    def _build_final_jam_result(
+        self,
+    ):
+
+        movement = (
+            self.jam_result
+            if isinstance(
+                self.jam_result,
+                dict,
+            )
+            else {}
+        )
+
+        spacing = (
+            self.spacing_result
+            if isinstance(
+                self.spacing_result,
+                dict,
+            )
+            else {}
+        )
+
+        movement_detected = bool(
+            movement.get(
+                "jam_detected",
+                False,
+            )
+        )
+
+        movement_warning = bool(
+            movement.get(
+                "warning",
+                False,
+            )
+        )
+
+        spacing_detected = bool(
+            spacing.get(
+                "jam_detected",
+                False,
+            )
+        )
+
+        jam_detected = bool(
+            movement_detected
+            or
+            spacing_detected
+        )
+
+        jam_types = []
+
+        if movement_detected:
+
+            jam_types.append(
+                "movement"
+            )
+
+        if spacing_detected:
+
+            jam_types.append(
+                "bag_spacing"
+            )
+
+        movement_ids = (
+            movement.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        spacing_ids = (
+            spacing.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        active_ids = sorted(
+            {
+                int(track_id)
+                for track_id
+                in (
+                    list(movement_ids)
+                    +
+                    list(spacing_ids)
+                )
+                if track_id is not None
+            }
+        )
+
+        if jam_detected:
+
+            status = "jam"
+
+        elif movement_warning:
+
+            status = "warning"
+
+        elif (
+            self.jam_detection_enabled
+            or
+            self.bag_spacing_enabled
+        ):
+
+            status = "normal"
+
+        else:
+
+            status = "disabled"
+
+        return {
+
+            "status":
+                status,
+
+            "jam_detected":
+                jam_detected,
+
+            "warning":
+                (
+                    movement_warning
+                    and
+                    not jam_detected
+                ),
+
+            "jam_types":
+                jam_types,
+
+            "movement_jam_detected":
+                movement_detected,
+
+            "spacing_jam_detected":
+                spacing_detected,
+
+            "active_jam_count":
+                len(active_ids),
+
+            "active_jam_track_ids":
+                active_ids,
+
+            "minimum_gap_mm":
+                spacing.get(
+                    "minimum_gap_mm"
+                ),
+
+            "spacing_threshold_mm":
+                spacing.get(
+                    "threshold_mm",
+                    self.bag_spacing_detector
+                    .jam_threshold_mm,
+                ),
+
+            "spacing_jam_pairs":
+                spacing.get(
+                    "jam_pairs",
+                    [],
+                )
+                or [],
+        }
 
     # ======================================================
     # PIPELINE THREAD
@@ -1070,7 +1334,7 @@ class Pipeline:
         )
 
     # ======================================================
-    # TRACKING
+    # TRACK
     # ======================================================
 
     def track(
@@ -1416,13 +1680,20 @@ class Pipeline:
                 self.counter.last_counted_bags
             ),
 
-            # ==========================================
-            # JAM V1
-            # ==========================================
-
+            # Condition A
             jam_result=self.jam_result,
 
             jam_roi=self.jam_roi,
+
+            # Condition B
+            spacing_result=self.spacing_result,
+
+            spacing_roi=self.spacing_roi,
+
+            # Final A OR B
+            final_jam_result=(
+                self.final_jam_result
+            ),
         )
 
     # ======================================================
@@ -1463,10 +1734,6 @@ class Pipeline:
                 else None
             )
 
-    # ======================================================
-    # PUBLIC LATEST FRAME
-    # ======================================================
-
     def get_latest_frame(
         self,
     ):
@@ -1481,10 +1748,6 @@ class Pipeline:
 
                 else None
             )
-
-    # ======================================================
-    # BACKWARD COMPATIBILITY
-    # ======================================================
 
     def _get_latest_frame(
         self,
@@ -1542,7 +1805,7 @@ class Pipeline:
         self.connected = False
 
         # ----------------------------------------------
-        # Reset jam temporal memory when stream ends.
+        # Reset Condition A
         # ----------------------------------------------
 
         try:
@@ -1559,6 +1822,43 @@ class Pipeline:
                 f"{self.name}: JamDetector reset failed."
             )
 
+        # ----------------------------------------------
+        # Reset Condition B result
+        #
+        # BagSpacingDetector has no temporal jam state.
+        # ----------------------------------------------
+
+        try:
+
+            self.spacing_result = (
+                self.bag_spacing_detector
+                ._empty_result()
+            )
+
+        except Exception:
+
+            self.logger.warning(
+                f"{self.name}: BagSpacingDetector "
+                "reset failed."
+            )
+
+        try:
+
+            self.final_jam_result = (
+                self._build_final_jam_result()
+            )
+
+        except Exception:
+
+            self.final_jam_result = {
+                "status": "disabled",
+                "jam_detected": False,
+                "warning": False,
+                "jam_types": [],
+                "active_jam_count": 0,
+                "active_jam_track_ids": [],
+            }
+
         with self._frame_lock:
 
             self._latest_frame = None
@@ -1574,28 +1874,15 @@ class Pipeline:
         print_results,
     ):
 
-        # --------------------------------------------------
-        # Finalize print result ONLY for bags that crossed
-        # during this frame.
-        # --------------------------------------------------
-
         counted_results = (
             self._update_print_totals()
         )
-
-        # --------------------------------------------------
-        # Current live print status
-        # --------------------------------------------------
 
         live_print_status = (
             self._summarize_print_status(
                 print_results
             )
         )
-
-        # --------------------------------------------------
-        # Count-event print status
-        # --------------------------------------------------
 
         counted_print_status = (
 
@@ -1688,10 +1975,6 @@ class Pipeline:
 
         for counted_bag in counted_results:
 
-            # ----------------------------------------------
-            # ELASTICSEARCH COUNT EVENT
-            # ----------------------------------------------
-
             if self.elasticsearch is not None:
 
                 try:
@@ -1715,10 +1998,6 @@ class Pipeline:
                         f"{self.name}: failed publishing "
                         "count event to Elasticsearch."
                     )
-
-            # ----------------------------------------------
-            # JSONL COUNT EVENT
-            # ----------------------------------------------
 
             if self.count_logger is not None:
 
@@ -1830,11 +2109,6 @@ class Pipeline:
             counted_results.append(
                 result
             )
-
-            # ----------------------------------------------
-            # This bag is already finalized.
-            # Its print-vote history is no longer needed.
-            # ----------------------------------------------
 
             if track_id is not None:
 
@@ -1966,13 +2240,6 @@ class Pipeline:
             time.monotonic()
         )
 
-        # --------------------------------------------------
-        # Throttle ordinary dashboard updates.
-        #
-        # Count events, state transitions, startup/shutdown
-        # and explicit force updates bypass throttling.
-        # --------------------------------------------------
-
         if (
             not force
             and
@@ -2010,7 +2277,11 @@ class Pipeline:
             )
         )
 
-        jam_result = (
+        # ==================================================
+        # CONDITION A
+        # ==================================================
+
+        movement = (
             self.jam_result
             if isinstance(
                 self.jam_result,
@@ -2019,8 +2290,8 @@ class Pipeline:
             else {}
         )
 
-        jam_status = (
-            jam_result.get(
+        movement_status = (
+            movement.get(
                 "status",
                 "normal",
             )
@@ -2028,39 +2299,148 @@ class Pipeline:
             else "disabled"
         )
 
-        jam_detected = bool(
-            jam_result.get(
+        movement_detected = bool(
+            movement.get(
                 "jam_detected",
                 False,
             )
         )
 
-        jam_warning = bool(
-            jam_result.get(
+        movement_warning = bool(
+            movement.get(
                 "warning",
                 False,
             )
         )
 
-        active_jam_track_ids = (
-            jam_result.get(
+        movement_ids = (
+            movement.get(
                 "active_jam_track_ids",
                 [],
             )
             or []
         )
 
-        active_jam_count = int(
-            jam_result.get(
-                "active_jam_count",
-                0,
+        movement_tracks = (
+            movement.get(
+                "tracks",
+                [],
             )
-            or 0
+            or []
         )
 
-        jam_tracks = (
-            jam_result.get(
-                "tracks",
+        # ==================================================
+        # CONDITION B
+        # ==================================================
+
+        spacing = (
+            self.spacing_result
+            if isinstance(
+                self.spacing_result,
+                dict,
+            )
+            else {}
+        )
+
+        spacing_status = (
+            spacing.get(
+                "status",
+                "normal",
+            )
+            if self.bag_spacing_enabled
+            else "disabled"
+        )
+
+        spacing_detected = bool(
+            spacing.get(
+                "jam_detected",
+                False,
+            )
+        )
+
+        spacing_pairs = (
+            spacing.get(
+                "pairs",
+                [],
+            )
+            or []
+        )
+
+        spacing_jam_pairs = (
+            spacing.get(
+                "jam_pairs",
+                [],
+            )
+            or []
+        )
+
+        spacing_ids = (
+            spacing.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        minimum_gap_mm = (
+            spacing.get(
+                "minimum_gap_mm"
+            )
+        )
+
+        spacing_threshold_mm = (
+            spacing.get(
+                "threshold_mm",
+                self.bag_spacing_detector
+                .jam_threshold_mm,
+            )
+        )
+
+        # ==================================================
+        # FINAL A OR B
+        # ==================================================
+
+        final_jam = (
+            self.final_jam_result
+            if isinstance(
+                self.final_jam_result,
+                dict,
+            )
+            else {}
+        )
+
+        final_status = (
+            final_jam.get(
+                "status",
+                "normal",
+            )
+        )
+
+        final_detected = bool(
+            final_jam.get(
+                "jam_detected",
+                False,
+            )
+        )
+
+        final_warning = bool(
+            final_jam.get(
+                "warning",
+                False,
+            )
+        )
+
+        final_ids = (
+            final_jam.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        final_types = (
+            final_jam.get(
+                "jam_types",
                 [],
             )
             or []
@@ -2123,33 +2503,115 @@ class Pipeline:
                 ),
 
                 # ==========================================
-                # JAM V1 DASHBOARD STATE
+                # CONDITION A
                 # ==========================================
 
-                jam_detection_enabled=(
+                movement_jam_enabled=(
                     self.jam_detection_enabled
                 ),
 
-                jam_status=jam_status,
+                movement_jam_status=(
+                    movement_status
+                ),
 
-                jam_detected=jam_detected,
+                movement_jam_detected=(
+                    movement_detected
+                ),
 
-                jam_warning=jam_warning,
+                movement_jam_warning=(
+                    movement_warning
+                ),
 
-                active_jam_count=(
-                    active_jam_count
+                movement_jam_track_ids=(
+                    movement_ids
+                ),
+
+                movement_jam_tracks=(
+                    movement_tracks
+                ),
+
+                # ==========================================
+                # CONDITION B
+                # ==========================================
+
+                spacing_detection_enabled=(
+                    self.bag_spacing_enabled
+                ),
+
+                spacing_status=(
+                    spacing_status
+                ),
+
+                spacing_jam_detected=(
+                    spacing_detected
+                ),
+
+                spacing_threshold_mm=(
+                    spacing_threshold_mm
+                ),
+
+                minimum_gap_mm=(
+                    minimum_gap_mm
+                ),
+
+                spacing_pairs=(
+                    spacing_pairs
+                ),
+
+                spacing_jam_pairs=(
+                    spacing_jam_pairs
+                ),
+
+                spacing_jam_track_ids=(
+                    spacing_ids
+                ),
+
+                # ==========================================
+                # FINAL JAM
+                #
+                # Keep existing field names so dashboard
+                # code remains backward-compatible.
+                # ==========================================
+
+                jam_detection_enabled=bool(
+                    self.jam_detection_enabled
+                    or
+                    self.bag_spacing_enabled
+                ),
+
+                jam_status=(
+                    final_status
+                ),
+
+                jam_detected=(
+                    final_detected
+                ),
+
+                jam_warning=(
+                    final_warning
+                ),
+
+                jam_types=(
+                    final_types
+                ),
+
+                active_jam_count=len(
+                    final_ids
                 ),
 
                 active_jam_track_ids=(
-                    active_jam_track_ids
+                    final_ids
                 ),
 
-                jam_tracks=jam_tracks,
+                # Preserve old V1 field for compatibility.
+                jam_tracks=(
+                    movement_tracks
+                ),
             )
 
-        except Exception:
+        except Exception as error:
 
             self.logger.warning(
                 f"{self.name}: dashboard runtime "
-                "update failed."
+                f"update failed: {error}"
             )

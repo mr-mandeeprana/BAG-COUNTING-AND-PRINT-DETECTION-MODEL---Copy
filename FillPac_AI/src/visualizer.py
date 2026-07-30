@@ -15,20 +15,38 @@ Visualizes:
 - FPS
 - Bag totals
 
-Jam Detection V1:
+Jam Detection - Condition A
+---------------------------
+Movement-based jam detection:
 - Jam monitoring ROI
 - Track ID
 - Motion speed in pixels/second
 - Stationary duration
-- Per-track jam state
-- Camera-level jam status
+- Per-track movement jam state
 
-Jam States:
-    NORMAL
-    SLOW
-    WARNING
-    JAM
-    RECOVERING
+Bag Spacing - Condition B
+-------------------------
+Calibrated physical bag-spacing detection:
+- Spacing monitoring ROI
+- Adjacent bag pair measurement
+- Edge-to-edge physical gap in millimetres
+- Minimum current gap
+- Configured jam threshold
+- Spacing jam pair highlighting
+
+Final Jam
+---------
+Final camera jam state:
+
+    Condition A OR Condition B
+
+Therefore:
+
+    movement jam = True  -> JAM
+    spacing jam  = True  -> JAM
+    neither              -> NORMAL
+
+Spacing detection does NOT modify counting logic.
 ==========================================================
 """
 
@@ -54,26 +72,39 @@ class Visualizer:
         bbox,
         color,
         label="",
+        thickness=2,
     ):
 
-        x1, y1, x2, y2 = [
-            int(v)
-            for v in bbox
-        ]
+        if not bbox:
+            return
+
+        try:
+
+            x1, y1, x2, y2 = [
+                int(v)
+                for v in bbox
+            ]
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return
 
         cv2.rectangle(
             frame,
             (x1, y1),
             (x2, y2),
             color,
-            2,
+            thickness,
         )
 
         if label:
 
             cv2.putText(
                 frame,
-                label,
+                str(label),
                 (
                     x1,
                     max(
@@ -96,6 +127,9 @@ class Visualizer:
         frame,
         bbox,
     ):
+
+        if not bbox:
+            return
 
         x1, y1, x2, y2 = [
             int(v)
@@ -155,10 +189,23 @@ class Visualizer:
         center,
     ):
 
-        center = (
-            int(center[0]),
-            int(center[1]),
-        )
+        if center is None:
+            return
+
+        try:
+
+            center = (
+                int(center[0]),
+                int(center[1]),
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+
+            return
 
         cv2.circle(
             frame,
@@ -246,14 +293,17 @@ class Visualizer:
         )
 
     # ======================================================
-    # JAM ROI
+    # GENERIC RECTANGULAR ROI
     # ======================================================
 
     @staticmethod
-    def draw_jam_roi(
+    def _draw_rectangular_roi(
         frame,
         roi,
-        status="normal",
+        color,
+        title,
+        fill_alpha=0.05,
+        thickness=2,
     ):
 
         if not roi:
@@ -296,7 +346,6 @@ class Visualizer:
 
             return
 
-        # Invalid ROI
         if (
             x1 == x2
             or
@@ -359,48 +408,32 @@ class Visualizer:
             y2,
         )
 
-        color = Visualizer.get_jam_color(
-            status
-        )
+        if fill_alpha > 0:
 
-        # ----------------------------------------------
-        # Transparent ROI overlay
-        # ----------------------------------------------
+            overlay = frame.copy()
 
-        overlay = frame.copy()
+            cv2.rectangle(
+                overlay,
+                (
+                    x_min,
+                    y_min,
+                ),
+                (
+                    x_max,
+                    y_max,
+                ),
+                color,
+                -1,
+            )
 
-        cv2.rectangle(
-            overlay,
-            (
-                x_min,
-                y_min,
-            ),
-            (
-                x_max,
-                y_max,
-            ),
-            color,
-            -1,
-        )
-
-        cv2.addWeighted(
-            overlay,
-            0.08,
-            frame,
-            0.92,
-            0,
-            frame,
-        )
-
-        # ----------------------------------------------
-        # ROI border
-        # ----------------------------------------------
-
-        thickness = (
-            4
-            if status == "jam"
-            else 2
-        )
+            cv2.addWeighted(
+                overlay,
+                fill_alpha,
+                frame,
+                1.0 - fill_alpha,
+                0,
+                frame,
+            )
 
         cv2.rectangle(
             frame,
@@ -416,24 +449,91 @@ class Visualizer:
             thickness,
         )
 
-        # ----------------------------------------------
-        # ROI title
-        # ----------------------------------------------
+        if title:
 
-        cv2.putText(
-            frame,
-            "JAM MONITORING ZONE",
-            (
-                x_min + 5,
-                max(
-                    y_min + 25,
-                    25,
+            cv2.putText(
+                frame,
+                title,
+                (
+                    x_min + 5,
+                    max(
+                        y_min + 25,
+                        25,
+                    ),
                 ),
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    # ======================================================
+    # JAM ROI - CONDITION A
+    # ======================================================
+
+    @staticmethod
+    def draw_jam_roi(
+        frame,
+        roi,
+        status="normal",
+    ):
+
+        color = Visualizer.get_jam_color(
+            status
+        )
+
+        thickness = (
+            4
+            if str(
+                status
+            ).lower() == "jam"
+            else 2
+        )
+
+        Visualizer._draw_rectangular_roi(
+            frame=frame,
+            roi=roi,
+            color=color,
+            title="MOVEMENT JAM ZONE",
+            fill_alpha=0.08,
+            thickness=thickness,
+        )
+
+    # ======================================================
+    # SPACING ROI - CONDITION B
+    # ======================================================
+
+    @staticmethod
+    def draw_spacing_roi(
+        frame,
+        roi,
+        status="normal",
+    ):
+
+        status = str(
+            status
+            or "normal"
+        ).lower()
+
+        color = (
+            (0, 0, 255)
+            if status == "jam"
+            else (255, 255, 0)
+        )
+
+        thickness = (
+            4
+            if status == "jam"
+            else 2
+        )
+
+        Visualizer._draw_rectangular_roi(
+            frame=frame,
+            roi=roi,
+            color=color,
+            title="BAG SPACING ZONE",
+            fill_alpha=0.04,
+            thickness=thickness,
         )
 
     # ======================================================
@@ -488,6 +588,14 @@ class Visualizer:
                 255,
                 0,
                 255,
+            )
+
+        if status == "disabled":
+
+            return (
+                160,
+                160,
+                160,
             )
 
         return (
@@ -550,7 +658,7 @@ class Visualizer:
 
         cv2.putText(
             frame,
-            name,
+            str(name),
             (20, 150),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -589,7 +697,12 @@ class Visualizer:
         status,
     ):
 
-        if status is None:
+        if (
+            status is None
+            or
+            not bag_bbox
+        ):
+
             return
 
         x1, y1, _, _ = [
@@ -626,11 +739,11 @@ class Visualizer:
         )
 
     # ======================================================
-    # CAMERA JAM STATUS
+    # MOVEMENT JAM STATUS - CONDITION A
     # ======================================================
 
     @staticmethod
-    def draw_camera_jam_status(
+    def draw_movement_jam_status(
         frame,
         jam_result,
     ):
@@ -656,14 +769,49 @@ class Visualizer:
             status
         )
 
-        text = (
-            "JAM STATUS : "
-            f"{status.upper()}"
+        cv2.putText(
+            frame,
+            (
+                "Movement : "
+                f"{status.upper()}"
+            ),
+            (20, 300),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            color,
+            2,
+        )
+
+    # ======================================================
+    # FINAL CAMERA JAM STATUS
+    # ======================================================
+
+    @staticmethod
+    def draw_final_jam_status(
+        frame,
+        final_jam_result,
+    ):
+
+        if not final_jam_result:
+            return
+
+        status = str(
+            final_jam_result.get(
+                "status",
+                "normal",
+            )
+        ).lower()
+
+        color = Visualizer.get_jam_color(
+            status
         )
 
         cv2.putText(
             frame,
-            text,
+            (
+                "JAM STATUS : "
+                f"{status.upper()}"
+            ),
             (20, 225),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -671,31 +819,56 @@ class Visualizer:
             2,
         )
 
-        active_count = int(
-            jam_result.get(
-                "active_jam_count",
-                0,
+        jam_types = (
+            final_jam_result.get(
+                "jam_types",
+                [],
             )
-            or 0
+            or []
         )
 
-        if active_count > 0:
+        if jam_types:
+
+            readable = []
+
+            for jam_type in jam_types:
+
+                if jam_type == "movement":
+
+                    readable.append(
+                        "MOVEMENT"
+                    )
+
+                elif jam_type == "bag_spacing":
+
+                    readable.append(
+                        "BAG SPACING"
+                    )
+
+                else:
+
+                    readable.append(
+                        str(
+                            jam_type
+                        ).upper()
+                    )
+
+            reason = " + ".join(
+                readable
+            )
 
             cv2.putText(
                 frame,
-                (
-                    "JAMMED BAGS : "
-                    f"{active_count}"
-                ),
+                f"Reason : {reason}",
                 (20, 260),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.62,
                 color,
                 2,
             )
 
     # ======================================================
-    # PER TRACK JAM INFORMATION
+    # PER TRACK MOVEMENT JAM INFORMATION
     # ======================================================
 
     @staticmethod
@@ -717,7 +890,7 @@ class Visualizer:
         if not bbox:
             return
 
-        x1, y1, _, y2 = [
+        x1, _, _, y2 = [
             int(v)
             for v in bbox
         ]
@@ -760,10 +933,6 @@ class Visualizer:
             state
         )
 
-        # ----------------------------------------------
-        # State
-        # ----------------------------------------------
-
         cv2.putText(
             frame,
             (
@@ -787,10 +956,6 @@ class Visualizer:
             y2 + 48
         )
 
-        # ----------------------------------------------
-        # Waiting for sufficient history
-        # ----------------------------------------------
-
         if not history_ready:
 
             cv2.putText(
@@ -811,10 +976,6 @@ class Visualizer:
 
             return
 
-        # ----------------------------------------------
-        # Speed
-        # ----------------------------------------------
-
         if show_speed:
 
             cv2.putText(
@@ -834,10 +995,6 @@ class Visualizer:
             )
 
             line_y += 22
-
-        # ----------------------------------------------
-        # Stationary duration
-        # ----------------------------------------------
 
         if show_stationary_time:
 
@@ -861,6 +1018,803 @@ class Visualizer:
             )
 
     # ======================================================
+    # SPACING RESULT HELPERS
+    # ======================================================
+
+    @staticmethod
+    def _get_pair_track_ids(
+        pair,
+    ):
+
+        if not isinstance(
+            pair,
+            dict,
+        ):
+
+            return (
+                None,
+                None,
+            )
+
+        id_a = pair.get(
+            "track_id_a"
+        )
+
+        id_b = pair.get(
+            "track_id_b"
+        )
+
+        # Compatibility with possible alternate names.
+        if id_a is None:
+
+            id_a = pair.get(
+                "front_track_id"
+            )
+
+        if id_b is None:
+
+            id_b = pair.get(
+                "rear_track_id"
+            )
+
+        if id_a is None:
+
+            id_a = pair.get(
+                "bag_a_track_id"
+            )
+
+        if id_b is None:
+
+            id_b = pair.get(
+                "bag_b_track_id"
+            )
+
+        if (
+            id_a is None
+            or
+            id_b is None
+        ):
+
+            track_ids = pair.get(
+                "track_ids"
+            )
+
+            if (
+                isinstance(
+                    track_ids,
+                    (list, tuple),
+                )
+                and
+                len(track_ids) >= 2
+            ):
+
+                id_a = track_ids[0]
+                id_b = track_ids[1]
+
+        return (
+            id_a,
+            id_b,
+        )
+
+    @staticmethod
+    def _get_pair_gap_mm(
+        pair,
+    ):
+
+        if not isinstance(
+            pair,
+            dict,
+        ):
+
+            return None
+
+        for key in (
+            "gap_mm",
+            "edge_gap_mm",
+            "distance_mm",
+            "spacing_mm",
+        ):
+
+            value = pair.get(
+                key
+            )
+
+            if value is None:
+                continue
+
+            try:
+
+                return float(
+                    value
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                continue
+
+        return None
+
+    @staticmethod
+    def _get_pair_jam_state(
+        pair,
+        threshold_mm=None,
+    ):
+
+        if not isinstance(
+            pair,
+            dict,
+        ):
+
+            return False
+
+        for key in (
+            "jam_detected",
+            "is_jam",
+            "jam",
+        ):
+
+            if key in pair:
+
+                return bool(
+                    pair.get(
+                        key
+                    )
+                )
+
+        gap_mm = (
+            Visualizer._get_pair_gap_mm(
+                pair
+            )
+        )
+
+        if (
+            gap_mm is not None
+            and
+            threshold_mm is not None
+        ):
+
+            try:
+
+                return (
+                    gap_mm
+                    <=
+                    float(
+                        threshold_mm
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                return False
+
+        return False
+
+    # ======================================================
+    # SPACING PAIR DRAWING
+    # ======================================================
+
+    @staticmethod
+    def draw_spacing_pairs(
+        frame,
+        spacing_result,
+        bag_tracks,
+    ):
+
+        if not spacing_result:
+            return
+
+        pairs = (
+            spacing_result.get(
+                "pairs",
+                [],
+            )
+            or []
+        )
+
+        if not pairs:
+            return
+
+        threshold_mm = (
+            spacing_result.get(
+                "threshold_mm"
+            )
+        )
+
+        track_lookup = {
+
+            track.get(
+                "track_id"
+            ):
+                track
+
+            for track in bag_tracks
+
+            if track.get(
+                "track_id"
+            ) is not None
+        }
+
+        for pair in pairs:
+
+            (
+                track_id_a,
+                track_id_b,
+            ) = (
+                Visualizer._get_pair_track_ids(
+                    pair
+                )
+            )
+
+            if (
+                track_id_a is None
+                or
+                track_id_b is None
+            ):
+
+                continue
+
+            bag_a = track_lookup.get(
+                track_id_a
+            )
+
+            bag_b = track_lookup.get(
+                track_id_b
+            )
+
+            if (
+                not bag_a
+                or
+                not bag_b
+            ):
+
+                continue
+
+            bbox_a = bag_a.get(
+                "bbox"
+            )
+
+            bbox_b = bag_b.get(
+                "bbox"
+            )
+
+            if (
+                not bbox_a
+                or
+                not bbox_b
+            ):
+
+                continue
+
+            gap_mm = (
+                Visualizer._get_pair_gap_mm(
+                    pair
+                )
+            )
+
+            is_jam = (
+                Visualizer._get_pair_jam_state(
+                    pair,
+                    threshold_mm,
+                )
+            )
+
+            color = (
+                (0, 0, 255)
+                if is_jam
+                else (0, 255, 0)
+            )
+
+            # ----------------------------------------------
+            # Prefer detector-provided image edge points.
+            #
+            # This is the most accurate visualization
+            # because Condition B is EDGE-TO-EDGE.
+            # ----------------------------------------------
+
+            point_a = (
+                pair.get(
+                    "edge_point_a"
+                )
+                or
+                pair.get(
+                    "image_edge_a"
+                )
+            )
+
+            point_b = (
+                pair.get(
+                    "edge_point_b"
+                )
+                or
+                pair.get(
+                    "image_edge_b"
+                )
+            )
+
+            if (
+                point_a is not None
+                and
+                point_b is not None
+            ):
+
+                try:
+
+                    point_a = (
+                        int(
+                            point_a[0]
+                        ),
+                        int(
+                            point_a[1]
+                        ),
+                    )
+
+                    point_b = (
+                        int(
+                            point_b[0]
+                        ),
+                        int(
+                            point_b[1]
+                        ),
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                    IndexError,
+                ):
+
+                    point_a = None
+                    point_b = None
+
+            # ----------------------------------------------
+            # Fallback visualization
+            #
+            # If BagSpacingDetector has not returned edge
+            # image points, approximate the closest bbox
+            # edges only for drawing.
+            #
+            # This fallback DOES NOT calculate gap_mm.
+            # The physical value still comes exclusively
+            # from BagSpacingDetector.
+            # ----------------------------------------------
+
+            if (
+                point_a is None
+                or
+                point_b is None
+            ):
+
+                ax1, ay1, ax2, ay2 = [
+                    int(v)
+                    for v in bbox_a
+                ]
+
+                bx1, by1, bx2, by2 = [
+                    int(v)
+                    for v in bbox_b
+                ]
+
+                center_a_y = int(
+                    (
+                        ay1
+                        +
+                        ay2
+                    )
+                    / 2
+                )
+
+                center_b_y = int(
+                    (
+                        by1
+                        +
+                        by2
+                    )
+                    / 2
+                )
+
+                center_a_x = int(
+                    (
+                        ax1
+                        +
+                        ax2
+                    )
+                    / 2
+                )
+
+                center_b_x = int(
+                    (
+                        bx1
+                        +
+                        bx2
+                    )
+                    / 2
+                )
+
+                # Conveyor direction is predominantly
+                # vertical in the current FillPac setup.
+                #
+                # Choose facing Y edges.
+
+                if center_a_y <= center_b_y:
+
+                    point_a = (
+                        center_a_x,
+                        ay2,
+                    )
+
+                    point_b = (
+                        center_b_x,
+                        by1,
+                    )
+
+                else:
+
+                    point_a = (
+                        center_a_x,
+                        ay1,
+                    )
+
+                    point_b = (
+                        center_b_x,
+                        by2,
+                    )
+
+            # ----------------------------------------------
+            # Measurement line
+            # ----------------------------------------------
+
+            cv2.line(
+                frame,
+                point_a,
+                point_b,
+                color,
+                3 if is_jam else 2,
+            )
+
+            cv2.circle(
+                frame,
+                point_a,
+                5,
+                color,
+                -1,
+            )
+
+            cv2.circle(
+                frame,
+                point_b,
+                5,
+                color,
+                -1,
+            )
+
+            # ----------------------------------------------
+            # Measurement text
+            # ----------------------------------------------
+
+            text_x = int(
+                (
+                    point_a[0]
+                    +
+                    point_b[0]
+                )
+                / 2
+            )
+
+            text_y = int(
+                (
+                    point_a[1]
+                    +
+                    point_b[1]
+                )
+                / 2
+            )
+
+            if gap_mm is not None:
+
+                if is_jam:
+
+                    text = (
+                        f"JAM | {gap_mm:.1f} mm"
+                    )
+
+                else:
+
+                    text = (
+                        f"{gap_mm:.1f} mm"
+                    )
+
+            else:
+
+                text = (
+                    "JAM"
+                    if is_jam
+                    else "Spacing"
+                )
+
+            # Background improves readability.
+            (
+                text_width,
+                text_height,
+            ), baseline = cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                2,
+            )
+
+            label_x = max(
+                text_x
+                -
+                text_width // 2,
+                0,
+            )
+
+            label_y = max(
+                text_y - 8,
+                text_height + 4,
+            )
+
+            cv2.rectangle(
+                frame,
+                (
+                    label_x - 4,
+                    label_y
+                    -
+                    text_height
+                    -
+                    4,
+                ),
+                (
+                    label_x
+                    +
+                    text_width
+                    +
+                    4,
+                    label_y
+                    +
+                    baseline
+                    +
+                    4,
+                ),
+                (0, 0, 0),
+                -1,
+            )
+
+            cv2.putText(
+                frame,
+                text,
+                (
+                    label_x,
+                    label_y,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    # ======================================================
+    # HIGHLIGHT SPACING JAM BAGS
+    # ======================================================
+
+    @staticmethod
+    def draw_spacing_jam_bags(
+        frame,
+        spacing_result,
+        bag_tracks,
+    ):
+
+        if not spacing_result:
+            return
+
+        jam_ids = set(
+            spacing_result.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        # Also derive IDs from jam_pairs for compatibility.
+
+        for pair in (
+            spacing_result.get(
+                "jam_pairs",
+                [],
+            )
+            or []
+        ):
+
+            (
+                id_a,
+                id_b,
+            ) = (
+                Visualizer._get_pair_track_ids(
+                    pair
+                )
+            )
+
+            if id_a is not None:
+
+                jam_ids.add(
+                    id_a
+                )
+
+            if id_b is not None:
+
+                jam_ids.add(
+                    id_b
+                )
+
+        if not jam_ids:
+            return
+
+        for bag in bag_tracks:
+
+            track_id = bag.get(
+                "track_id"
+            )
+
+            if track_id not in jam_ids:
+                continue
+
+            bbox = bag.get(
+                "bbox"
+            )
+
+            if not bbox:
+                continue
+
+            Visualizer.draw_box(
+                frame=frame,
+                bbox=bbox,
+                color=(
+                    0,
+                    0,
+                    255,
+                ),
+                label=(
+                    f"SPACING JAM ID:{track_id}"
+                ),
+                thickness=5,
+            )
+
+    # ======================================================
+    # SPACING STATUS PANEL
+    # ======================================================
+
+    @staticmethod
+    def draw_spacing_status(
+        frame,
+        spacing_result,
+    ):
+
+        if not spacing_result:
+            return
+
+        enabled = spacing_result.get(
+            "enabled",
+            True,
+        )
+
+        if not enabled:
+            return
+
+        status = str(
+            spacing_result.get(
+                "status",
+                "normal",
+            )
+        ).lower()
+
+        color = Visualizer.get_jam_color(
+            status
+        )
+
+        threshold_mm = (
+            spacing_result.get(
+                "threshold_mm"
+            )
+        )
+
+        minimum_gap_mm = (
+            spacing_result.get(
+                "minimum_gap_mm"
+            )
+        )
+
+        y = 325
+
+        cv2.putText(
+            frame,
+            (
+                "Spacing : "
+                f"{status.upper()}"
+            ),
+            (
+                20,
+                y,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            color,
+            2,
+        )
+
+        y += 28
+
+        if threshold_mm is not None:
+
+            try:
+
+                threshold_text = (
+                    f"Threshold : "
+                    f"{float(threshold_mm):.1f} mm"
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                threshold_text = (
+                    f"Threshold : {threshold_mm}"
+                )
+
+            cv2.putText(
+                frame,
+                threshold_text,
+                (
+                    20,
+                    y,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+            y += 26
+
+        if minimum_gap_mm is not None:
+
+            try:
+
+                gap_text = (
+                    f"Minimum Gap : "
+                    f"{float(minimum_gap_mm):.1f} mm"
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                gap_text = (
+                    f"Minimum Gap : "
+                    f"{minimum_gap_mm}"
+                )
+
+            cv2.putText(
+                frame,
+                gap_text,
+                (
+                    20,
+                    y,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    # ======================================================
     # VISUALIZE
     # ======================================================
 
@@ -880,11 +1834,24 @@ class Visualizer:
         counted_bags=None,
 
         # --------------------------------------------------
-        # JAM V1
+        # CONDITION A
         # --------------------------------------------------
 
         jam_result=None,
         jam_roi=None,
+
+        # --------------------------------------------------
+        # CONDITION B
+        # --------------------------------------------------
+
+        spacing_result=None,
+        spacing_roi=None,
+
+        # --------------------------------------------------
+        # FINAL CONDITION A OR B
+        # --------------------------------------------------
+
+        final_jam_result=None,
     ):
 
         # ==================================================
@@ -922,7 +1889,7 @@ class Visualizer:
         )
 
         # ==================================================
-        # JAM DISPLAY SETTINGS
+        # CONDITION A DISPLAY SETTINGS
         # ==================================================
 
         show_jam_roi = display_config.get(
@@ -947,13 +1914,62 @@ class Visualizer:
             )
         )
 
+        # ==================================================
+        # CONDITION B DISPLAY SETTINGS
+        # ==================================================
+
+        show_spacing_roi = display_config.get(
+            "show_spacing_roi",
+            True,
+        )
+
+        show_spacing_lines = display_config.get(
+            "show_spacing_lines",
+            True,
+        )
+
+        show_spacing_status = display_config.get(
+            "show_spacing_status",
+            True,
+        )
+
+        show_spacing_jam_boxes = display_config.get(
+            "show_spacing_jam_boxes",
+            True,
+        )
+
         counted_bags = (
             counted_bags
             or []
         )
 
+        bag_tracks = (
+            bag_tracks
+            or []
+        )
+
+        all_detections = (
+            all_detections
+            or []
+        )
+
+        print_results = (
+            print_results
+            or []
+        )
+
         jam_result = (
             jam_result
+            or {}
+        )
+
+        spacing_result = (
+            spacing_result
+            or {}
+        )
+
+        final_jam_result = (
+            final_jam_result
             or {}
         )
 
@@ -1049,7 +2065,7 @@ class Visualizer:
                 )
 
         # ==================================================
-        # JAM ROI
+        # CONDITION A ROI
         # ==================================================
 
         if (
@@ -1071,7 +2087,35 @@ class Visualizer:
             )
 
         # ==================================================
-        # JAM RESULT LOOKUP
+        # CONDITION B ROI
+        # ==================================================
+
+        spacing_enabled = bool(
+            spacing_result.get(
+                "enabled",
+                True,
+            )
+        )
+
+        if (
+            show_spacing_roi
+            and
+            spacing_enabled
+            and
+            spacing_roi
+        ):
+
+            self.draw_spacing_roi(
+                frame=frame,
+                roi=spacing_roi,
+                status=spacing_result.get(
+                    "status",
+                    "normal",
+                ),
+            )
+
+        # ==================================================
+        # CONDITION A RESULT LOOKUP
         # ==================================================
 
         jam_lookup = {}
@@ -1092,6 +2136,42 @@ class Visualizer:
                 ] = metrics
 
         # ==================================================
+        # CONDITION B JAM TRACK IDS
+        # ==================================================
+
+        spacing_jam_ids = set(
+            spacing_result.get(
+                "active_jam_track_ids",
+                [],
+            )
+            or []
+        )
+
+        for pair in spacing_result.get(
+            "jam_pairs",
+            [],
+        ) or []:
+
+            (
+                id_a,
+                id_b,
+            ) = self._get_pair_track_ids(
+                pair
+            )
+
+            if id_a is not None:
+
+                spacing_jam_ids.add(
+                    id_a
+                )
+
+            if id_b is not None:
+
+                spacing_jam_ids.add(
+                    id_b
+                )
+
+        # ==================================================
         # BAG TRACKS
         # ==================================================
 
@@ -1099,9 +2179,12 @@ class Visualizer:
 
             for bag in bag_tracks:
 
-                bbox = bag[
+                bbox = bag.get(
                     "bbox"
-                ]
+                )
+
+                if not bbox:
+                    continue
 
                 track_id = bag.get(
                     "track_id"
@@ -1114,13 +2197,20 @@ class Visualizer:
                 )
 
                 # ------------------------------------------
-                # Bag box color
+                # BOX COLOR PRIORITY
                 #
-                # If jam information exists, use the jam
-                # state color.
+                # Spacing JAM > Movement state > Normal
                 # ------------------------------------------
 
-                if jam_metrics:
+                if track_id in spacing_jam_ids:
+
+                    bag_color = (
+                        0,
+                        0,
+                        255,
+                    )
+
+                elif jam_metrics:
 
                     bag_color = (
                         self.get_jam_color(
@@ -1138,6 +2228,10 @@ class Visualizer:
                         255,
                         0,
                     )
+
+                # ------------------------------------------
+                # LABEL
+                # ------------------------------------------
 
                 if show_labels:
 
@@ -1163,7 +2257,7 @@ class Visualizer:
                 )
 
                 # ------------------------------------------
-                # Count flash
+                # COUNT FLASH
                 # ------------------------------------------
 
                 flash_until = (
@@ -1189,7 +2283,7 @@ class Visualizer:
                     )
 
                 # ------------------------------------------
-                # Physical center
+                # PHYSICAL CENTER
                 # ------------------------------------------
 
                 if show_center:
@@ -1227,7 +2321,7 @@ class Visualizer:
                     )
 
                 # ------------------------------------------
-                # JAM TRACK INFORMATION
+                # CONDITION A TRACK INFO
                 # ------------------------------------------
 
                 if (
@@ -1266,9 +2360,9 @@ class Visualizer:
 
                 self.draw_box(
                     frame,
-                    det[
+                    det.get(
                         "bbox"
-                    ],
+                    ),
                     (
                         255,
                         0,
@@ -1278,16 +2372,58 @@ class Visualizer:
                 )
 
         # ==================================================
+        # CONDITION B PAIR MEASUREMENTS
+        # ==================================================
+
+        if (
+            show_spacing_lines
+            and
+            spacing_enabled
+        ):
+
+            self.draw_spacing_pairs(
+                frame=frame,
+                spacing_result=spacing_result,
+                bag_tracks=bag_tracks,
+            )
+
+        # ==================================================
+        # CONDITION B JAM BAG HIGHLIGHT
+        # ==================================================
+
+        if (
+            show_spacing_jam_boxes
+            and
+            spacing_enabled
+            and
+            spacing_result.get(
+                "jam_detected",
+                False,
+            )
+        ):
+
+            self.draw_spacing_jam_bags(
+                frame=frame,
+                spacing_result=spacing_result,
+                bag_tracks=bag_tracks,
+            )
+
+        # ==================================================
         # PRINT STATUS
         # ==================================================
 
         for result in print_results:
 
+            bag_bbox = result.get(
+                "bag_bbox"
+            )
+
+            if not bag_bbox:
+                continue
+
             self.draw_print_status(
                 frame,
-                result[
-                    "bag_bbox"
-                ],
+                bag_bbox,
                 result.get(
                     "print_present"
                 ),
@@ -1327,12 +2463,33 @@ class Visualizer:
             )
 
         # ==================================================
-        # CAMERA JAM STATUS
+        # FINAL JAM STATUS
         # ==================================================
 
         if show_jam_status:
 
-            self.draw_camera_jam_status(
+            self.draw_final_jam_status(
+                frame,
+                final_jam_result,
+            )
+
+            # Condition A status shown separately.
+            self.draw_movement_jam_status(
                 frame,
                 jam_result,
+            )
+
+        # ==================================================
+        # CONDITION B STATUS
+        # ==================================================
+
+        if (
+            show_spacing_status
+            and
+            spacing_enabled
+        ):
+
+            self.draw_spacing_status(
+                frame,
+                spacing_result,
             )

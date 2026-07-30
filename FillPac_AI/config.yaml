@@ -177,6 +177,127 @@ jam_detection:
 
   track_ttl_seconds: 2.0
 
+# ==========================================================
+# BAG SPACING JAM DETECTION - CONDITION B
+# ==========================================================
+#
+# Purpose:
+# Detect a bag jam when the physical edge-to-edge distance
+# between any two adjacent bags is less than or equal to
+# the configured threshold.
+#
+# Decision:
+#
+#   gap_mm <= jam_threshold_mm  -> JAM
+#   gap_mm >  jam_threshold_mm  -> NORMAL
+#
+# IMPORTANT:
+# - No timer is used.
+# - No stationary condition is required.
+# - Only adjacent bags are compared.
+# - Distance is calculated after pixel -> mm calibration.
+#
+# NOTE:
+# Calibration values below are DEVELOPMENT REFERENCE VALUES.
+# They MUST be replaced with actual measured conveyor
+# coordinates for production.
+# ==========================================================
+
+bag_spacing:
+  enabled: true
+
+  # Conveyor movement direction
+  direction: up
+
+  # --------------------------------------------------------
+  # JAM DISTANCE
+  # --------------------------------------------------------
+  #
+  # Actual required minimum normal spacing = 300 mm
+  # Measurement / calibration margin        =   5 mm
+  #
+  # Effective jam threshold                 = 305 mm
+  #
+  # Therefore:
+  #
+  # > 305 mm  = NORMAL
+  # <=305 mm  = JAM
+  # --------------------------------------------------------
+
+  minimum_safe_gap_mm: 150.0
+  measurement_margin_mm: 5.0
+  jam_threshold_mm: 155.0
+
+  # --------------------------------------------------------
+  # TRACK VALIDATION
+  # --------------------------------------------------------
+
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  # --------------------------------------------------------
+  # BAG SPACING ROI
+  # --------------------------------------------------------
+  #
+  # Only bags whose centers are inside this region are
+  # considered for spacing calculation.
+  #
+  # Current development ROI matches the jam monitoring area.
+  # --------------------------------------------------------
+
+  roi:
+    x1: 0
+    y1: 150
+    x2: 477
+    y2: 500
+
+  # --------------------------------------------------------
+  # CAMERA CALIBRATION
+  # --------------------------------------------------------
+  #
+  # Homography maps:
+  #
+  #       IMAGE PIXELS
+  #            |
+  #            v
+  #       REAL WORLD
+  #       MILLIMETRES
+  #
+  # Point order MUST remain:
+  #
+  # P1 = top-left
+  # P2 = top-right
+  # P3 = bottom-right
+  # P4 = bottom-left
+  #
+  # --------------------------------------------------------
+
+  calibration:
+
+    # Pixel coordinates from development camera image.
+    #
+    # TEMPORARY VALUES.
+
+    image_points:
+      - [150, 150]    # P1
+      - [400, 150]    # P2
+      - [470, 500]    # P3
+      - [60, 500]     # P4
+
+    # Corresponding physical conveyor coordinates.
+    #
+    # Temporary reference:
+    #
+    # Conveyor width  = 800 mm
+    # Calibration length = 2000 mm
+
+    world_points_mm:
+      - [0, 0]        # P1
+      - [800, 0]      # P2
+      - [800, 2000]   # P3
+      - [0, 2000]     # P4
 
 # ==========================================================
 # CAMERAS
@@ -192,10 +313,10 @@ cameras:
   - id: 1
     name: Camera 1
 
-    enabled: true
+    enabled: false
 
-    mode: video
-    source: "data/videos/camera 1.mp4"
+    mode: rtsp
+    source: "rtsp://mandeep:123456@192.0.0.2:1945/"
 
     buffer_size: 1
 
@@ -207,6 +328,7 @@ cameras:
 
       confidence: 0.20
       iou: 0.45
+
 
       device: cpu
       image_size: 640
@@ -311,7 +433,7 @@ cameras:
   - id: 2
     name: Camera 2
 
-    enabled: true
+    enabled: false
 
     mode: video
     source: "data/videos/camera 2.mp4"
@@ -430,7 +552,7 @@ cameras:
   - id: 3
     name: Camera 3
 
-    enabled: true
+    enabled: false
 
     mode: video
     source: "data/videos/camera 3.mp4"
@@ -547,7 +669,7 @@ cameras:
   # ========================================================
 
   - id: 4
-    name: Camera 4
+    name: Camera 4s
 
     enabled: true
 
@@ -668,15 +790,20 @@ display:
   show_labels: true
   show_center: true
   show_roi: true
-
   show_fps: true
   show_count: true
 
+  # Condition A
   show_jam_roi: true
   show_jam_status: true
   show_jam_speed: true
   show_stationary_time: true
 
+  # Condition B
+  show_spacing_roi: true
+  show_spacing_lines: true
+  show_spacing_status: true
+  show_spacing_jam_boxes: true
 
 # ==========================================================
 # OUTPUT

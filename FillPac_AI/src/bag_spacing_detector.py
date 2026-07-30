@@ -1,0 +1,1656 @@
+"""
+==========================================================
+FillPac AI
+Bag Spacing / Distance Jam Detector - Condition B
+==========================================================
+
+Purpose
+-------
+Detect an immediate bag-spacing jam when the calibrated
+physical EDGE-TO-EDGE gap between two adjacent bags is
+less than or equal to the configured threshold.
+
+Condition B
+-----------
+    edge_gap_mm <= jam_threshold_mm
+        -> JAM
+
+    edge_gap_mm > jam_threshold_mm
+        -> NORMAL
+
+Important
+---------
+- NO timer is used.
+- NO stationary condition is required.
+- NO movement history is required.
+- Only adjacent bags are compared.
+- Track IDs are used only for association.
+- Pixel coordinates are transformed into calibrated
+  physical conveyor coordinates using homography.
+- Gap is measured longitudinally along the conveyor.
+- This detector works independently from Condition A.
+
+Expected Configuration
+----------------------
+bag_spacing:
+
+    enabled: true
+
+    direction: up
+
+    minimum_safe_gap_mm: 300.0
+    measurement_margin_mm: 5.0
+    jam_threshold_mm: 305.0
+
+    min_track_age: 4
+
+    ignore_unstable_tracks: true
+    ignore_motion_jumps: true
+
+    roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+    calibration:
+
+        image_points:
+            - [150, 150]
+            - [400, 150]
+            - [470, 500]
+            - [60, 500]
+
+        world_points_mm:
+            - [0, 0]
+            - [800, 0]
+            - [800, 2000]
+            - [0, 2000]
+
+Output
+------
+update(tracks) returns:
+
+{
+    "enabled": True,
+    "status": "normal" | "jam",
+    "jam_detected": bool,
+
+    "threshold_mm": 305.0,
+    "minimum_gap_mm": ...,
+
+    "pairs": [...],
+    "jam_pairs": [...],
+
+    "active_jam_track_ids": [...]
+}
+
+Each pair contains both descriptive field names and
+visualizer-compatible aliases.
+==========================================================
+"""
+
+import math
+
+import cv2
+import numpy as np
+
+
+class BagSpacingDetector:
+
+    NORMAL = "normal"
+    JAM = "jam"
+    DISABLED = "disabled"
+
+    # ======================================================
+    # INITIALIZATION
+    # ======================================================
+
+    def __init__(
+        self,
+        config=None,
+    ):
+
+        config = config or {}
+
+        # ==================================================
+        # BASIC CONFIGURATION
+        # ==================================================
+
+        self.enabled = bool(
+            config.get(
+                "enabled",
+                False,
+            )
+        )
+
+        self.minimum_safe_gap_mm = max(
+            float(
+                config.get(
+                    "minimum_safe_gap_mm",
+                    300.0,
+                )
+            ),
+            0.0,
+        )
+
+        self.measurement_margin_mm = max(
+            float(
+                config.get(
+                    "measurement_margin_mm",
+                    5.0,
+                )
+            ),
+            0.0,
+        )
+
+        self.jam_threshold_mm = max(
+            float(
+                config.get(
+                    "jam_threshold_mm",
+                    (
+                        self.minimum_safe_gap_mm
+                        +
+                        self.measurement_margin_mm
+                    ),
+                )
+            ),
+            0.0,
+        )
+
+        # ==================================================
+        # CONVEYOR DIRECTION
+        # ==================================================
+
+        self.direction = str(
+            config.get(
+                "direction",
+                "up",
+            )
+        ).strip().lower()
+
+        if self.direction not in {
+            "up",
+            "down",
+        }:
+
+            raise ValueError(
+                "BagSpacingDetector direction must "
+                "be 'up' or 'down'."
+            )
+
+        # ==================================================
+        # TRACK QUALITY
+        # ==================================================
+
+        self.min_track_age = max(
+            int(
+                config.get(
+                    "min_track_age",
+                    4,
+                )
+            ),
+            1,
+        )
+
+        self.ignore_unstable_tracks = bool(
+            config.get(
+                "ignore_unstable_tracks",
+                True,
+            )
+        )
+
+        self.ignore_motion_jumps = bool(
+            config.get(
+                "ignore_motion_jumps",
+                True,
+            )
+        )
+
+        # ==================================================
+        # SPACING ROI
+        # ==================================================
+
+        roi = (
+            config.get(
+                "roi",
+                {},
+            )
+            or {}
+        )
+
+        self.roi = {
+
+            "x1":
+                int(
+                    roi.get(
+                        "x1",
+                        0,
+                    )
+                ),
+
+            "y1":
+                int(
+                    roi.get(
+                        "y1",
+                        0,
+                    )
+                ),
+
+            "x2":
+                int(
+                    roi.get(
+                        "x2",
+                        0,
+                    )
+                ),
+
+            "y2":
+                int(
+                    roi.get(
+                        "y2",
+                        0,
+                    )
+                ),
+        }
+
+        # ==================================================
+        # CALIBRATION
+        # ==================================================
+
+        calibration = (
+            config.get(
+                "calibration",
+                {},
+            )
+            or {}
+        )
+
+        self.image_points = np.asarray(
+            calibration.get(
+                "image_points",
+                [],
+            ),
+            dtype=np.float32,
+        )
+
+        self.world_points = np.asarray(
+            calibration.get(
+                "world_points_mm",
+                [],
+            ),
+            dtype=np.float32,
+        )
+
+        self.homography = None
+
+        if self.enabled:
+
+            self._build_homography()
+
+        # ==================================================
+        # LATEST RESULT
+        # ==================================================
+
+        self.last_result = (
+            self._empty_result()
+        )
+
+    # ======================================================
+    # BUILD HOMOGRAPHY
+    # ======================================================
+
+    def _build_homography(
+        self,
+    ):
+
+        if self.image_points.shape != (
+            4,
+            2,
+        ):
+
+            raise ValueError(
+                "bag_spacing.calibration.image_points "
+                "must contain exactly four [x, y] points."
+            )
+
+        if self.world_points.shape != (
+            4,
+            2,
+        ):
+
+            raise ValueError(
+                "bag_spacing.calibration.world_points_mm "
+                "must contain exactly four [x, y] points."
+            )
+
+        homography = (
+            cv2.getPerspectiveTransform(
+                self.image_points,
+                self.world_points,
+            )
+        )
+
+        if homography is None:
+
+            raise ValueError(
+                "Unable to calculate bag-spacing "
+                "homography."
+            )
+
+        if not np.all(
+            np.isfinite(
+                homography
+            )
+        ):
+
+            raise ValueError(
+                "Bag-spacing homography contains "
+                "invalid values."
+            )
+
+        self.homography = homography
+
+    # ======================================================
+    # PIXEL -> PHYSICAL WORLD
+    # ======================================================
+
+    def pixel_to_world(
+        self,
+        point,
+    ):
+
+        if self.homography is None:
+
+            return None
+
+        try:
+
+            x = float(
+                point[0]
+            )
+
+            y = float(
+                point[1]
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+
+            return None
+
+        if not (
+            math.isfinite(
+                x
+            )
+            and
+            math.isfinite(
+                y
+            )
+        ):
+
+            return None
+
+        src = np.array(
+            [
+                [
+                    [
+                        x,
+                        y,
+                    ]
+                ]
+            ],
+            dtype=np.float32,
+        )
+
+        try:
+
+            transformed = (
+                cv2.perspectiveTransform(
+                    src,
+                    self.homography,
+                )
+            )
+
+        except cv2.error:
+
+            return None
+
+        wx, wy = (
+            transformed[
+                0
+            ][
+                0
+            ]
+        )
+
+        wx = float(
+            wx
+        )
+
+        wy = float(
+            wy
+        )
+
+        if not (
+            math.isfinite(
+                wx
+            )
+            and
+            math.isfinite(
+                wy
+            )
+        ):
+
+            return None
+
+        return (
+            wx,
+            wy,
+        )
+
+    # ======================================================
+    # ROI CHECK
+    # ======================================================
+
+    def _point_inside_roi(
+        self,
+        x,
+        y,
+    ):
+
+        x1 = min(
+            self.roi["x1"],
+            self.roi["x2"],
+        )
+
+        x2 = max(
+            self.roi["x1"],
+            self.roi["x2"],
+        )
+
+        y1 = min(
+            self.roi["y1"],
+            self.roi["y2"],
+        )
+
+        y2 = max(
+            self.roi["y1"],
+            self.roi["y2"],
+        )
+
+        # ----------------------------------------------
+        # No ROI configured -> allow whole frame.
+        # ----------------------------------------------
+
+        if (
+            x1 == x2
+            and
+            y1 == y2
+        ):
+
+            return True
+
+        return (
+            x1 <= x <= x2
+            and
+            y1 <= y <= y2
+        )
+
+    # ======================================================
+    # TRACK VALIDATION
+    # ======================================================
+
+    def _valid_track(
+        self,
+        track,
+    ):
+
+        if not isinstance(
+            track,
+            dict,
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # BAG CLASS ONLY
+        #
+        # Tracker output may not always contain class_id.
+        # If class_id exists, it must be class 0.
+        # ----------------------------------------------
+
+        class_id = track.get(
+            "class_id"
+        )
+
+        if (
+            class_id is not None
+            and
+            class_id != 0
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # TRACK ID
+        # ----------------------------------------------
+
+        if track.get(
+            "track_id"
+        ) is None:
+
+            return False
+
+        # ----------------------------------------------
+        # BOUNDING BOX
+        # ----------------------------------------------
+
+        bbox = track.get(
+            "bbox"
+        )
+
+        if (
+            bbox is None
+            or
+            len(
+                bbox
+            ) != 4
+        ):
+
+            return False
+
+        try:
+
+            x1, y1, x2, y2 = [
+                float(
+                    value
+                )
+                for value in bbox
+            ]
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return False
+
+        if not all(
+            math.isfinite(
+                value
+            )
+            for value in (
+                x1,
+                y1,
+                x2,
+                y2,
+            )
+        ):
+
+            return False
+
+        if (
+            x2 <= x1
+            or
+            y2 <= y1
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # CENTER
+        # ----------------------------------------------
+
+        center = track.get(
+            "center"
+        )
+
+        # If tracker doesn't provide center,
+        # calculate it from bbox.
+
+        if (
+            center is None
+            or
+            len(
+                center
+            ) != 2
+        ):
+
+            center = (
+                (
+                    x1
+                    +
+                    x2
+                )
+                / 2.0,
+                (
+                    y1
+                    +
+                    y2
+                )
+                / 2.0,
+            )
+
+        try:
+
+            cx = float(
+                center[0]
+            )
+
+            cy = float(
+                center[1]
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # TRACK AGE
+        # ----------------------------------------------
+
+        track_age = int(
+            track.get(
+                "track_age",
+                track.get(
+                    "age",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        if (
+            track_age
+            <
+            self.min_track_age
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # UNSTABLE TRACK
+        # ----------------------------------------------
+
+        if (
+            self.ignore_unstable_tracks
+            and
+            track.get(
+                "unstable",
+                False,
+            )
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # MOTION JUMP
+        # ----------------------------------------------
+
+        if (
+            self.ignore_motion_jumps
+            and
+            track.get(
+                "motion_jump",
+                False,
+            )
+        ):
+
+            return False
+
+        # ----------------------------------------------
+        # SPACING ROI
+        # ----------------------------------------------
+
+        return self._point_inside_roi(
+            cx,
+            cy,
+        )
+
+    # ======================================================
+    # PREPARE BAG
+    # ======================================================
+
+    def _prepare_bag(
+        self,
+        track,
+    ):
+
+        x1, y1, x2, y2 = [
+            float(
+                value
+            )
+            for value in track[
+                "bbox"
+            ]
+        ]
+
+        cx = (
+            x1
+            +
+            x2
+        ) / 2.0
+
+        cy = (
+            y1
+            +
+            y2
+        ) / 2.0
+
+        return {
+
+            "track_id":
+                int(
+                    track[
+                        "track_id"
+                    ]
+                ),
+
+            "bbox":
+                (
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                ),
+
+            "center":
+                (
+                    cx,
+                    cy,
+                ),
+
+            "track_age":
+                int(
+                    track.get(
+                        "track_age",
+                        track.get(
+                            "age",
+                            0,
+                        ),
+                    )
+                    or 0
+                ),
+        }
+
+    # ======================================================
+    # ORDER BAGS ALONG CONVEYOR
+    # ======================================================
+
+    def _sort_bags(
+        self,
+        bags,
+    ):
+
+        # --------------------------------------------------
+        # Image coordinates:
+        #
+        # top    -> smaller Y
+        # bottom -> larger Y
+        #
+        # Direction UP:
+        # bag with smaller Y is physically ahead/front.
+        #
+        # Direction DOWN:
+        # bag with larger Y is physically ahead/front.
+        # --------------------------------------------------
+
+        if self.direction == "up":
+
+            return sorted(
+                bags,
+                key=lambda bag:
+                    bag[
+                        "center"
+                    ][
+                        1
+                    ],
+            )
+
+        return sorted(
+            bags,
+            key=lambda bag:
+                bag[
+                    "center"
+                ][
+                    1
+                ],
+            reverse=True,
+        )
+
+    # ======================================================
+    # GET FACING BAG EDGES
+    # ======================================================
+
+    def _facing_edge_points(
+        self,
+        front_bag,
+        rear_bag,
+    ):
+        """
+        Returns facing edge reference points in image pixels.
+
+        UP conveyor:
+
+                FRONT BAG
+              +-----------+
+              |           |
+              +-----*-----+  <- bottom-center
+
+                    GAP
+
+              +-----*-----+  <- top-center
+              |           |
+              +-----------+
+                 REAR BAG
+
+
+        DOWN conveyor:
+
+                 REAR BAG
+              +-----------+
+              |           |
+              +-----*-----+
+
+                    GAP
+
+              +-----*-----+
+              |           |
+              +-----------+
+                FRONT BAG
+
+        These image edge points are transformed through
+        homography before the physical gap is calculated.
+        """
+
+        fx1, fy1, fx2, fy2 = (
+            front_bag[
+                "bbox"
+            ]
+        )
+
+        rx1, ry1, rx2, ry2 = (
+            rear_bag[
+                "bbox"
+            ]
+        )
+
+        front_cx = (
+            fx1
+            +
+            fx2
+        ) / 2.0
+
+        rear_cx = (
+            rx1
+            +
+            rx2
+        ) / 2.0
+
+        if self.direction == "up":
+
+            # Front bag trailing edge.
+            front_edge = (
+                front_cx,
+                fy2,
+            )
+
+            # Rear bag leading edge.
+            rear_edge = (
+                rear_cx,
+                ry1,
+            )
+
+        else:
+
+            # Front bag trailing edge.
+            front_edge = (
+                front_cx,
+                fy1,
+            )
+
+            # Rear bag leading edge.
+            rear_edge = (
+                rear_cx,
+                ry2,
+            )
+
+        return (
+            front_edge,
+            rear_edge,
+        )
+
+    # ======================================================
+    # CALCULATE ADJACENT PAIR
+    # ======================================================
+
+    def _calculate_pair(
+        self,
+        front_bag,
+        rear_bag,
+    ):
+
+        # --------------------------------------------------
+        # PIXEL EDGE POINTS
+        # --------------------------------------------------
+
+        (
+            front_edge_px,
+            rear_edge_px,
+        ) = self._facing_edge_points(
+            front_bag,
+            rear_bag,
+        )
+
+        # --------------------------------------------------
+        # PIXEL -> WORLD
+        # --------------------------------------------------
+
+        front_edge_world = (
+            self.pixel_to_world(
+                front_edge_px
+            )
+        )
+
+        rear_edge_world = (
+            self.pixel_to_world(
+                rear_edge_px
+            )
+        )
+
+        if (
+            front_edge_world is None
+            or
+            rear_edge_world is None
+        ):
+
+            return None
+
+        # --------------------------------------------------
+        # PHYSICAL LONGITUDINAL GAP
+        #
+        # World Y represents the conveyor travel axis.
+        #
+        # We intentionally DO NOT use pixel distance.
+        #
+        # We also intentionally DO NOT use full 2-D
+        # Euclidean distance because lateral X displacement
+        # should not increase the longitudinal bag spacing.
+        #
+        # Therefore:
+        #
+        # gap = |rear_world_y - front_world_y|
+        # --------------------------------------------------
+
+        front_world_y = float(
+            front_edge_world[
+                1
+            ]
+        )
+
+        rear_world_y = float(
+            rear_edge_world[
+                1
+            ]
+        )
+
+        gap_mm = abs(
+            rear_world_y
+            -
+            front_world_y
+        )
+
+        if not math.isfinite(
+            gap_mm
+        ):
+
+            return None
+
+        # --------------------------------------------------
+        # CONDITION B
+        #
+        # Immediate decision.
+        #
+        # NO TIMER.
+        # --------------------------------------------------
+
+        jam_detected = bool(
+            gap_mm
+            <=
+            self.jam_threshold_mm
+        )
+
+        status = (
+            self.JAM
+            if jam_detected
+            else self.NORMAL
+        )
+
+        # --------------------------------------------------
+        # NORMALIZED OUTPUT VALUES
+        # --------------------------------------------------
+
+        front_edge_px_out = (
+            round(
+                float(
+                    front_edge_px[
+                        0
+                    ]
+                ),
+                2,
+            ),
+            round(
+                float(
+                    front_edge_px[
+                        1
+                    ]
+                ),
+                2,
+            ),
+        )
+
+        rear_edge_px_out = (
+            round(
+                float(
+                    rear_edge_px[
+                        0
+                    ]
+                ),
+                2,
+            ),
+            round(
+                float(
+                    rear_edge_px[
+                        1
+                    ]
+                ),
+                2,
+            ),
+        )
+
+        front_edge_world_out = (
+            round(
+                float(
+                    front_edge_world[
+                        0
+                    ]
+                ),
+                2,
+            ),
+            round(
+                float(
+                    front_edge_world[
+                        1
+                    ]
+                ),
+                2,
+            ),
+        )
+
+        rear_edge_world_out = (
+            round(
+                float(
+                    rear_edge_world[
+                        0
+                    ]
+                ),
+                2,
+            ),
+            round(
+                float(
+                    rear_edge_world[
+                        1
+                    ]
+                ),
+                2,
+            ),
+        )
+
+        gap_mm_out = round(
+            float(
+                gap_mm
+            ),
+            2,
+        )
+
+        front_track_id = (
+            front_bag[
+                "track_id"
+            ]
+        )
+
+        rear_track_id = (
+            rear_bag[
+                "track_id"
+            ]
+        )
+
+        # --------------------------------------------------
+        # RETURN PAIR
+        #
+        # Both canonical fields and aliases are returned.
+        #
+        # This keeps pipeline/dashboard/visualizer
+        # compatibility straightforward.
+        # --------------------------------------------------
+
+        return {
+
+            # ==============================================
+            # TRACK ASSOCIATION
+            # ==============================================
+
+            "front_track_id":
+                front_track_id,
+
+            "rear_track_id":
+                rear_track_id,
+
+            # Generic aliases used by visualizer.
+            "track_id_a":
+                front_track_id,
+
+            "track_id_b":
+                rear_track_id,
+
+            "track_ids":
+                [
+                    front_track_id,
+                    rear_track_id,
+                ],
+
+            # ==============================================
+            # IMAGE EDGE POINTS
+            # ==============================================
+
+            "front_edge_px":
+                front_edge_px_out,
+
+            "rear_edge_px":
+                rear_edge_px_out,
+
+            # Visualizer-compatible aliases.
+            "edge_point_a":
+                front_edge_px_out,
+
+            "edge_point_b":
+                rear_edge_px_out,
+
+            "image_edge_a":
+                front_edge_px_out,
+
+            "image_edge_b":
+                rear_edge_px_out,
+
+            # ==============================================
+            # PHYSICAL EDGE POINTS
+            # ==============================================
+
+            "front_edge_world_mm":
+                front_edge_world_out,
+
+            "rear_edge_world_mm":
+                rear_edge_world_out,
+
+            "world_edge_a_mm":
+                front_edge_world_out,
+
+            "world_edge_b_mm":
+                rear_edge_world_out,
+
+            # ==============================================
+            # GAP
+            # ==============================================
+
+            "edge_gap_mm":
+                gap_mm_out,
+
+            # Generic alias.
+            "gap_mm":
+                gap_mm_out,
+
+            # ==============================================
+            # THRESHOLD
+            # ==============================================
+
+            "threshold_mm":
+                self.jam_threshold_mm,
+
+            "minimum_safe_gap_mm":
+                self.minimum_safe_gap_mm,
+
+            "measurement_margin_mm":
+                self.measurement_margin_mm,
+
+            # ==============================================
+            # DECISION
+            # ==============================================
+
+            "jam_detected":
+                jam_detected,
+
+            "is_jam":
+                jam_detected,
+
+            "status":
+                status,
+        }
+
+    # ======================================================
+    # UPDATE
+    # ======================================================
+
+    def update(
+        self,
+        tracks,
+    ):
+
+        # ==================================================
+        # DISABLED
+        # ==================================================
+
+        if not self.enabled:
+
+            self.last_result = (
+                self._empty_result()
+            )
+
+            return self.last_result
+
+        tracks = (
+            tracks
+            or []
+        )
+
+        # ==================================================
+        # VALIDATE / PREPARE BAGS
+        # ==================================================
+
+        valid_bags = []
+
+        for track in tracks:
+
+            if not self._valid_track(
+                track
+            ):
+
+                continue
+
+            try:
+
+                bag = (
+                    self._prepare_bag(
+                        track
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                IndexError,
+                KeyError,
+            ):
+
+                continue
+
+            valid_bags.append(
+                bag
+            )
+
+        # ==================================================
+        # ORDER BAGS ALONG CONVEYOR
+        # ==================================================
+
+        ordered_bags = (
+            self._sort_bags(
+                valid_bags
+            )
+        )
+
+        # ==================================================
+        # ADJACENT PAIRS ONLY
+        #
+        # Example:
+        #
+        # A B C D
+        #
+        # Compare:
+        #
+        # A-B
+        # B-C
+        # C-D
+        #
+        # Do NOT compare:
+        #
+        # A-C
+        # A-D
+        # B-D
+        # ==================================================
+
+        pairs = []
+
+        for index in range(
+            len(
+                ordered_bags
+            )
+            -
+            1
+        ):
+
+            front_bag = (
+                ordered_bags[
+                    index
+                ]
+            )
+
+            rear_bag = (
+                ordered_bags[
+                    index
+                    +
+                    1
+                ]
+            )
+
+            pair = (
+                self._calculate_pair(
+                    front_bag,
+                    rear_bag,
+                )
+            )
+
+            if pair is None:
+
+                continue
+
+            pairs.append(
+                pair
+            )
+
+        # ==================================================
+        # JAM PAIRS
+        # ==================================================
+
+        jam_pairs = [
+
+            pair
+
+            for pair in pairs
+
+            if pair.get(
+                "jam_detected",
+                False,
+            )
+        ]
+
+        # ==================================================
+        # MINIMUM PHYSICAL GAP
+        # ==================================================
+
+        minimum_gap_mm = None
+
+        if pairs:
+
+            minimum_gap_mm = min(
+                float(
+                    pair[
+                        "edge_gap_mm"
+                    ]
+                )
+                for pair in pairs
+            )
+
+            minimum_gap_mm = round(
+                minimum_gap_mm,
+                2,
+            )
+
+        # ==================================================
+        # FINAL CONDITION B STATE
+        # ==================================================
+
+        jam_detected = bool(
+            jam_pairs
+        )
+
+        status = (
+            self.JAM
+            if jam_detected
+            else self.NORMAL
+        )
+
+        # ==================================================
+        # ACTIVE JAM TRACK IDS
+        # ==================================================
+
+        active_jam_track_ids = sorted(
+            {
+                track_id
+
+                for pair in jam_pairs
+
+                for track_id in (
+                    pair[
+                        "front_track_id"
+                    ],
+                    pair[
+                        "rear_track_id"
+                    ],
+                )
+
+                if track_id is not None
+            }
+        )
+
+        # ==================================================
+        # RESULT
+        # ==================================================
+
+        self.last_result = {
+
+            "enabled":
+                True,
+
+            "status":
+                status,
+
+            "jam_detected":
+                jam_detected,
+
+            "jam_type":
+                (
+                    "bag_spacing"
+                    if jam_detected
+                    else None
+                ),
+
+            # ==============================================
+            # CONFIGURATION
+            # ==============================================
+
+            "threshold_mm":
+                self.jam_threshold_mm,
+
+            "minimum_safe_gap_mm":
+                self.minimum_safe_gap_mm,
+
+            "measurement_margin_mm":
+                self.measurement_margin_mm,
+
+            "direction":
+                self.direction,
+
+            # ==============================================
+            # ROI / CALIBRATION INFO
+            # ==============================================
+
+            "roi":
+                dict(
+                    self.roi
+                ),
+
+            "calibrated":
+                (
+                    self.homography
+                    is not None
+                ),
+
+            # ==============================================
+            # LIVE BAG INFORMATION
+            # ==============================================
+
+            "bag_count_in_roi":
+                len(
+                    ordered_bags
+                ),
+
+            "pair_count":
+                len(
+                    pairs
+                ),
+
+            # ==============================================
+            # DISTANCE
+            # ==============================================
+
+            "minimum_gap_mm":
+                minimum_gap_mm,
+
+            # ==============================================
+            # PAIRS
+            # ==============================================
+
+            "pairs":
+                pairs,
+
+            "jam_pairs":
+                jam_pairs,
+
+            # ==============================================
+            # JAM TRACKS
+            # ==============================================
+
+            "active_jam_count":
+                len(
+                    active_jam_track_ids
+                ),
+
+            "active_jam_track_ids":
+                active_jam_track_ids,
+        }
+
+        return self.last_result
+
+    # ======================================================
+    # RESET
+    # ======================================================
+
+    def reset(
+        self,
+    ):
+
+        # Condition B has no temporal timer/history.
+        #
+        # Reset only clears the latest result.
+
+        self.last_result = (
+            self._empty_result()
+        )
+
+    # ======================================================
+    # EMPTY RESULT
+    # ======================================================
+
+    def _empty_result(
+        self,
+    ):
+
+        return {
+
+            "enabled":
+                self.enabled,
+
+            "status":
+                (
+                    self.NORMAL
+                    if self.enabled
+                    else self.DISABLED
+                ),
+
+            "jam_detected":
+                False,
+
+            "jam_type":
+                None,
+
+            # ==============================================
+            # CONFIGURATION
+            # ==============================================
+
+            "threshold_mm":
+                self.jam_threshold_mm,
+
+            "minimum_safe_gap_mm":
+                self.minimum_safe_gap_mm,
+
+            "measurement_margin_mm":
+                self.measurement_margin_mm,
+
+            "direction":
+                self.direction,
+
+            # ==============================================
+            # ROI / CALIBRATION
+            # ==============================================
+
+            "roi":
+                dict(
+                    self.roi
+                ),
+
+            "calibrated":
+                (
+                    self.homography
+                    is not None
+                ),
+
+            # ==============================================
+            # LIVE VALUES
+            # ==============================================
+
+            "bag_count_in_roi":
+                0,
+
+            "pair_count":
+                0,
+
+            "minimum_gap_mm":
+                None,
+
+            # ==============================================
+            # PAIRS
+            # ==============================================
+
+            "pairs":
+                [],
+
+            "jam_pairs":
+                [],
+
+            # ==============================================
+            # JAM TRACKS
+            # ==============================================
+
+            "active_jam_count":
+                0,
+
+            "active_jam_track_ids":
+                [],
+        }

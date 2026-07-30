@@ -12,35 +12,55 @@ Loads config.yaml and normalizes configuration for:
 - Tracker
 - Physical-center counting
 - Print detection
-- Bag jam detection
+- Movement-based bag jam detection - Condition A
+- Distance-based bag spacing jam detection - Condition B
 - Display
 - Cameras
 
-Jam Detection
--------------
+Jam Detection - Condition A
+---------------------------
 Each camera receives its own jam_detection configuration.
 
 Global jam_detection values act as defaults.
-
 Camera-specific values override the global defaults.
+
+Bag Spacing - Condition B
+-------------------------
+Each camera receives its own bag_spacing configuration.
+
+Condition B detects a jam immediately when the calibrated
+physical edge-to-edge distance between adjacent bags is
+less than or equal to the configured threshold.
 
 Example:
 
-jam_detection:
+bag_spacing:
     enabled: true
-    history_seconds: 1.0
-    ...
+    direction: up
+    jam_threshold_mm: 305.0
 
-camera:
-    jam_detection:
-        enabled: true
-        roi:
-            x1: 0
-            y1: 150
-            x2: 477
-            y2: 500
+    roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
 
-The final camera configuration contains the merged values.
+    calibration:
+
+        image_points:
+            - [150, 150]
+            - [400, 150]
+            - [470, 500]
+            - [60, 500]
+
+        world_points_mm:
+            - [0, 0]
+            - [800, 0]
+            - [800, 2000]
+            - [0, 2000]
+
+Camera-specific bag_spacing values can override the
+global configuration.
 ==========================================================
 """
 
@@ -171,6 +191,14 @@ class Config:
             or {}
         )
 
+        global_bag_spacing = deepcopy(
+            data.get(
+                "bag_spacing",
+                {},
+            )
+            or {}
+        )
+
         global_display = deepcopy(
             data.get(
                 "display",
@@ -263,7 +291,7 @@ class Config:
             #
             # print_detection: true
             #
-            # or
+            # or:
             #
             # print_detection:
             #     enabled: true
@@ -299,7 +327,7 @@ class Config:
             )
 
             # ==============================================
-            # JAM DETECTION
+            # JAM DETECTION - CONDITION A
             # ==============================================
 
             jd = camera.get(
@@ -343,10 +371,8 @@ class Config:
             # ----------------------------------------------
             # JAM ROI
             #
-            # Important:
             # _merge_dicts is shallow.
-            #
-            # Therefore normalize ROI separately.
+            # Therefore ROI is merged separately.
             # ----------------------------------------------
 
             global_jam_roi = (
@@ -381,6 +407,121 @@ class Config:
             camera[
                 "jam_detection"
             ] = camera_jam
+
+            # ==============================================
+            # BAG SPACING JAM - CONDITION B
+            # ==============================================
+
+            bs = camera.get(
+                "bag_spacing",
+                global_bag_spacing,
+            )
+
+            # Support:
+            #
+            # bag_spacing: true
+            #
+            # or:
+            #
+            # bag_spacing:
+            #     enabled: true
+
+            if isinstance(
+                bs,
+                bool,
+            ):
+
+                bs = {
+                    "enabled":
+                        bs
+                }
+
+            elif not isinstance(
+                bs,
+                dict,
+            ):
+
+                bs = {}
+
+            camera_bag_spacing = (
+                self._merge_dicts(
+                    global_bag_spacing,
+                    bs,
+                )
+            )
+
+            # ----------------------------------------------
+            # BAG SPACING ROI
+            #
+            # ROI is merged separately because the standard
+            # dictionary merge is shallow.
+            # ----------------------------------------------
+
+            global_spacing_roi = (
+                global_bag_spacing.get(
+                    "roi",
+                    {},
+                )
+                or {}
+            )
+
+            camera_spacing_roi = (
+                bs.get(
+                    "roi",
+                    {},
+                )
+                or {}
+            )
+
+            merged_spacing_roi = (
+                self._merge_dicts(
+                    global_spacing_roi,
+                    camera_spacing_roi,
+                )
+            )
+
+            camera_bag_spacing[
+                "roi"
+            ] = self._normalize_roi(
+                merged_spacing_roi
+            )
+
+            # ----------------------------------------------
+            # CAMERA CALIBRATION
+            #
+            # Global calibration acts as the development
+            # default.
+            #
+            # In production each camera can override its
+            # own image_points/world_points_mm.
+            # ----------------------------------------------
+
+            global_calibration = (
+                global_bag_spacing.get(
+                    "calibration",
+                    {},
+                )
+                or {}
+            )
+
+            camera_calibration = (
+                bs.get(
+                    "calibration",
+                    {},
+                )
+                or {}
+            )
+
+            camera_bag_spacing[
+                "calibration"
+            ] = self._merge_dicts(
+                global_calibration,
+                camera_calibration,
+            )
+
+            camera[
+                "bag_spacing"
+            ] = camera_bag_spacing
 
             # ==============================================
             # DISPLAY
@@ -747,7 +888,7 @@ class Config:
                 )
 
             # ==============================================
-            # JAM DETECTION
+            # JAM DETECTION - CONDITION A
             # ==============================================
 
             jam = camera.get(
@@ -780,8 +921,42 @@ class Config:
                     jam,
                 )
 
+            # ==============================================
+            # BAG SPACING JAM - CONDITION B
+            # ==============================================
+
+            bag_spacing = camera.get(
+                "bag_spacing",
+                {},
+            )
+
+            if not isinstance(
+                bag_spacing,
+                dict,
+            ):
+
+                raise ValueError(
+                    f"{camera_name}: "
+                    "bag_spacing must be "
+                    "a dictionary."
+                )
+
+            spacing_enabled = bool(
+                bag_spacing.get(
+                    "enabled",
+                    False,
+                )
+            )
+
+            if spacing_enabled:
+
+                self._validate_bag_spacing_config(
+                    camera_name,
+                    bag_spacing,
+                )
+
     # ======================================================
-    # JAM VALIDATION
+    # JAM VALIDATION - CONDITION A
     # ======================================================
 
     @staticmethod
@@ -1060,4 +1235,406 @@ class Config:
                 f"{camera_name}: "
                 "track_ttl_seconds must "
                 "be > 0."
+            )
+
+    # ======================================================
+    # BAG SPACING VALIDATION - CONDITION B
+    # ======================================================
+
+    @staticmethod
+    def _validate_bag_spacing_config(
+        camera_name,
+        config,
+    ) -> None:
+
+        # --------------------------------------------------
+        # JAM THRESHOLD
+        # --------------------------------------------------
+
+        try:
+
+            jam_threshold_mm = float(
+                config.get(
+                    "jam_threshold_mm",
+                    305.0,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+
+            raise ValueError(
+                f"{camera_name}: invalid "
+                "bag_spacing jam_threshold_mm."
+            ) from error
+
+        if jam_threshold_mm <= 0:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing jam_threshold_mm "
+                "must be > 0."
+            )
+
+        # --------------------------------------------------
+        # ENGINEERING GAP VALUES
+        # --------------------------------------------------
+
+        try:
+
+            minimum_safe_gap_mm = float(
+                config.get(
+                    "minimum_safe_gap_mm",
+                    300.0,
+                )
+            )
+
+            measurement_margin_mm = float(
+                config.get(
+                    "measurement_margin_mm",
+                    5.0,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+
+            raise ValueError(
+                f"{camera_name}: invalid "
+                "bag spacing engineering values."
+            ) from error
+
+        if minimum_safe_gap_mm <= 0:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "minimum_safe_gap_mm must "
+                "be > 0."
+            )
+
+        if measurement_margin_mm < 0:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "measurement_margin_mm cannot "
+                "be negative."
+            )
+
+        # --------------------------------------------------
+        # CONSISTENCY CHECK
+        # --------------------------------------------------
+
+        expected_threshold = (
+            minimum_safe_gap_mm
+            +
+            measurement_margin_mm
+        )
+
+        if abs(
+            jam_threshold_mm
+            -
+            expected_threshold
+        ) > 0.001:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing jam_threshold_mm "
+                "must equal "
+                "minimum_safe_gap_mm + "
+                "measurement_margin_mm. "
+                f"Expected {expected_threshold:.3f} mm, "
+                f"got {jam_threshold_mm:.3f} mm."
+            )
+
+        # --------------------------------------------------
+        # DIRECTION
+        # --------------------------------------------------
+
+        direction = str(
+            config.get(
+                "direction",
+                "up",
+            )
+        ).strip().lower()
+
+        if direction not in {
+            "up",
+            "down",
+        }:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing direction must "
+                "be 'up' or 'down'."
+            )
+
+        # --------------------------------------------------
+        # MINIMUM TRACK AGE
+        # --------------------------------------------------
+
+        try:
+
+            min_track_age = int(
+                config.get(
+                    "min_track_age",
+                    4,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+
+            raise ValueError(
+                f"{camera_name}: invalid "
+                "bag_spacing min_track_age."
+            ) from error
+
+        if min_track_age < 1:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing min_track_age "
+                "must be >= 1."
+            )
+
+        # --------------------------------------------------
+        # SPACING ROI
+        # --------------------------------------------------
+
+        roi = config.get(
+            "roi",
+            {},
+        )
+
+        if not isinstance(
+            roi,
+            dict,
+        ):
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing ROI must be "
+                "a dictionary."
+            )
+
+        x1 = Config._safe_int(
+            roi.get(
+                "x1",
+                0,
+            )
+        )
+
+        y1 = Config._safe_int(
+            roi.get(
+                "y1",
+                0,
+            )
+        )
+
+        x2 = Config._safe_int(
+            roi.get(
+                "x2",
+                0,
+            )
+        )
+
+        y2 = Config._safe_int(
+            roi.get(
+                "y2",
+                0,
+            )
+        )
+
+        if x1 == x2:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing ROI width "
+                "cannot be zero."
+            )
+
+        if y1 == y2:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing ROI height "
+                "cannot be zero."
+            )
+
+        # --------------------------------------------------
+        # CALIBRATION
+        # --------------------------------------------------
+
+        calibration = config.get(
+            "calibration",
+            {},
+        )
+
+        if not isinstance(
+            calibration,
+            dict,
+        ):
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing calibration must "
+                "be a dictionary."
+            )
+
+        image_points = calibration.get(
+            "image_points",
+            []
+        )
+
+        world_points = calibration.get(
+            "world_points_mm",
+            []
+        )
+
+        if (
+            not isinstance(
+                image_points,
+                list,
+            )
+            or
+            len(image_points) != 4
+        ):
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing calibration."
+                "image_points must contain "
+                "exactly 4 points."
+            )
+
+        if (
+            not isinstance(
+                world_points,
+                list,
+            )
+            or
+            len(world_points) != 4
+        ):
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing calibration."
+                "world_points_mm must contain "
+                "exactly 4 points."
+            )
+
+        # --------------------------------------------------
+        # VALIDATE POINT FORMAT
+        # --------------------------------------------------
+
+        for label, points in (
+            (
+                "image_points",
+                image_points,
+            ),
+            (
+                "world_points_mm",
+                world_points,
+            ),
+        ):
+
+            for index, point in enumerate(
+                points
+            ):
+
+                if (
+                    not isinstance(
+                        point,
+                        (list, tuple),
+                    )
+                    or
+                    len(point) != 2
+                ):
+
+                    raise ValueError(
+                        f"{camera_name}: "
+                        "bag_spacing calibration."
+                        f"{label}[{index}] must "
+                        "be [x, y]."
+                    )
+
+                try:
+
+                    x = float(
+                        point[0]
+                    )
+
+                    y = float(
+                        point[1]
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ) as error:
+
+                    raise ValueError(
+                        f"{camera_name}: "
+                        "bag_spacing calibration."
+                        f"{label}[{index}] contains "
+                        "invalid coordinates."
+                    ) from error
+
+                if not (
+                    x == x
+                    and
+                    y == y
+                ):
+
+                    raise ValueError(
+                        f"{camera_name}: "
+                        "bag_spacing calibration."
+                        f"{label}[{index}] contains "
+                        "NaN coordinates."
+                    )
+
+        # --------------------------------------------------
+        # CHECK DUPLICATE CALIBRATION POINTS
+        # --------------------------------------------------
+
+        image_point_set = {
+            (
+                float(point[0]),
+                float(point[1]),
+            )
+            for point in image_points
+        }
+
+        world_point_set = {
+            (
+                float(point[0]),
+                float(point[1]),
+            )
+            for point in world_points
+        }
+
+        if len(
+            image_point_set
+        ) != 4:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing image calibration "
+                "points must be unique."
+            )
+
+        if len(
+            world_point_set
+        ) != 4:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "bag_spacing world calibration "
+                "points must be unique."
             )
