@@ -332,7 +332,7 @@ class DashboardState:
     def __init__(
         self,
         state_file=None,
-        publish_interval=0.25,
+        publish_interval=0.5,
         stale_timeout=10.0,
         auto_publish=True,
     ):
@@ -374,7 +374,7 @@ class DashboardState:
             0.05,
             safe_float(
                 publish_interval,
-                0.25,
+                0.5,
             ),
         )
 
@@ -397,6 +397,10 @@ class DashboardState:
 
         self._lock = (
             threading.RLock()
+        )
+
+        self._publish_lock = (
+            threading.Lock()
         )
 
         self._stop_event = (
@@ -2325,158 +2329,224 @@ class DashboardState:
 
         A temporary file + os.replace() is used so the
         dashboard server never reads half-written JSON.
+
+        The entire method runs under a dedicated
+        ``_publish_lock`` so only one thread is ever
+        writing the temp file / doing the atomic replace
+        at a time. ``_lock`` alone was not sufficient here
+        because it was only held while copying state, not
+        while the file was actually being written -- two
+        publisher/caller threads could race past that copy
+        step at nearly the same moment and then contend for
+        the destination file during os.replace().
+
+        On Windows, os.replace() can also raise
+        PermissionError when another process (commonly
+        antivirus/Windows Defender, or a file indexer/backup
+        agent) briefly holds an open handle to the
+        destination file. That lock is normally released
+        within a couple hundred milliseconds on affected
+        machines, so the replace is retried a bounded number
+        of times with a short backoff before giving up.
         """
 
-        with self._lock:
+        with self._publish_lock:
 
-            if (
-                not force
-                and
-                not self._dirty
-            ):
+            with self._lock:
 
-                return False
+                if (
+                    not force
+                    and
+                    not self._dirty
+                ):
 
-
-            self._recalculate_totals_locked()
-
-
-            snapshot = deepcopy(
-                self._state
-            )
+                    return False
 
 
-            snapshot[
-                "state_stale"
-            ] = False
+                self._recalculate_totals_locked()
 
 
-            snapshot[
-                "uptime_seconds"
-            ] = max(
-                0.0,
-                time.monotonic()
-                -
-                self._startup_monotonic,
-            )
-
-
-        temp_path = None
-
-
-        try:
-
-            self.state_file.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-
-            fd, temp_name = (
-                tempfile.mkstemp(
-                    prefix=(
-                        self.state_file.name
-                        + "."
-                    ),
-                    suffix=".tmp",
-                    dir=str(
-                        self.state_file.parent
-                    ),
-                    text=True,
-                )
-            )
-
-
-            temp_path = Path(
-                temp_name
-            )
-
-
-            with os.fdopen(
-                fd,
-                "w",
-                encoding="utf-8",
-            ) as file:
-
-                json.dump(
-                    snapshot,
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
+                snapshot = deepcopy(
+                    self._state
                 )
 
-                file.flush()
 
-                try:
+                snapshot[
+                    "state_stale"
+                ] = False
 
-                    os.fsync(
-                        file.fileno()
+
+                snapshot[
+                    "uptime_seconds"
+                ] = max(
+                    0.0,
+                    time.monotonic()
+                    -
+                    self._startup_monotonic,
+                )
+
+
+            temp_path = None
+
+
+            try:
+
+                self.state_file.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+
+                fd, temp_name = (
+                    tempfile.mkstemp(
+                        prefix=(
+                            self.state_file.name
+                            + "."
+                        ),
+                        suffix=".tmp",
+                        dir=str(
+                            self.state_file.parent
+                        ),
+                        text=True,
+                    )
+                )
+
+
+                temp_path = Path(
+                    temp_name
+                )
+
+
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+
+                    json.dump(
+                        snapshot,
+                        file,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
                     )
 
-                except OSError:
+                    file.flush()
 
-                    pass
+                    try:
+
+                        os.fsync(
+                            file.fileno()
+                        )
+
+                    except OSError:
+
+                        pass
 
 
-            os.replace(
-                temp_path,
-                self.state_file,
-            )
+                # ------------------------------------------------
+                # Atomic replace, with retry.
+                #
+                # Windows can transiently deny os.replace() with a
+                # PermissionError while Defender/AV, a backup
+                # agent, or a file indexer has state.json open for
+                # scanning. On corporate laptops this hold can run
+                # 100-200ms, so the backoff is sized above that.
+                # ------------------------------------------------
+
+                replace_error = None
+
+                max_replace_attempts = 20
+
+                for attempt in range(
+                    max_replace_attempts
+                ):
+
+                    try:
+
+                        os.replace(
+                            temp_path,
+                            self.state_file,
+                        )
+
+                        replace_error = None
+
+                        break
+
+                    except PermissionError as error:
+
+                        replace_error = error
+
+                        logger.warning(
+                            (
+                                "Dashboard state file "
+                                "locked, retrying "
+                                "replace (%d/%d): %s"
+                            ),
+                            attempt + 1,
+                            max_replace_attempts,
+                            self.state_file,
+                        )
+
+                        time.sleep(0.2)
+
+                if replace_error is not None:
+
+                    raise replace_error
 
 
-            with self._lock:
+                with self._lock:
 
-                self._dirty = False
+                    self._dirty = False
 
-                self._last_publish_monotonic = (
-                    time.monotonic()
+                    self._last_publish_monotonic = (
+                        time.monotonic()
+                    )
+
+                    self._last_publish_time = (
+                        utc_now_iso()
+                    )
+
+                    self._publish_count += 1
+
+                    self._last_error = None
+
+
+                return True
+
+
+            except Exception as error:
+
+                with self._lock:
+
+                    self._publish_errors += 1
+
+                    self._last_error = str(
+                        error
+                    )
+
+
+                logger.exception(
+                    "Failed publishing dashboard state."
                 )
 
-                self._last_publish_time = (
-                    utc_now_iso()
-                )
 
-                self._publish_count += 1
+                if (
+                    temp_path is not None
+                    and
+                    temp_path.exists()
+                ):
 
-                self._last_error = None
+                    try:
 
+                        temp_path.unlink()
 
-            return True
+                    except OSError:
 
-
-        except Exception as error:
-
-            with self._lock:
-
-                self._publish_errors += 1
-
-                self._last_error = str(
-                    error
-                )
+                        pass
 
 
-            logger.exception(
-                "Failed publishing dashboard state."
-            )
-
-
-            if (
-                temp_path is not None
-                and
-                temp_path.exists()
-            ):
-
-                try:
-
-                    temp_path.unlink()
-
-                except OSError:
-
-                    pass
-
-
-            return False
+                return False
 
 
     # ======================================================

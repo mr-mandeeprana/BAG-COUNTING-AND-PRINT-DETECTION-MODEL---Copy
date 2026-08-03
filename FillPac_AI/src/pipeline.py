@@ -1104,9 +1104,13 @@ class Pipeline:
 
             except Exception as error:
 
-                self.logger.exception(
+                import traceback
+
+                self.logger.error(
                     f"{self.name}: Condition C failed: {error}"
                 )
+
+                traceback.print_exc()
 
                 self.condition_c_result = {
 
@@ -2257,13 +2261,14 @@ class Pipeline:
 
                         self.name,
 
-                        counted_bag[
-                            "total_count"
-                        ],
+                        counted_bag.get(
+                            "total_count",
+                            self.counter.total_count,
+                        ),
 
-                        counted_bag[
+                        counted_bag.get(
                             "center"
-                        ],
+                        ),
                     )
 
                 except Exception:
@@ -2275,47 +2280,52 @@ class Pipeline:
 
             if self.count_logger is not None:
 
+                import traceback
+
+                print("=" * 80)
+                print(counted_bag)
+                print("=" * 80)
+
                 try:
 
                     self.count_logger.log_count(
 
                         camera_name=self.name,
 
-                        total_count=counted_bag[
-                            "total_count"
-                        ],
+                        total_count=count,
 
-                        track_id=counted_bag[
+                        track_id=counted_bag.get(
                             "track_id"
-                        ],
+                        ),
 
-                        center=counted_bag[
+                        center=counted_bag.get(
                             "center"
-                        ],
+                        ),
 
-                        print_present=counted_bag[
+                        print_present=counted_bag.get(
                             "print_present"
-                        ],
+                        ),
 
-                        printed_count=counted_bag[
+                        printed_count=counted_bag.get(
                             "printed_count"
-                        ],
+                        ),
 
-                        missing_count=counted_bag[
+                        missing_count=counted_bag.get(
                             "missing_count"
-                        ],
+                        ),
 
                         print_detection_enabled=(
                             self.print_detection_enabled
                         ),
                     )
 
-                except Exception:
+                except Exception as e:
 
-                    self.logger.warning(
-                        f"{self.name}: failed writing "
-                        "count event."
+                    self.logger.error(
+                        f"{self.name}: failed writing count event: {e}"
                     )
+
+                    traceback.print_exc()
 
         self.last_count = count
 

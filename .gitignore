@@ -1,14 +1,29 @@
+# Virtual Environments
+venv/
 .venv/
-.pytest_cache/
-.agents/
-.vscode/
+FillPac_AI/venv/
+
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
+# IDE
+.vscode/
+.idea/
+
+# Project folders
+.agents/
 FillPac_AI/.pytest_cache/
 FillPac_AI/.ultralytics/
 FillPac_AI/**/__pycache__/
+
+# Logs
+logs/
+*.log
 FillPac_AI/logs/
+
+# Outputs
 FillPac_AI/runs/
 FillPac_AI/data/output/
 FillPac_AI/data/import_backups/
@@ -16,7 +31,8 @@ FillPac_AI/data/videos/
 FillPac_AI/data/images.zip
 FillPac_AI/data/labels/*.cache
 
+# Training datasets
 Find bag and print.yolo26/train/
 
+# Temp
 *.tmp
-*.log

@@ -137,6 +137,8 @@ class ROIOccupancyDetector:
 
         self.last_capture_time = 0.0
 
+        self.last_saved_track_ids = set()
+
         # =================================================
         # JAM EVENT LIFECYCLE STATE
         # =================================================
@@ -360,6 +362,12 @@ class ROIOccupancyDetector:
 
         roi_track_ids = set(track_ids)
 
+        track_changed = (
+            roi_track_ids
+            !=
+            self.last_saved_track_ids
+        )
+
         roi_distances = []
 
         minimum_gap = None
@@ -466,25 +474,19 @@ class ROIOccupancyDetector:
         }
 
         should_capture = (
-            new_jam
-            or
-            (
-                jam
-                and
-                (
-                    time.time()
-                    -
-                    self.last_capture_time
-                )
-                >
-                self.capture_cooldown
-            )
+            jam
+            and
+            track_changed
         )
 
         if should_capture:
 
             self.last_capture_time = (
                 time.time()
+            )
+
+            self.last_saved_track_ids = (
+                roi_track_ids.copy()
             )
 
             image_path = self._save(

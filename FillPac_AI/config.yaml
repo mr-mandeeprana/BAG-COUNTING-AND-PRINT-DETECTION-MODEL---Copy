@@ -492,7 +492,7 @@ cameras:
   - id: 2
     name: Camera 2
 
-    enabled: false
+    enabled: true
 
     mode: video
     source: "data/videos/camera 2.mp4"
@@ -611,7 +611,7 @@ cameras:
   - id: 3
     name: Camera 3
 
-    enabled: false
+    enabled: true
 
     mode: video
     source: "data/videos/camera 3.mp4"
@@ -730,7 +730,7 @@ cameras:
   - id: 4
     name: Camera 4
 
-    enabled: false
+    enabled: true
 
     mode: video
     source: "data/videos/camera 4.mp4"
