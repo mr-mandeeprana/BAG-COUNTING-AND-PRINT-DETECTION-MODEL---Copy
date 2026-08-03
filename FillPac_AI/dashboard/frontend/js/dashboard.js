@@ -112,14 +112,6 @@ const JAM_STATES = [
 ];
 
 
-const CONDITION_C_STATES = [
-    "normal",
-    "warning",
-    "occupied",
-    "jam"
-];
-
-
 /* ==========================================================
    DOM HELPERS
    ========================================================== */
@@ -1997,32 +1989,6 @@ function renderJamMonitoring(cameras) {
             `camera${index}ConditionC`,
             roiStatus.toUpperCase()
         );
-
-
-        const conditionCBadge =
-            byId(
-                `jamCamera${index}ConditionC`
-            );
-
-        if (conditionCBadge) {
-
-            CONDITION_C_STATES.forEach(
-                state => {
-
-                    conditionCBadge
-                        .classList
-                        .remove(
-                            `condition-c-${state}`
-                        );
-                }
-            );
-
-            conditionCBadge
-                .classList
-                .add(
-                    `condition-c-${roiStatus.toLowerCase()}`
-                );
-        }
 
 
         setText(
