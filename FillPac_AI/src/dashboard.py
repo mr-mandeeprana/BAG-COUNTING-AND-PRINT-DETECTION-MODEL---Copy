@@ -751,6 +751,74 @@ class DashboardState:
                     ),
 
                 # ------------------------------------------
+                # CONDITION C
+                # ------------------------------------------
+
+                "condition_c_enabled":
+                    safe_bool(
+                        existing.get(
+                            "condition_c_enabled",
+                            False,
+                        )
+                    ),
+
+                "condition_c_detected":
+                    safe_bool(
+                        existing.get(
+                            "condition_c_detected",
+                            False,
+                        )
+                    ),
+
+                "condition_c_bag_count":
+                    safe_int(
+                        existing.get(
+                            "condition_c_bag_count",
+                            0,
+                        )
+                    ),
+
+                "condition_c_track_ids":
+                    normalize_track_ids(
+                        existing.get(
+                            "condition_c_track_ids",
+                            [],
+                        )
+                    ),
+
+                "condition_c_status":
+                    existing.get(
+                        "condition_c_status",
+                        "normal",
+                    ),
+
+                "condition_c_minimum_gap_mm":
+                    existing.get(
+                        "condition_c_minimum_gap_mm"
+                    ),
+
+                "condition_c_distances":
+                    existing.get(
+                        "condition_c_distances",
+                        [],
+                    ),
+
+                "condition_c_image_path":
+                    existing.get(
+                        "condition_c_image_path"
+                    ),
+
+                "condition_c_image_url":
+                    existing.get(
+                        "condition_c_image_url"
+                    ),
+
+                "condition_c_timestamp":
+                    existing.get(
+                        "condition_c_timestamp"
+                    ),
+
+                # ------------------------------------------
                 # FPS
                 # ------------------------------------------
 
@@ -1159,6 +1227,42 @@ class DashboardState:
                         "active_jam_track_ids"
                     ] = []
 
+                    camera[
+                        "condition_c_detected"
+                    ] = False
+
+                    camera[
+                        "condition_c_bag_count"
+                    ] = 0
+
+                    camera[
+                        "condition_c_track_ids"
+                    ] = []
+
+                    camera[
+                        "condition_c_status"
+                    ] = "disabled"
+
+                    camera[
+                        "condition_c_minimum_gap_mm"
+                    ] = None
+
+                    camera[
+                        "condition_c_distances"
+                    ] = []
+
+                    camera[
+                        "condition_c_image_path"
+                    ] = None
+
+                    camera[
+                        "condition_c_image_url"
+                    ] = None
+
+                    camera[
+                        "condition_c_timestamp"
+                    ] = None
+
 
             # ----------------------------------------------
             # JAM STATUS
@@ -1442,6 +1546,81 @@ class DashboardState:
                     key
                 ] = self._json_safe(
                     value
+                )
+
+
+            # ----------------------------------------------
+            # Keep condition_c_status consistent
+            # ----------------------------------------------
+
+            condition_c_detected = safe_bool(
+                camera.get(
+                    "condition_c_detected",
+                    False,
+                )
+            )
+
+            if not camera.get(
+                "condition_c_enabled",
+                False,
+            ):
+
+                camera[
+                    "condition_c_status"
+                ] = "disabled"
+
+            elif condition_c_detected:
+
+                camera[
+                    "condition_c_status"
+                ] = "jam"
+
+            else:
+
+                camera[
+                    "condition_c_status"
+                ] = "normal"
+
+
+            # ----------------------------------------------
+            # Condition C timestamp
+            # ----------------------------------------------
+
+            condition_c_changed = any(
+                key in extra_fields
+                for key in (
+                    "condition_c_detected",
+                    "condition_c_bag_count",
+                    "condition_c_track_ids",
+                )
+            )
+
+            if condition_c_changed:
+
+                camera[
+                    "condition_c_timestamp"
+                ] = utc_now_iso()
+
+
+            # ----------------------------------------------
+            # Condition C image URL
+            # ----------------------------------------------
+
+            if "condition_c_image_path" in extra_fields:
+
+                condition_c_image_path = (
+                    camera.get(
+                        "condition_c_image_path"
+                    )
+                )
+
+                camera[
+                    "condition_c_image_url"
+                ] = (
+                    f"/condition-c/image/"
+                    f"{Path(condition_c_image_path).name}"
+                    if condition_c_image_path
+                    else None
                 )
 
 

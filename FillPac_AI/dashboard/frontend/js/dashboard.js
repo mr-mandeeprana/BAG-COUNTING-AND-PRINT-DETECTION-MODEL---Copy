@@ -112,6 +112,14 @@ const JAM_STATES = [
 ];
 
 
+const CONDITION_C_STATES = [
+    "normal",
+    "warning",
+    "occupied",
+    "jam"
+];
+
+
 /* ==========================================================
    DOM HELPERS
    ========================================================== */
@@ -1773,11 +1781,58 @@ function renderJamMonitoring(cameras) {
         const trackIds =
             Array.isArray(
                 camera
-                    ?.active_jam_track_ids
+                    ?.condition_c_track_ids
             )
                 ? camera
-                    .active_jam_track_ids
-                : [];
+                    .condition_c_track_ids
+                : (
+                    Array.isArray(
+                        camera
+                            ?.active_jam_track_ids
+                    )
+                        ? camera
+                            .active_jam_track_ids
+                        : []
+                );
+
+
+        /* --------------------------------------------------
+           CONDITION C (ROI OCCUPANCY) FIELDS
+           -------------------------------------------------- */
+
+        const roiBagCount =
+            safeNumber(
+                camera
+                    ?.condition_c_bag_count,
+                0
+            );
+
+        const roiGap =
+            camera
+                ?.condition_c_minimum_gap_mm;
+
+        const roiDistances =
+            camera
+                ?.condition_c_distances
+            || [];
+
+        const roiImage =
+            camera
+                ?.condition_c_image_url
+            ||
+            camera
+                ?.condition_c_image_path;
+
+        const roiStatus =
+            camera
+                ?.condition_c_status
+            ||
+            (
+                camera
+                    ?.condition_c_detected
+                    ? "jam"
+                    : "normal"
+            );
 
 
         /* --------------------------------------------------
@@ -1882,6 +1937,92 @@ function renderJamMonitoring(cameras) {
                 cameraJamCount
             )
         );
+
+
+        setText(
+            `jamCamera${index}RoiBags`,
+            formatInteger(
+                roiBagCount
+            )
+        );
+
+
+        setText(
+            `jamCamera${index}MinimumGap`,
+            roiGap == null
+                ? "--"
+                : `${formatDecimal(roiGap, 1)} mm`
+        );
+
+
+        const distanceElement =
+            byId(
+                `jamCamera${index}Distances`
+            );
+
+        if (distanceElement) {
+
+            distanceElement.innerHTML =
+                roiDistances.length
+                    ? roiDistances
+                        .map(
+                            d => `${formatDecimal(d?.distance_mm, 1)} mm`
+                        )
+                        .join("<br>")
+                    : "--";
+        }
+
+
+        const roiImageElement =
+            byId(
+                `jamCamera${index}Image`
+            );
+
+        if (roiImageElement) {
+
+            roiImageElement.src =
+                roiImage
+                    ? `${roiImage}?t=${Date.now()}`
+                    : "";
+        }
+
+
+        setText(
+            `jamCamera${index}ConditionC`,
+            roiStatus.toUpperCase()
+        );
+
+
+        setText(
+            `camera${index}ConditionC`,
+            roiStatus.toUpperCase()
+        );
+
+
+        const conditionCBadge =
+            byId(
+                `jamCamera${index}ConditionC`
+            );
+
+        if (conditionCBadge) {
+
+            CONDITION_C_STATES.forEach(
+                state => {
+
+                    conditionCBadge
+                        .classList
+                        .remove(
+                            `condition-c-${state}`
+                        );
+                }
+            );
+
+            conditionCBadge
+                .classList
+                .add(
+                    `condition-c-${roiStatus.toLowerCase()}`
+                );
+        }
 
 
         setText(
@@ -4362,7 +4503,47 @@ function handleJamSocketUpdate(
             ??
             existing.jam_tracks
             ??
-            []
+            [],
+
+        condition_c_detected:
+            payload.condition_c_detected
+            ??
+            existing.condition_c_detected,
+
+        condition_c_status:
+            payload.condition_c_status
+            ??
+            existing.condition_c_status,
+
+        condition_c_bag_count:
+            payload.condition_c_bag_count
+            ??
+            existing.condition_c_bag_count,
+
+        condition_c_track_ids:
+            payload.condition_c_track_ids
+            ??
+            existing.condition_c_track_ids,
+
+        condition_c_minimum_gap_mm:
+            payload.condition_c_minimum_gap_mm
+            ??
+            existing.condition_c_minimum_gap_mm,
+
+        condition_c_distances:
+            payload.condition_c_distances
+            ??
+            existing.condition_c_distances,
+
+        condition_c_image_url:
+            payload.condition_c_image_url
+            ??
+            existing.condition_c_image_url,
+
+        condition_c_image_path:
+            payload.condition_c_image_path
+            ??
+            existing.condition_c_image_path
     };
 
 

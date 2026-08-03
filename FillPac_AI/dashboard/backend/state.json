@@ -1,34 +1,34 @@
 {
   "system_status": "offline",
-  "startup_time": "2026-07-30T07:33:17.769961+00:00",
-  "updated_at": "2026-07-30T07:54:24.867188+00:00",
+  "startup_time": "2026-08-03T05:44:58.646617+00:00",
+  "updated_at": "2026-08-03T05:46:00.262289+00:00",
   "service_status": {
     "model_loaded": false,
     "inference_manager_running": false,
     "elasticsearch_connected": false,
     "dashboard_enabled": true
   },
-  "total_count": 356,
-  "total_printed_count": 0,
+  "total_count": 10,
+  "total_printed_count": 10,
   "total_missing_count": 0,
-  "total_printed_bags_count": 0,
+  "total_printed_bags_count": 10,
   "total_not_printed_bags_count": 0,
   "cameras": {
-    "Camera 4s": {
-      "id": 4,
-      "name": "Camera 4s",
+    "Camera 1": {
+      "id": 1,
+      "name": "Camera 1",
       "enabled": true,
       "configured": true,
       "mode": "video",
       "source_type": "video",
       "status": "offline",
-      "count": 356,
-      "total_count": 356,
-      "printed_count": 0,
+      "count": 10,
+      "total_count": 10,
+      "printed_count": 10,
       "missing_count": 0,
-      "printed_bags_count": 0,
+      "printed_bags_count": 10,
       "not_printed_bags_count": 0,
-      "print_detection_enabled": false,
+      "print_detection_enabled": true,
       "print_status": "offline",
       "jam_detection_enabled": true,
       "jam_status": "normal",
@@ -36,14 +36,24 @@
       "jam_warning": false,
       "active_jam_count": 0,
       "active_jam_track_ids": [],
+      "condition_c_enabled": true,
+      "condition_c_detected": false,
+      "condition_c_bag_count": 0,
+      "condition_c_track_ids": [],
+      "condition_c_status": "normal",
+      "condition_c_minimum_gap_mm": null,
+      "condition_c_distances": [],
+      "condition_c_image_path": null,
+      "condition_c_image_url": null,
+      "condition_c_timestamp": "2026-08-03T05:46:00.258290+00:00",
       "fps": 0.0,
-      "frame_count": 11391,
-      "last_frame_at": "2026-07-30T07:54:24.742796+00:00",
+      "frame_count": 335,
+      "last_frame_at": "2026-08-03T05:46:00.233230+00:00",
       "last_detection_at": null,
-      "last_count_at": "2026-07-30T07:54:23.437876+00:00",
+      "last_count_at": "2026-08-03T05:45:57.981909+00:00",
       "last_error": null,
-      "registered_at": "2026-07-30T07:33:18.410180+00:00",
-      "updated_at": "2026-07-30T07:54:24.867188+00:00",
+      "registered_at": "2026-08-03T05:44:59.916248+00:00",
+      "updated_at": "2026-08-03T05:46:00.262289+00:00",
       "metadata": {
         "roi": {
           "x1": 0,
@@ -67,7 +77,14 @@
           "x2": 477,
           "y2": 500
         },
-        "spacing_threshold_mm": 155.0
+        "spacing_threshold_mm": 155.0,
+        "condition_c_enabled": true,
+        "condition_c_roi": {
+          "x1": 0,
+          "y1": 150,
+          "x2": 477,
+          "y2": 500
+        }
       },
       "movement_jam_enabled": true,
       "movement_jam_status": "normal",
@@ -82,11 +99,20 @@
       "spacing_pairs": [],
       "spacing_jam_pairs": [],
       "spacing_jam_track_ids": [],
+      "condition_c_roi": {
+        "x1": 0,
+        "y1": 150,
+        "x2": 477,
+        "y2": 500
+      },
+      "condition_c_max_allowed_bags": 1,
+      "condition_c_roi_occupancy": 0.0,
+      "condition_c_duration": 0,
       "jam_types": [],
       "movement_jam_tracks": [],
       "jam_tracks": []
     }
   },
   "state_stale": false,
-  "uptime_seconds": 1267.1090000000004
+  "uptime_seconds": 61.625
 }

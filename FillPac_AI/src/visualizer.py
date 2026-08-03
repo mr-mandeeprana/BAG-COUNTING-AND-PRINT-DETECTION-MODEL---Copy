@@ -537,6 +537,34 @@ class Visualizer:
         )
 
     # ======================================================
+    # ROI OCCUPANCY ROI - CONDITION C
+    # ======================================================
+
+    @staticmethod
+    def draw_condition_c_roi(
+        frame,
+        roi,
+        jam=False,
+    ):
+
+        color = (
+            (0, 0, 255)
+            if jam
+            else (255, 0, 255)
+        )
+
+        thickness = 4 if jam else 2
+
+        Visualizer._draw_rectangular_roi(
+            frame=frame,
+            roi=roi,
+            color=color,
+            title="ROI OCCUPANCY",
+            fill_alpha=0.04,
+            thickness=thickness,
+        )
+
+    # ======================================================
     # JAM COLOR
     # ======================================================
 
@@ -843,6 +871,12 @@ class Visualizer:
 
                     readable.append(
                         "BAG SPACING"
+                    )
+
+                elif jam_type == "roi_occupancy":
+
+                    readable.append(
+                        "ROI OCCUPANCY"
                     )
 
                 else:
@@ -1815,6 +1849,333 @@ class Visualizer:
             )
 
     # ======================================================
+    # CONDITION C STATUS
+    # ======================================================
+
+    @staticmethod
+    def draw_condition_c_status(
+        frame,
+        result,
+        max_bags=None,
+    ):
+
+        if not result:
+            return
+
+        jam = result.get(
+            "jam",
+            False,
+        )
+
+        bag_count = result.get(
+            "bag_count",
+            0,
+        )
+
+        minimum_gap_mm = result.get(
+            "minimum_gap_mm"
+        )
+
+        color = (
+            (0, 0, 255)
+            if jam
+            else (255, 0, 255)
+        )
+
+        status = (
+            "JAM"
+            if jam
+            else "NORMAL"
+        )
+
+        if max_bags is not None:
+
+            bags_text = (
+                f"Bags : {bag_count} / {max_bags}"
+            )
+
+        else:
+
+            bags_text = (
+                f"Bags Inside ROI : {bag_count}"
+            )
+
+        # --------------------------------------------------
+        # PANEL BACKGROUND
+        # --------------------------------------------------
+
+        panel_x1 = 10
+        panel_y1 = 385
+        panel_x2 = 320
+        panel_y2 = (
+            460
+            if minimum_gap_mm is not None
+            else 435
+        )
+
+        overlay = frame.copy()
+
+        cv2.rectangle(
+            overlay,
+            (panel_x1, panel_y1),
+            (panel_x2, panel_y2),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.addWeighted(
+            overlay,
+            0.35,
+            frame,
+            0.65,
+            0,
+            frame,
+        )
+
+        cv2.rectangle(
+            frame,
+            (panel_x1, panel_y1),
+            (panel_x2, panel_y2),
+            color,
+            1,
+        )
+
+        cv2.putText(
+            frame,
+            f"ROI OCCUPANCY : {status}",
+            (20, 405),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
+
+        cv2.putText(
+            frame,
+            bags_text,
+            (20, 432),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
+
+        if minimum_gap_mm is not None:
+
+            cv2.putText(
+                frame,
+                f"Minimum Gap : {minimum_gap_mm:.1f} mm",
+                (20, 456),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    # ======================================================
+    # CONDITION C - ROI DISTANCE DRAWING
+    # ======================================================
+
+    @staticmethod
+    def draw_condition_c_distances(
+        frame,
+        condition_c_result,
+    ):
+
+        if not condition_c_result:
+            return
+
+        distances = (
+            condition_c_result.get(
+                "distances",
+                [],
+            )
+            or []
+        )
+
+        if not distances:
+            return
+
+        color = (255, 0, 255)
+
+        for pair in distances:
+
+            if not isinstance(
+                pair,
+                dict,
+            ):
+                continue
+
+            point_a = (
+                pair.get(
+                    "edge_point_a"
+                )
+                or
+                pair.get(
+                    "image_edge_a"
+                )
+            )
+
+            point_b = (
+                pair.get(
+                    "edge_point_b"
+                )
+                or
+                pair.get(
+                    "image_edge_b"
+                )
+            )
+
+            if (
+                point_a is None
+                or
+                point_b is None
+            ):
+                continue
+
+            try:
+
+                point_a = (
+                    int(
+                        point_a[0]
+                    ),
+                    int(
+                        point_a[1]
+                    ),
+                )
+
+                point_b = (
+                    int(
+                        point_b[0]
+                    ),
+                    int(
+                        point_b[1]
+                    ),
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                IndexError,
+            ):
+                continue
+
+            cv2.line(
+                frame,
+                point_a,
+                point_b,
+                color,
+                2,
+            )
+
+            cv2.circle(
+                frame,
+                point_a,
+                5,
+                color,
+                -1,
+            )
+
+            cv2.circle(
+                frame,
+                point_b,
+                5,
+                color,
+                -1,
+            )
+
+            gap_mm = (
+                Visualizer._get_pair_gap_mm(
+                    pair
+                )
+            )
+
+            text = (
+                f"ROI | {gap_mm:.1f} mm"
+                if gap_mm is not None
+                else "ROI"
+            )
+
+            text_x = int(
+                (
+                    point_a[0]
+                    +
+                    point_b[0]
+                )
+                / 2
+            )
+
+            text_y = int(
+                (
+                    point_a[1]
+                    +
+                    point_b[1]
+                )
+                / 2
+            )
+
+            (
+                text_width,
+                text_height,
+            ), baseline = cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                2,
+            )
+
+            label_x = max(
+                text_x
+                -
+                text_width // 2,
+                0,
+            )
+
+            label_y = max(
+                text_y - 8,
+                text_height + 4,
+            )
+
+            cv2.rectangle(
+                frame,
+                (
+                    label_x - 4,
+                    label_y
+                    -
+                    text_height
+                    -
+                    4,
+                ),
+                (
+                    label_x
+                    +
+                    text_width
+                    +
+                    4,
+                    label_y
+                    +
+                    baseline
+                    +
+                    4,
+                ),
+                (0, 0, 0),
+                -1,
+            )
+
+            cv2.putText(
+                frame,
+                text,
+                (
+                    label_x,
+                    label_y,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+    # ======================================================
     # VISUALIZE
     # ======================================================
 
@@ -1852,6 +2213,14 @@ class Visualizer:
         # --------------------------------------------------
 
         final_jam_result=None,
+
+        # ------------------------------------
+        # CONDITION C
+        # ------------------------------------
+
+        condition_c_result=None,
+        condition_c_roi=None,
+        condition_c_max_bags=None,
     ):
 
         # ==================================================
@@ -1938,6 +2307,20 @@ class Visualizer:
             True,
         )
 
+        # ==================================================
+        # CONDITION C DISPLAY SETTINGS
+        # ==================================================
+
+        show_condition_c_status = display_config.get(
+            "show_condition_c_status",
+            True,
+        )
+
+        show_condition_c_lines = display_config.get(
+            "show_condition_c_lines",
+            True,
+        )
+
         counted_bags = (
             counted_bags
             or []
@@ -1970,6 +2353,11 @@ class Visualizer:
 
         final_jam_result = (
             final_jam_result
+            or {}
+        )
+
+        condition_c_result = (
+            condition_c_result
             or {}
         )
 
@@ -2115,6 +2503,24 @@ class Visualizer:
             )
 
         # ==================================================
+        # CONDITION C ROI
+        # ==================================================
+
+        if condition_c_roi:
+
+            self.draw_condition_c_roi(
+
+                frame=frame,
+
+                roi=condition_c_roi,
+
+                jam=condition_c_result.get(
+                    "jam",
+                    False,
+                ),
+            )
+
+        # ==================================================
         # CONDITION A RESULT LOOKUP
         # ==================================================
 
@@ -2177,6 +2583,13 @@ class Visualizer:
 
         if show_boxes:
 
+            condition_c_ids = set(
+                condition_c_result.get(
+                    "track_ids",
+                    [],
+                )
+            )
+
             for bag in bag_tracks:
 
                 bbox = bag.get(
@@ -2189,6 +2602,22 @@ class Visualizer:
                 track_id = bag.get(
                     "track_id"
                 )
+
+                if track_id in condition_c_ids:
+
+                    cv2.rectangle(
+                        frame,
+                        (
+                            int(bbox[0]),
+                            int(bbox[1]),
+                        ),
+                        (
+                            int(bbox[2]),
+                            int(bbox[3]),
+                        ),
+                        (255, 0, 255),
+                        5,
+                    )
 
                 jam_metrics = (
                     jam_lookup.get(
@@ -2235,7 +2664,17 @@ class Visualizer:
 
                 if show_labels:
 
-                    if track_id is not None:
+                    if (
+                        track_id is not None
+                        and
+                        track_id in condition_c_ids
+                    ):
+
+                        label = (
+                            f"ROI ID:{track_id}"
+                        )
+
+                    elif track_id is not None:
 
                         label = (
                             f"Bag ID:{track_id}"
@@ -2409,6 +2848,21 @@ class Visualizer:
             )
 
         # ==================================================
+        # CONDITION C ROI DISTANCE MEASUREMENTS
+        # ==================================================
+
+        if (
+            show_condition_c_lines
+            and
+            condition_c_roi
+        ):
+
+            self.draw_condition_c_distances(
+                frame=frame,
+                condition_c_result=condition_c_result,
+            )
+
+        # ==================================================
         # PRINT STATUS
         # ==================================================
 
@@ -2492,4 +2946,12 @@ class Visualizer:
             self.draw_spacing_status(
                 frame,
                 spacing_result,
+            )
+
+        if show_condition_c_status:
+
+            self.draw_condition_c_status(
+                frame,
+                condition_c_result,
+                max_bags=condition_c_max_bags,
             )

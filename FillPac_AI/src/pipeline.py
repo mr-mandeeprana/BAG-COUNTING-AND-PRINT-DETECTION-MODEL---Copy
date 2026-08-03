@@ -75,6 +75,7 @@ from src.bag_spacing_detector import BagSpacingDetector
 from src.camera import Camera
 from src.counter import Counter
 from src.jam_detector import JamDetector
+from src.roi_occupancy_detector import ROIOccupancyDetector
 from src.print_detector import PrintDetector
 from src.tracker import Tracker
 from src.visualizer import Visualizer
@@ -217,6 +218,14 @@ class Pipeline:
         spacing_config = (
             camera_config.get(
                 "bag_spacing",
+                {},
+            )
+            or {}
+        )
+
+        condition_c_config = (
+            camera_config.get(
+                "condition_c",
                 {},
             )
             or {}
@@ -453,6 +462,43 @@ class Pipeline:
         self.spacing_result = (
             self.bag_spacing_detector._empty_result()
         )
+
+        # ==================================================
+        # CONDITION C - ROI OCCUPANCY JAM
+        # ==================================================
+
+        self.condition_c_detector = (
+            ROIOccupancyDetector(
+                config=condition_c_config,
+            )
+        )
+
+        self.condition_c_enabled = bool(
+            self.condition_c_detector.enabled
+        )
+
+        self.condition_c_roi = dict(
+            self.condition_c_detector.roi
+        )
+
+        self.condition_c_result = {
+
+            "jam": False,
+
+            "status": "normal",
+
+            "bag_count": 0,
+
+            "track_ids": [],
+
+            "minimum_gap_mm": None,
+
+            "distances": [],
+
+            "image_path": None,
+        }
+
+        self.condition_c_start_time = None
 
         # ==================================================
         # FINAL JAM RESULT
@@ -731,6 +777,12 @@ class Pipeline:
                     "spacing_threshold_mm":
                         self.bag_spacing_detector
                         .jam_threshold_mm,
+
+                    "condition_c_enabled":
+                        self.condition_c_enabled,
+
+                    "condition_c_roi":
+                        self.condition_c_roi,
                 },
             )
 
@@ -807,11 +859,65 @@ class Pipeline:
 
                 spacing_jam_track_ids=[],
 
+                # ==========================================
+                # CONDITION C
+                #
+                # ROI Occupancy Detector
+                #
+                # Publishes:
+                # - ROI Bag Count
+                # - Track IDs
+                # - Minimum Gap
+                # - Distances
+                # - ROI Image
+                # - ROI Coordinates
+                # - Max Allowed Bags / Occupancy %
+                # - Jam Timestamp / Duration
+                # ==========================================
+                condition_c_enabled=(
+                    self.condition_c_enabled
+                ),
+
+                condition_c_status=(
+                    "normal"
+                    if self.condition_c_enabled
+                    else "disabled"
+                ),
+
+                condition_c_detected=False,
+
+                condition_c_bag_count=0,
+
+                condition_c_track_ids=[],
+
+                condition_c_minimum_gap_mm=None,
+
+                condition_c_distances=[],
+
+                condition_c_image_path=None,
+
+                condition_c_roi=(
+                    self.condition_c_roi
+                ),
+
+                condition_c_max_allowed_bags=(
+                    self.condition_c_detector
+                    .max_allowed_bags
+                ),
+
+                condition_c_roi_occupancy=0,
+
+                condition_c_timestamp=None,
+
+                condition_c_duration=0,
+
                 # Final combined jam
                 jam_detection_enabled=bool(
                     self.jam_detection_enabled
                     or
                     self.bag_spacing_enabled
+                    or
+                    self.condition_c_enabled
                 ),
 
                 jam_status="normal",
@@ -982,9 +1088,59 @@ class Pipeline:
             )
 
             # ==============================================
+            # CONDITION C
+            # ==============================================
+
+            try:
+
+                self.condition_c_result = (
+                    self.condition_c_detector.process(
+                        frame=frame,
+                        tracks=tracks,
+                        spacing_result=self.spacing_result,
+                        camera_name=self.name,
+                    )
+                )
+
+            except Exception as error:
+
+                self.logger.exception(
+                    f"{self.name}: Condition C failed: {error}"
+                )
+
+                self.condition_c_result = {
+
+                    "jam": False,
+
+                    "status": "normal",
+
+                    "bag_count": 0,
+
+                    "track_ids": [],
+
+                    "minimum_gap_mm": None,
+
+                    "distances": [],
+
+                    "image_path": None,
+                }
+
+            if self.condition_c_result.get("jam", False):
+
+                if self.condition_c_start_time is None:
+
+                    self.condition_c_start_time = (
+                        time.perf_counter()
+                    )
+
+            else:
+
+                self.condition_c_start_time = None
+
+            # ==============================================
             # FINAL JAM
             #
-            # A OR B
+            # A OR B OR C
             # ==============================================
 
             self.final_jam_result = (
@@ -1091,6 +1247,23 @@ class Pipeline:
             return False
 
     # ======================================================
+    # CONDITION C RESULT ACCESSOR
+    # ======================================================
+
+    def _condition_c(
+        self,
+    ):
+
+        return (
+            self.condition_c_result
+            if isinstance(
+                self.condition_c_result,
+                dict,
+            )
+            else {}
+        )
+
+    # ======================================================
     # BUILD FINAL JAM RESULT
     # ======================================================
 
@@ -1116,6 +1289,8 @@ class Pipeline:
             else {}
         )
 
+        condition_c = self._condition_c()
+
         movement_detected = bool(
             movement.get(
                 "jam_detected",
@@ -1137,10 +1312,19 @@ class Pipeline:
             )
         )
 
+        condition_c_detected = bool(
+            condition_c.get(
+                "jam",
+                False,
+            )
+        )
+
         jam_detected = bool(
             movement_detected
             or
             spacing_detected
+            or
+            condition_c_detected
         )
 
         jam_types = []
@@ -1155,6 +1339,12 @@ class Pipeline:
 
             jam_types.append(
                 "bag_spacing"
+            )
+
+        if condition_c_detected:
+
+            jam_types.append(
+                "roi_occupancy"
             )
 
         movement_ids = (
@@ -1173,6 +1363,14 @@ class Pipeline:
             or []
         )
 
+        condition_c_ids = (
+            condition_c.get(
+                "track_ids",
+                [],
+            )
+            or []
+        )
+
         active_ids = sorted(
             {
                 int(track_id)
@@ -1181,6 +1379,8 @@ class Pipeline:
                     list(movement_ids)
                     +
                     list(spacing_ids)
+                    +
+                    list(condition_c_ids)
                 )
                 if track_id is not None
             }
@@ -1198,6 +1398,8 @@ class Pipeline:
             self.jam_detection_enabled
             or
             self.bag_spacing_enabled
+            or
+            self.condition_c_enabled
         ):
 
             status = "normal"
@@ -1254,6 +1456,36 @@ class Pipeline:
                     [],
                 )
                 or [],
+
+            "condition_c_bag_count":
+                condition_c.get(
+                    "bag_count",
+                    0,
+                ),
+
+            "condition_c_track_ids":
+                condition_c.get(
+                    "track_ids",
+                    [],
+                )
+                or [],
+
+            "condition_c_minimum_gap_mm":
+                condition_c.get(
+                    "minimum_gap_mm"
+                ),
+
+            "condition_c_distances":
+                condition_c.get(
+                    "distances",
+                    [],
+                )
+                or [],
+
+            "condition_c_image_path":
+                condition_c.get(
+                    "image_path"
+                ),
         }
 
     # ======================================================
@@ -1694,6 +1926,14 @@ class Pipeline:
             final_jam_result=(
                 self.final_jam_result
             ),
+
+            condition_c_result=(
+                self.condition_c_result
+            ),
+
+            condition_c_roi=(
+                self.condition_c_roi
+            ),
         )
 
     # ======================================================
@@ -1839,6 +2079,40 @@ class Pipeline:
 
             self.logger.warning(
                 f"{self.name}: BagSpacingDetector "
+                "reset failed."
+            )
+
+        # ----------------------------------------------
+        # Reset Condition C result
+        #
+        # ROIOccupancyDetector has no temporal jam state.
+        # ----------------------------------------------
+
+        try:
+
+            self.condition_c_result = {
+
+                "jam": False,
+
+                "status": "normal",
+
+                "bag_count": 0,
+
+                "track_ids": [],
+
+                "minimum_gap_mm": None,
+
+                "distances": [],
+
+                "image_path": None,
+            }
+
+            self.condition_c_start_time = None
+
+        except Exception:
+
+            self.logger.warning(
+                f"{self.name}: ROIOccupancyDetector "
                 "reset failed."
             )
 
@@ -2397,6 +2671,70 @@ class Pipeline:
         )
 
         # ==================================================
+        # CONDITION C
+        #
+        # ROI Occupancy Detector
+        #
+        # Publishes:
+        # - ROI Bag Count
+        # - Track IDs
+        # - Minimum Gap
+        # - Distances
+        # - ROI Image
+        # - ROI Coordinates
+        # - Max Allowed Bags / Occupancy %
+        # - Jam Timestamp / Duration
+        # ==================================================
+
+        condition_c = self._condition_c()
+
+        condition_c_status = (
+            condition_c.get(
+                "status",
+                "normal",
+            )
+            if self.condition_c_enabled
+            else "disabled"
+        )
+
+        condition_c_max_allowed_bags = (
+            self.condition_c_detector.max_allowed_bags
+        )
+
+        condition_c_roi_occupancy = (
+            condition_c.get(
+                "bag_count",
+                0,
+            )
+            /
+            condition_c_max_allowed_bags
+            if condition_c_max_allowed_bags
+            else 0
+        )
+
+        condition_c_timestamp = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+            if condition_c.get(
+                "jam",
+                False,
+            )
+            else None
+        )
+
+        condition_c_duration = (
+            round(
+                time.perf_counter()
+                -
+                self.condition_c_start_time,
+                1,
+            )
+            if self.condition_c_start_time is not None
+            else 0
+        )
+
+        # ==================================================
         # FINAL A OR B
         # ==================================================
 
@@ -2567,6 +2905,90 @@ class Pipeline:
                 ),
 
                 # ==========================================
+                # CONDITION C
+                #
+                # ROI Occupancy Detector
+                #
+                # Publishes:
+                # - ROI Bag Count
+                # - Track IDs
+                # - Minimum Gap
+                # - Distances
+                # - ROI Image
+                # - ROI Coordinates
+                # - Max Allowed Bags / Occupancy %
+                # - Jam Timestamp / Duration
+                # ==========================================
+
+                condition_c_enabled=(
+                    self.condition_c_enabled
+                ),
+
+                condition_c_status=(
+                    condition_c_status
+                ),
+
+                condition_c_detected=(
+                    condition_c.get(
+                        "jam",
+                        False,
+                    )
+                ),
+
+                condition_c_bag_count=(
+                    condition_c.get(
+                        "bag_count",
+                        0,
+                    )
+                ),
+
+                condition_c_track_ids=(
+                    condition_c.get(
+                        "track_ids",
+                        [],
+                    )
+                ),
+
+                condition_c_minimum_gap_mm=(
+                    condition_c.get(
+                        "minimum_gap_mm"
+                    )
+                ),
+
+                condition_c_distances=(
+                    condition_c.get(
+                        "distances",
+                        [],
+                    )
+                ),
+
+                condition_c_image_path=(
+                    condition_c.get(
+                        "image_path"
+                    )
+                ),
+
+                condition_c_roi=(
+                    self.condition_c_roi
+                ),
+
+                condition_c_max_allowed_bags=(
+                    condition_c_max_allowed_bags
+                ),
+
+                condition_c_roi_occupancy=(
+                    condition_c_roi_occupancy
+                ),
+
+                condition_c_timestamp=(
+                    condition_c_timestamp
+                ),
+
+                condition_c_duration=(
+                    condition_c_duration
+                ),
+
+                # ==========================================
                 # FINAL JAM
                 #
                 # Keep existing field names so dashboard
@@ -2577,6 +2999,8 @@ class Pipeline:
                     self.jam_detection_enabled
                     or
                     self.bag_spacing_enabled
+                    or
+                    self.condition_c_enabled
                 ),
 
                 jam_status=(

@@ -80,6 +80,7 @@ update(tracks) returns:
     "minimum_gap_mm": ...,
 
     "pairs": [...],
+    "distances": [...],
     "jam_pairs": [...],
 
     "active_jam_track_ids": [...]
@@ -1242,6 +1243,45 @@ class BagSpacingDetector:
 
             "status":
                 status,
+
+            # ==============================================
+            # STANDARDIZED DISTANCE FIELDS
+            # ==============================================
+
+            "track1":
+                front_track_id,
+
+            "track2":
+                rear_track_id,
+
+            "distance_mm":
+                gap_mm_out,
+
+            "distance_px":
+                round(
+                    abs(
+                        front_edge_px[1]
+                        -
+                        rear_edge_px[1]
+                    ),
+                    2,
+                ),
+
+            # ==============================================
+            # BAG INFORMATION
+            # ==============================================
+
+            "front_bbox":
+                front_bag["bbox"],
+
+            "rear_bbox":
+                rear_bag["bbox"],
+
+            "front_center":
+                front_bag["center"],
+
+            "rear_center":
+                rear_bag["center"],
         }
 
     # ======================================================
@@ -1530,6 +1570,10 @@ class BagSpacingDetector:
             "pairs":
                 pairs,
 
+            # Canonical distance output
+            "distances":
+                pairs,
+
             "jam_pairs":
                 jam_pairs,
 
@@ -1639,6 +1683,9 @@ class BagSpacingDetector:
             # ==============================================
 
             "pairs":
+                [],
+
+            "distances":
                 [],
 
             "jam_pairs":

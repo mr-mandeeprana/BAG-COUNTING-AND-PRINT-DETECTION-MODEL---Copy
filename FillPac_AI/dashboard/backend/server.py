@@ -44,7 +44,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 
 import socketio
 
@@ -77,6 +81,20 @@ COUNT_EVENTS_FILE = (
     PROJECT_ROOT
     / "logs"
     / "count_events.jsonl"
+)
+
+CONDITION_C_IMAGES_DIR = (
+    PROJECT_ROOT
+    / "logs"
+    / "condition_c"
+    / "images"
+)
+
+CONDITION_C_EVENTS_DIR = (
+    PROJECT_ROOT
+    / "logs"
+    / "condition_c"
+    / "events"
 )
 
 
@@ -741,6 +759,66 @@ async def read_count_events():
 
 
 # ==========================================================
+# READ CONDITION C EVENTS
+# ==========================================================
+
+async def read_condition_c_events():
+
+    if not CONDITION_C_EVENTS_DIR.exists():
+        return []
+
+    try:
+
+        files = sorted(
+            CONDITION_C_EVENTS_DIR.glob(
+                "*.json"
+            )
+        )
+
+    except OSError as error:
+
+        logger.warning(
+            "Could not list Condition C "
+            "events: %s",
+            error,
+        )
+
+        return []
+
+    events = []
+
+    for file_path in files:
+
+        try:
+
+            with open(
+                file_path,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                event = json.load(
+                    file
+                )
+
+        except (
+            OSError,
+            json.JSONDecodeError,
+        ):
+            continue
+
+        if not isinstance(
+            event,
+            dict,
+        ):
+            continue
+
+        events.append(event)
+
+    return events
+
+
+# ==========================================================
 # PRINT QUALITY
 # ==========================================================
 
@@ -830,6 +908,30 @@ def calculate_production_rate(
         /
         elapsed_hours,
         2,
+    )
+
+
+# ==========================================================
+# CONDITION C - IMAGE URL
+# ==========================================================
+
+def build_condition_c_image_url(
+    image_path,
+):
+
+    if not image_path:
+        return None
+
+    filename = Path(
+        str(image_path)
+    ).name
+
+    if not filename:
+        return None
+
+    return (
+        "/condition-c/image/"
+        f"{filename}"
     )
 
 
@@ -983,6 +1085,102 @@ def build_camera_production(
             "active_jam_track_ids":
                 active_jam_track_ids,
 
+            # ==============================================
+            # CONDITION C - ROI OCCUPANCY
+            # ==============================================
+
+            "condition_c_enabled":
+                safe_bool(
+                    camera.get(
+                        "condition_c_enabled",
+                        False,
+                    )
+                ),
+
+            "condition_c_detected":
+                safe_bool(
+                    camera.get(
+                        "condition_c_detected",
+                        False,
+                    )
+                ),
+
+            "condition_c_status":
+                camera.get(
+                    "condition_c_status",
+                    "normal",
+                ),
+
+            "condition_c_bag_count":
+                safe_int(
+                    camera.get(
+                        "condition_c_bag_count",
+                        0,
+                    )
+                ),
+
+            "condition_c_track_ids":
+                camera.get(
+                    "condition_c_track_ids",
+                    [],
+                )
+                or [],
+
+            "condition_c_minimum_gap_mm":
+                camera.get(
+                    "condition_c_minimum_gap_mm"
+                ),
+
+            "condition_c_image_path":
+                camera.get(
+                    "condition_c_image_path"
+                ),
+
+            "condition_c_image_exists":
+                bool(
+                    camera.get(
+                        "condition_c_image_path"
+                    )
+                ),
+
+            "condition_c_image_url":
+                build_condition_c_image_url(
+                    camera.get(
+                        "condition_c_image_path"
+                    )
+                ),
+
+            "condition_c_distances":
+                camera.get(
+                    "condition_c_distances",
+                    [],
+                )
+                or [],
+
+            "condition_c_spacing_pairs":
+                camera.get(
+                    "condition_c_spacing_pairs",
+                    [],
+                )
+                or [],
+
+            "condition_c_roi":
+                camera.get(
+                    "condition_c_roi",
+                    {},
+                ),
+
+            "condition_c_timestamp":
+                camera.get(
+                    "condition_c_timestamp"
+                ),
+
+            "condition_c_duration":
+                camera.get(
+                    "condition_c_duration",
+                    0,
+                ),
+
         }
 
     return result
@@ -1014,6 +1212,12 @@ def build_jam_summary(
 
     total_active_jams = 0
 
+    condition_c_jam_camera_count = 0
+
+    condition_c_active_tracks = 0
+
+    condition_c_total_bags = 0
+
     camera_result = {}
 
     for (
@@ -1036,6 +1240,40 @@ def build_jam_summary(
         )
 
         total_active_jams += active_count
+
+        condition_c_detected = safe_bool(
+            camera.get(
+                "condition_c_detected",
+                False,
+            )
+        )
+
+        condition_c_track_ids = (
+            camera.get(
+                "condition_c_track_ids",
+                [],
+            )
+            or []
+        )
+
+        condition_c_bag_count = safe_int(
+            camera.get(
+                "condition_c_bag_count",
+                0,
+            )
+        )
+
+        if condition_c_detected:
+
+            condition_c_jam_camera_count += 1
+
+        condition_c_active_tracks += len(
+            condition_c_track_ids
+        )
+
+        condition_c_total_bags += (
+            condition_c_bag_count
+        )
 
         if status == "jam":
 
@@ -1098,6 +1336,28 @@ def build_jam_summary(
                 )
                 or [],
 
+            "condition_c_enabled":
+                safe_bool(
+                    camera.get(
+                        "condition_c_enabled",
+                        False,
+                    )
+                ),
+
+            "condition_c_detected":
+                condition_c_detected,
+
+            "condition_c_bag_count":
+                condition_c_bag_count,
+
+            "condition_c_track_ids":
+                condition_c_track_ids,
+
+            "condition_c_minimum_gap_mm":
+                camera.get(
+                    "condition_c_minimum_gap_mm"
+                ),
+
             "updated_at":
                 camera.get(
                     "updated_at"
@@ -1130,6 +1390,18 @@ def build_jam_summary(
 
         "active_jams":
             total_active_jams,
+
+        "condition_c_jam_cameras":
+            condition_c_jam_camera_count,
+
+        "condition_c_active_tracks":
+            condition_c_active_tracks,
+
+        "condition_c_total_tracks":
+            condition_c_active_tracks,
+
+        "condition_c_total_bags":
+            condition_c_total_bags,
 
         "cameras":
             camera_result,
@@ -1255,6 +1527,18 @@ def read_safe_config():
                         {},
                     ),
 
+                "bag_spacing":
+                    camera.get(
+                        "bag_spacing",
+                        {},
+                    ),
+
+                "condition_c":
+                    camera.get(
+                        "condition_c",
+                        {},
+                    ),
+
                 "dashboard_publish_interval":
                     camera.get(
                         "dashboard_publish_interval"
@@ -1293,6 +1577,18 @@ def read_safe_config():
         "jam_detection":
             config.get(
                 "jam_detection",
+                {},
+            ),
+
+        "bag_spacing":
+            config.get(
+                "bag_spacing",
+                {},
+            ),
+
+        "condition_c":
+            config.get(
+                "condition_c",
                 {},
             ),
 
@@ -2335,6 +2631,62 @@ async def analytics():
         )
     )
 
+    # ------------------------------------------------------
+    # CONDITION C ANALYTICS
+    #
+    # Each saved event file represents one ROI occupancy
+    # jam capture (ROIOccupancyDetector only saves on jam).
+    # ------------------------------------------------------
+
+    condition_c_events = (
+        await read_condition_c_events()
+    )
+
+    roi_jam_events = len(
+        condition_c_events
+    )
+
+    roi_bag_counts = [
+        safe_int(
+            event.get(
+                "bag_count",
+                0,
+            )
+        )
+        for event in condition_c_events
+    ]
+
+    roi_gap_values = [
+        event.get(
+            "minimum_gap_mm"
+        )
+        for event in condition_c_events
+        if event.get(
+            "minimum_gap_mm"
+        )
+        is not None
+    ]
+
+    average_roi_bag_count = (
+        safe_round(
+            sum(roi_bag_counts)
+            /
+            len(roi_bag_counts)
+        )
+        if roi_bag_counts
+        else 0.0
+    )
+
+    average_roi_gap_mm = (
+        safe_round(
+            sum(roi_gap_values)
+            /
+            len(roi_gap_values)
+        )
+        if roi_gap_values
+        else None
+    )
+
     return {
 
         "total_events":
@@ -2370,6 +2722,19 @@ async def analytics():
 
         "jam":
             jam_summary,
+
+        # ==============================================
+        # CONDITION C ANALYTICS
+        # ==============================================
+
+        "roi_jam_events":
+            roi_jam_events,
+
+        "average_roi_bag_count":
+            average_roi_bag_count,
+
+        "average_roi_gap_mm":
+            average_roi_gap_mm,
 
         "generated_at":
             utc_now_iso(),
@@ -2630,6 +2995,64 @@ async def live_camera(
             "multipart/x-mixed-replace; "
             "boundary=frame"
         ),
+    )
+
+
+# ==========================================================
+# CONDITION C - ROI SNAPSHOT IMAGE
+# ==========================================================
+
+@api.get(
+    "/condition-c/image/{filename}"
+)
+async def condition_c_image(
+    filename: str,
+):
+
+    safe_name = Path(
+        filename
+    ).name
+
+    if not safe_name:
+
+        return JSONResponse(
+
+            status_code=404,
+
+            content={
+                "error":
+                    "Invalid image filename."
+            },
+        )
+
+    file_path = (
+        CONDITION_C_IMAGES_DIR
+        /
+        safe_name
+    )
+
+    if (
+        not file_path.exists()
+        or
+        not file_path.is_file()
+    ):
+
+        return JSONResponse(
+
+            status_code=404,
+
+            content={
+                "error":
+                    "ROI snapshot not found.",
+
+                "filename":
+                    safe_name,
+            },
+        )
+
+    return FileResponse(
+        file_path,
+        media_type="image/jpeg",
     )
 
 

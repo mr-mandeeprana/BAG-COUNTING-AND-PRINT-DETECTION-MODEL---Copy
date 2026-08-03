@@ -199,6 +199,14 @@ class Config:
             or {}
         )
 
+        global_condition_c = deepcopy(
+            data.get(
+                "condition_c",
+                {},
+            )
+            or {}
+        )
+
         global_display = deepcopy(
             data.get(
                 "display",
@@ -522,6 +530,68 @@ class Config:
             camera[
                 "bag_spacing"
             ] = camera_bag_spacing
+
+            # ==============================================
+            # ROI OCCUPANCY JAM - CONDITION C
+            # ==============================================
+
+            cc = camera.get(
+                "condition_c",
+                global_condition_c,
+            )
+
+            if isinstance(
+                cc,
+                bool,
+            ):
+
+                cc = {
+                    "enabled":
+                        cc
+                }
+
+            elif not isinstance(
+                cc,
+                dict,
+            ):
+
+                cc = {}
+
+            camera_condition_c = self._merge_dicts(
+                global_condition_c,
+                cc,
+            )
+
+            global_condition_c_roi = (
+                global_condition_c.get(
+                    "roi",
+                    {},
+                )
+                or {}
+            )
+
+            camera_condition_c_roi = (
+                cc.get(
+                    "roi",
+                    {},
+                )
+                or {}
+            )
+
+            merged_condition_c_roi = self._merge_dicts(
+                global_condition_c_roi,
+                camera_condition_c_roi,
+            )
+
+            camera_condition_c[
+                "roi"
+            ] = self._normalize_roi(
+                merged_condition_c_roi
+            )
+
+            camera[
+                "condition_c"
+            ] = camera_condition_c
 
             # ==============================================
             # DISPLAY
@@ -953,6 +1023,39 @@ class Config:
                 self._validate_bag_spacing_config(
                     camera_name,
                     bag_spacing,
+                )
+
+            # ==============================================
+            # ROI OCCUPANCY JAM - CONDITION C
+            # ==============================================
+
+            condition_c = camera.get(
+                "condition_c",
+                {},
+            )
+
+            if not isinstance(
+                condition_c,
+                dict,
+            ):
+
+                raise ValueError(
+                    f"{camera_name}: "
+                    "condition_c must be a dictionary."
+                )
+
+            condition_c_enabled = bool(
+                condition_c.get(
+                    "enabled",
+                    False,
+                )
+            )
+
+            if condition_c_enabled:
+
+                self._validate_condition_c_config(
+                    camera_name,
+                    condition_c,
                 )
 
     # ======================================================
@@ -1637,4 +1740,112 @@ class Config:
                 f"{camera_name}: "
                 "bag_spacing world calibration "
                 "points must be unique."
+            )
+
+    # ======================================================
+    # ROI OCCUPANCY VALIDATION - CONDITION C
+    # ======================================================
+
+    @staticmethod
+    def _validate_condition_c_config(
+        camera_name,
+        config,
+    ) -> None:
+
+        try:
+
+            max_allowed_bags = int(
+                config.get(
+                    "max_allowed_bags",
+                    1,
+                )
+            )
+
+            min_track_age = int(
+                config.get(
+                    "min_track_age",
+                    4,
+                )
+            )
+
+            cooldown = float(
+                config.get(
+                    "capture_cooldown_seconds",
+                    5,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+
+            raise ValueError(
+                f"{camera_name}: invalid condition_c configuration."
+            ) from error
+
+        if max_allowed_bags < 1:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c max_allowed_bags must be >= 1."
+            )
+
+        if min_track_age < 1:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c min_track_age must be >= 1."
+            )
+
+        if cooldown < 0:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c capture_cooldown_seconds must be >= 0."
+            )
+
+        roi = config.get(
+            "roi",
+            {},
+        )
+
+        if not isinstance(
+            roi,
+            dict,
+        ):
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c ROI must be a dictionary."
+            )
+
+        x1 = Config._safe_int(
+            roi.get("x1", 0)
+        )
+
+        y1 = Config._safe_int(
+            roi.get("y1", 0)
+        )
+
+        x2 = Config._safe_int(
+            roi.get("x2", 0)
+        )
+
+        y2 = Config._safe_int(
+            roi.get("y2", 0)
+        )
+
+        if x1 == x2:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c ROI width cannot be zero."
+            )
+
+        if y1 == y2:
+
+            raise ValueError(
+                f"{camera_name}: "
+                "condition_c ROI height cannot be zero."
             )

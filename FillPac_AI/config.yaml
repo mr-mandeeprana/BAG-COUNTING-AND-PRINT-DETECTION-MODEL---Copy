@@ -300,6 +300,65 @@ bag_spacing:
       - [0, 2000]     # P4
 
 # ==========================================================
+# ROI OCCUPANCY JAM DETECTION - CONDITION C
+# ==========================================================
+#
+# Purpose:
+# Detect bag accumulation inside a predefined ROI.
+#
+# Decision:
+#
+# bag_count_in_roi > max_allowed_bags
+#            -> CONDITION C JAM
+#
+# When triggered:
+#   • Save ROI image
+#   • Save jam log
+#   • Save distances between bags
+#
+# Final Jam:
+#
+# Condition A OR
+# Condition B OR
+# Condition C
+#
+# ==========================================================
+
+condition_c:
+
+  enabled: true
+
+  roi:
+
+    x1: 0
+    y1: 150
+    x2: 477
+    y2: 500
+
+  # Maximum bags allowed inside ROI
+  max_allowed_bags: 1
+
+  # Ignore unstable tracks
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  # Save evidence
+  save_roi_image: true
+
+  save_full_frame: false
+
+  save_logs: true
+
+  save_distances: true
+
+  capture_cooldown_seconds: 1
+
+  image_directory: logs/roi_images
+
+  log_directory: logs/jam_events      
+# ==========================================================
 # CAMERAS
 # ==========================================================
 
@@ -313,10 +372,10 @@ cameras:
   - id: 1
     name: Camera 1
 
-    enabled: false
+    enabled: true
 
-    mode: rtsp
-    source: "rtsp://mandeep:123456@192.0.0.2:1945/"
+    mode: video
+    source: "data/videos/camera 1.mp4"
 
     buffer_size: 1
 
@@ -669,9 +728,9 @@ cameras:
   # ========================================================
 
   - id: 4
-    name: Camera 4s
+    name: Camera 4
 
-    enabled: true
+    enabled: false
 
     mode: video
     source: "data/videos/camera 4.mp4"
