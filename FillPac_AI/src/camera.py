@@ -73,14 +73,13 @@ import cv2
 # This environment variable should be configured before
 # creating the RTSP VideoCapture object.
 
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    (
-        "rtsp_transport;tcp|"
-        "fflags;nobuffer|"
-        "flags;low_delay|"
-        "max_delay;0"
-    ),
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|"
+    "fflags;nobuffer|"
+    "flags;low_delay|"
+    "flush_packets;1|"
+    "max_delay;0|"
+    "reorder_queue_size;0"
 )
 
 
@@ -235,6 +234,11 @@ class Camera:
                 f"({self.mode})...",
             )
 
+            self._log(
+                "info",
+                f"{self.name}: Opening RTSP source: {self.source}"
+            )
+
             if not self._open_capture():
 
                 self.connected = False
@@ -285,13 +289,21 @@ class Camera:
             # RTSP
             # ------------------------------------------------
 
+            self._log(
+                "info",
+                f"{self.name}: Creating VideoCapture (backend=FFMPEG)"
+            )
             if self.mode == "rtsp":
 
                 self.cap = cv2.VideoCapture(
-                    self.source,
+                    self.source,    
                     cv2.CAP_FFMPEG,
                 )
-
+                self._log(
+                    "info",
+                    f"{self.name}: VideoCapture object created"
+                )
+            
             # ------------------------------------------------
             # VIDEO / USB CAMERA
             # ------------------------------------------------
@@ -497,8 +509,24 @@ class Camera:
 
                     else:
 
+                        start = time.perf_counter()
+
+                        # Drop stale buffered frames
+                        for _ in range(2):
+                            self.cap.grab()
+
                         success, frame = (
-                            self.cap.read()
+                            self.cap.retrieve()
+                        )
+
+                        elapsed = (
+                            time.perf_counter() - start
+                        ) * 1000
+
+                        self._log(
+                            "debug",
+                            f"{self.name}: Frame read took "
+                            f"{elapsed:.1f} ms",
                         )
 
             except Exception as error:
@@ -536,7 +564,7 @@ class Camera:
                     self._latest_frame = frame
 
                     self._latest_frame_time = (
-                        time.monotonic()
+                        time.time()
                     )
 
                     self._frame_sequence += 1
@@ -742,6 +770,17 @@ class Camera:
                         self._latest_frame.copy()
                     )
 
+                    age = (
+                        time.time()
+                        - self._latest_frame_time
+                    )
+
+                    self._log(
+                        "debug",
+                        f"{self.name}: Frame age "
+                        f"{age:.3f} sec",
+                    )
+
                     sequence = (
                         self._frame_sequence
                     )
@@ -798,7 +837,7 @@ class Camera:
 
         return max(
             0.0,
-            time.monotonic()
+            time.time()
             -
             timestamp,
         )
