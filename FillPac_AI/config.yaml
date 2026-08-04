@@ -52,7 +52,12 @@ tracker:
   track_buffer: 60
   match_thresh: 0.85
 
-  frame_rate: 30
+  # Matched to the camera's actual FPS (see camera logs:
+  # "connected (1280x720, 25.00 FPS)"). ByteTrack uses this
+  # to convert track_buffer (in frames) into real seconds --
+  # at 30 it assumed 60 frames = 2.0s; at the true 25fps that
+  # window is actually 2.4s.
+  frame_rate: 25
   minimum_consecutive_frames: 1
 
   min_track_age: 4
@@ -372,7 +377,7 @@ cameras:
   - id: 1
     name: Camera 1
 
-    enabled: false
+    enabled: true
 
     mode: rtsp
     source: "rtsp://beumer:Beumer!123@172.20.45.131:554/video/live?channel=1&subtype=1"
@@ -492,7 +497,7 @@ cameras:
   - id: 2
     name: Camera 2
 
-    enabled: true
+    enabled: false
 
     mode: video
     source: "data/videos/camera 2.mp4"

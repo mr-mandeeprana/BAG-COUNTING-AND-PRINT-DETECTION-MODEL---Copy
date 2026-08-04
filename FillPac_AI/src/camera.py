@@ -32,26 +32,68 @@ VIDEO FILE:
 
 RTSP / CAMERA:
 
-    Camera Stream
-         |
-         v
-    Capture Thread
-         |
-         v
-    Latest Frame Only
-         |
-         v
-    Pipeline / YOLO
+                       Camera Stream
+                            |
+                            v
+                     Capture Thread
+                     (reads every frame,
+                      no frames skipped
+                      at decode time)
+                            |
+              +-------------+-------------+
+              |                           |
+              v                           v
+      Latest Frame Only            Display FIFO Queue
+      (get_latest_frame() /        (read_display_frame())
+       read())                            |
+              |                           v
+              v                     Your display loop:
+      Your AI / YOLO thread:        shows every frame in
+      always grabs the newest       order, so motion looks
+      frame; if it falls behind     smooth (VLC-like) even
+      the camera, it skips ahead    if the AI thread is
+      instead of queuing up.        slower than the camera.
 
-Old frames are overwritten automatically.
+Two independent consumers, one capture thread:
 
-This prevents frame queues from creating increasing
-latency when inference FPS is lower than camera FPS.
+- AI / inference consumers should call read() or
+  get_latest_frame(). These intentionally drop old frames
+  so processing never falls further and further behind the
+  live camera.
+
+- A display consumer should run in its own thread and call
+  read_display_frame() in a loop. It pulls frames from a
+  small FIFO queue in capture order, so nothing is skipped
+  for the human watching the feed. If the display loop falls
+  behind, the oldest queued frame is dropped to bound memory
+  rather than growing without limit or blocking capture.
+
+Example wiring:
+
+    camera = Camera("line1", rtsp_url, mode="rtsp")
+    camera.connect()
+
+    def display_loop():
+        while running:
+            ok, frame = camera.read_display_frame(timeout=1.0)
+            if ok:
+                cv2.imshow("line1", frame)
+                cv2.waitKey(1)
+
+    def ai_loop():
+        while running:
+            ok, frame = camera.read()
+            if ok:
+                run_yolo(frame)
+
+    threading.Thread(target=display_loop, daemon=True).start()
+    threading.Thread(target=ai_loop, daemon=True).start()
 
 ============================================================
 """
 
 import os
+import queue
 import threading
 import time
 from typing import Union
@@ -77,9 +119,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|"
     "fflags;nobuffer|"
     "flags;low_delay|"
-    "flush_packets;1|"
-    "max_delay;0|"
-    "reorder_queue_size;0"
+    "max_delay;0"
 )
 
 
@@ -196,6 +236,27 @@ class Camera:
         self._last_read_sequence = -1
 
         # ==================================================
+        # DISPLAY FRAME QUEUE
+        #
+        # Separate from _latest_frame.
+        #
+        # _latest_frame is "latest only" (AI consumers skip
+        # ahead and drop old frames on purpose).
+        #
+        # This queue is FIFO and bounded, so a dedicated
+        # display loop can drain it and show every frame the
+        # camera produced, in order, for smooth motion.
+        #
+        # If a display consumer falls behind, the oldest
+        # queued frame is dropped to bound memory use rather
+        # than growing without limit.
+        # ==================================================
+
+        self._display_queue = queue.Queue(
+            maxsize=5
+        )
+
+        # ==================================================
         # CAPTURE THREAD
         # ==================================================
 
@@ -293,6 +354,9 @@ class Camera:
                 "info",
                 f"{self.name}: Creating VideoCapture (backend=FFMPEG)"
             )
+
+            t0 = time.perf_counter()
+
             if self.mode == "rtsp":
 
                 self.cap = cv2.VideoCapture(
@@ -312,6 +376,20 @@ class Camera:
 
                 self.cap = cv2.VideoCapture(
                     self.source
+                )
+
+            self._log(
+                "info",
+                f"{self.name}: Open took "
+                f"{(time.perf_counter() - t0):.3f}s",
+            )
+
+            if self.cap is not None:
+
+                self._log(
+                    "info",
+                    f"{self.name}: Backend="
+                    f"{self.cap.getBackendName()}",
                 )
 
         except Exception as error:
@@ -371,6 +449,26 @@ class Camera:
             )
 
         # --------------------------------------------------
+        # RGB CONVERSION
+        #
+        # Explicitly keep BGR conversion on. Setting this
+        # to 0 returns the decoder's native pixel format
+        # (often YUV), which shows up as grayscale/incorrect
+        # colors depending on the FFmpeg/OpenCV build.
+        # --------------------------------------------------
+
+        try:
+
+            self.cap.set(
+                cv2.CAP_PROP_CONVERT_RGB,
+                1,
+            )
+
+        except Exception:
+
+            pass
+
+        # --------------------------------------------------
         # OPEN TIMEOUT
         # --------------------------------------------------
 
@@ -403,7 +501,7 @@ class Camera:
 
                 self.cap.set(
                     cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    5000,
+                    1000,
                 )
 
             except Exception:
@@ -511,12 +609,13 @@ class Camera:
 
                         start = time.perf_counter()
 
-                        # Drop stale buffered frames
-                        for _ in range(2):
-                            self.cap.grab()
-
+                        # Read every frame. Do not skip
+                        # ahead with grab(); CAP_PROP_BUFFERSIZE
+                        # is already set to 1 above, so this
+                        # does not build up latency the way an
+                        # unbounded internal buffer would.
                         success, frame = (
-                            self.cap.retrieve()
+                            self.cap.read()
                         )
 
                         elapsed = (
@@ -568,6 +667,48 @@ class Camera:
                     )
 
                     self._frame_sequence += 1
+
+                self._log(
+                    "debug",
+                    f"{self.name}: Latest frame timestamp "
+                    f"{self._latest_frame_time}",
+                )
+
+                # ----------------------------------------
+                # DISPLAY QUEUE
+                #
+                # FIFO, separate from _latest_frame, so a
+                # display loop can show every frame in order.
+                # If the display consumer is behind, drop the
+                # oldest queued frame rather than growing
+                # unbounded or blocking the capture thread.
+                # ----------------------------------------
+
+                try:
+
+                    self._display_queue.put_nowait(
+                        frame.copy()
+                    )
+
+                except queue.Full:
+
+                    try:
+
+                        self._display_queue.get_nowait()
+
+                    except queue.Empty:
+
+                        pass
+
+                    try:
+
+                        self._display_queue.put_nowait(
+                            frame.copy()
+                        )
+
+                    except queue.Full:
+
+                        pass
 
                 continue
 
@@ -746,7 +887,7 @@ class Camera:
         # Wait briefly for the first frame after connection.
         deadline = (
             time.monotonic()
-            + 1.0
+            + 0.2
         )
 
         while (
@@ -804,6 +945,81 @@ class Camera:
         )
 
     # ======================================================
+    # READ DISPLAY FRAME
+    # ======================================================
+
+    def read_display_frame(
+        self,
+        timeout: float = 1.0,
+        target_size=None,
+    ):
+
+        """
+        Blocking read for a dedicated DISPLAY thread.
+
+        Unlike read() / get_latest_frame(), which always
+        return the newest frame and intentionally drop older
+        ones (so an AI pipeline never falls behind), this pulls
+        frames from a small FIFO queue in the order they were
+        captured. A loop that only calls this method sees every
+        frame the camera produced and stays smooth, the way
+        VLC would look.
+
+        Meant to be called from its own thread, separate from
+        whatever thread calls read() / get_latest_frame() for
+        AI processing. The two consumers do not interfere with
+        each other.
+
+        RTSP / camera modes only. For "video" mode, use read()
+        for both, since file playback is already synchronous.
+
+        target_size: optional (width, height) tuple. If given,
+        the frame is resized here before being returned. Useful
+        for a browser/JPEG streaming endpoint, which typically
+        doesn't need the camera's full decode resolution (e.g.
+        a 2560x1440 source encoded for a small dashboard tile).
+        Resizing here means the caller doesn't need its own
+        cv2.resize() step before cv2.imencode().
+        """
+
+        if self.mode == "video":
+
+            success, frame = self.read()
+
+        else:
+
+            try:
+
+                frame = self._display_queue.get(
+                    timeout=timeout
+                )
+
+                success = True
+
+            except queue.Empty:
+
+                success = False
+
+                frame = None
+
+        if (
+            success
+            and frame is not None
+            and target_size is not None
+        ):
+
+            frame = cv2.resize(
+                frame,
+                target_size,
+                interpolation=cv2.INTER_AREA,
+            )
+
+        return (
+            success,
+            frame,
+        )
+
+    # ======================================================
     # GET LATEST FRAME
     # ======================================================
 
@@ -857,6 +1073,16 @@ class Camera:
             self._frame_sequence = 0
 
             self._last_read_sequence = -1
+
+        while True:
+
+            try:
+
+                self._display_queue.get_nowait()
+
+            except queue.Empty:
+
+                break
 
     # ======================================================
     # BACKGROUND RECONNECT
