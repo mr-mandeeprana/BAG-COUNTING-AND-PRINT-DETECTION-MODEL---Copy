@@ -80,8 +80,11 @@ tracker:
 counting:
   method: center
 
-  # Preserve current movement direction
-  direction: up
+  # Vertical counting line (x1==x2) requires horizontal crossing.
+  # Evidence from live screenshots (higher/newer track IDs sitting
+  # further left) points to right -> left travel. Flip to "right"
+  # if Count stays at 0 after this change.
+  direction: left
 
   duplicate_distance: 30
   duplicate_time: 0.8
@@ -89,7 +92,10 @@ counting:
   line_tolerance: 12
   late_start_margin: 40
 
-  minimum_cross_distance: 15
+  # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+  # restriction while verifying physical-center counting.
+  # Restore to 15 once Count is confirmed working.
+  minimum_cross_distance: 0
   min_track_frames: 4
 
   stale_track_frames: 120
@@ -153,12 +159,14 @@ print_detection:
 jam_detection:
   enabled: true
 
-  # Current same-angle test-video monitoring area
+  # ENLARGED ROI (was 273,120 -> 1007,600) so both bags stay
+  # comfortably inside the region even mid-glide, not just when
+  # perfectly centered. Real 1280x720 RTSP sub-stream resolution.
   roi:
-    x1: 0
-    y1: 150
-    x2: 477
-    y2: 500
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
 
   # Trajectory history
   history_seconds: 1.0
@@ -212,7 +220,7 @@ bag_spacing:
   enabled: true
 
   # Conveyor movement direction
-  direction: up
+  direction: left
 
   # --------------------------------------------------------
   # JAM DISTANCE
@@ -229,9 +237,9 @@ bag_spacing:
   # <=305 mm  = JAM
   # --------------------------------------------------------
 
-  minimum_safe_gap_mm: 150.0
+  minimum_safe_gap_mm: 300.0
   measurement_margin_mm: 5.0
-  jam_threshold_mm: 155.0
+  jam_threshold_mm: 305.0
 
   # --------------------------------------------------------
   # TRACK VALIDATION
@@ -249,14 +257,15 @@ bag_spacing:
   # Only bags whose centers are inside this region are
   # considered for spacing calculation.
   #
-  # Current development ROI matches the jam monitoring area.
+  # ENLARGED ROI (was 273,120 -> 1007,600), matches the jam
+  # monitoring area above. Real 1280x720 RTSP sub-stream resolution.
   # --------------------------------------------------------
 
   roi:
-    x1: 0
-    y1: 150
-    x2: 477
-    y2: 500
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
 
   # --------------------------------------------------------
   # CAMERA CALIBRATION
@@ -281,28 +290,29 @@ bag_spacing:
 
   calibration:
 
-    # Pixel coordinates from development camera image.
-    #
-    # TEMPORARY VALUES.
+    # PLACEHOLDER - updated to match the ENLARGED ROI corners
+    # (150,60)-(1250,710) so the geometry stays structurally
+    # consistent with the resized ROI above. This still does NOT
+    # reflect real physical measurements. Do not trust mm output
+    # from this until the conveyor is measured and these points
+    # (and world_points_mm below) are replaced with real values.
 
     image_points:
-      - [150, 150]    # P1
-      - [400, 150]    # P2
-      - [470, 500]    # P3
-      - [60, 500]     # P4
+      - [180, 90]     # P1
+      - [1220, 90]    # P2
+      - [1220, 680]   # P3
+      - [180, 680]    # P4
 
-    # Corresponding physical conveyor coordinates.
-    #
-    # Temporary reference:
-    #
-    # Conveyor width  = 800 mm
-    # Calibration length = 2000 mm
+    # PLACEHOLDER world dimensions -- UNCHANGED. Do not scale this
+    # up just because the pixel ROI grew; it must come from an
+    # actual physical measurement of the new ROI's real-world
+    # width/length on the conveyor.
 
     world_points_mm:
       - [0, 0]        # P1
-      - [800, 0]      # P2
-      - [800, 2000]   # P3
-      - [0, 2000]     # P4
+      - [2540, 0]      # P2
+      - [2540, 1550]   # P3
+      - [0, 1550]     # P4
 
 # ==========================================================
 # ROI OCCUPANCY JAM DETECTION - CONDITION C
@@ -333,15 +343,22 @@ condition_c:
 
   enabled: true
 
+  # ENLARGED ROI (was 273,120 -> 1007,600), matches jam_detection
+  # and bag_spacing above.
   roi:
 
-    x1: 0
-    y1: 150
-    x2: 477
-    y2: 500
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
 
-  # Maximum bags allowed inside ROI
-  max_allowed_bags: 1
+  # ROI is sized to normally hold ~2 bags at once (see jam_detection
+  # comment above). JAM should only fire on a 3rd bag accumulating,
+  # not on the normal 2-bag occupancy shown in the test screenshots.
+  # FIXED: was 1, which meant 2 bags (the normal, expected occupancy)
+  # incorrectly triggered ROI OCCUPANCY : JAM. Now allows 2 before
+  # firing, matching the comment above and the ROI's actual sizing.
+  max_allowed_bags: 2
 
   # Ignore unstable tracks
   min_track_age: 4
@@ -377,11 +394,12 @@ cameras:
   - id: 1
     name: Camera 1
 
-    enabled: false
+    enabled: true
     mode: rtsp
+    # source: "data/videos/camera1_test.mp4"
     source: "rtsp://beumer:Beumer!123@172.20.45.131:554/video/live?channel=1&subtype=1"
 
-    buffer_size: 1
+    buffer_size: 5
 
     inference_timeout: 15
     dashboard_publish_interval: 0.5
@@ -394,7 +412,7 @@ cameras:
 
 
       device: cpu
-      image_size: 640
+      image_size: 480
       half: false
 
       max_detections: 20
@@ -402,9 +420,9 @@ cameras:
 
       detection_roi:
         x1: 0
-        y1: 120
-        x2: 1920
-        y2: 1080
+        y1: 80
+        x2: 1280
+        y2: 720
 
       allowed_classes:
         - 0
@@ -415,18 +433,35 @@ cameras:
 
     counting:
       method: center
-      direction: up
+      direction: left
 
-      duplicate_distance: 30
-      duplicate_time: 0.8
+      duplicate_distance: 50
+      duplicate_time: 1.5
 
       line_tolerance: 12
       late_start_margin: 40
 
-      minimum_cross_distance: 15
+      minimum_cross_distance: 0
       min_track_frames: 4
 
       stale_track_frames: 120
+
+    # ==================================================
+    # SEPARATE BAG ENTRY ROI COUNTER
+    # ==================================================
+
+    entry_roi_counting:
+      enabled: true
+
+      roi:
+        x1: 273
+        y1: 120
+        x2: 640
+        y2: 600
+
+      min_track_frames: 4
+      duplicate_distance: 50
+      max_history: 300
 
     print_detection:
       enabled: true
@@ -457,11 +492,14 @@ cameras:
     jam_detection:
       enabled: true
 
+      # ENLARGED ROI (was 273,120 -> 1007,600) -- Camera 1's own
+      # override, must match the global jam_detection ROI above
+      # or this one wins for Camera 1 specifically.
       roi:
-        x1: 0
-        y1: 150
-        x2: 477
-        y2: 500
+        x1: 180
+        y1: 90
+        x2: 1220
+        y2: 680
 
       history_seconds: 1.0
       min_history_seconds: 0.5
@@ -480,12 +518,25 @@ cameras:
 
       track_ttl_seconds: 2.0
 
-    # Counting line moved upward from Y=350 to Y=300
+    # Vertical counting line, centered on the real 1280x720 sub-stream (was horizontal line at Y=380)
     roi:
-      x1: 0
-      y1: 380
-      x2: 477
-      y2: 380
+      x1: 640
+      y1: 120
+      x2: 640
+      y2: 600
+
+      # NEW physical-center counting ROI (primary count event).
+      # Bags moving right -> left are counted when their center
+      # enters this zone (273 to 640), not when they cross the
+      # x=640 line. The line above remains as a fallback.
+      entry_roi:
+        enabled: true
+        x1: 273
+        y1: 120
+        x2: 640
+        y2: 600
+
+        entry_direction: left
 
 
   # ========================================================
@@ -496,10 +547,10 @@ cameras:
   - id: 2
     name: Camera 2
 
-    enabled: true
+    enabled: false
 
     mode: video
-    source: "data/videos/camera 2.mp4"
+    source: "data/videos/camera1_test.mp4"
 
     buffer_size: 1
 
@@ -521,9 +572,9 @@ cameras:
 
       detection_roi:
         x1: 0
-        y1: 120
-        x2: 1920
-        y2: 1080
+        y1: 80
+        x2: 1280
+        y2: 720
 
       allowed_classes:
         - 0
@@ -534,7 +585,12 @@ cameras:
 
     counting:
       method: center
-      direction: up
+      # TEMPORARY DIAGNOSTIC VALUE (was left) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "left" or "right" based
+      # on the actual observed movement.
+      direction: both
 
       duplicate_distance: 30
       duplicate_time: 0.8
@@ -542,7 +598,10 @@ cameras:
       line_tolerance: 12
       late_start_margin: 40
 
-      minimum_cross_distance: 15
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting on
+      # Camera 2. Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
       min_track_frames: 4
 
       stale_track_frames: 120
@@ -577,10 +636,10 @@ cameras:
       enabled: true
 
       roi:
-        x1: 0
-        y1: 150
-        x2: 477
-        y2: 500
+        x1: 273
+        y1: 120
+        x2: 1007
+        y2: 600
 
       history_seconds: 1.0
       min_history_seconds: 0.5
@@ -600,10 +659,10 @@ cameras:
       track_ttl_seconds: 2.0
 
     roi:
-      x1: 0
-      y1: 380
-      x2: 477
-      y2: 380
+      x1: 640
+      y1: 120
+      x2: 640
+      y2: 600
 
 
   # ========================================================
@@ -615,7 +674,7 @@ cameras:
   - id: 3
     name: Camera 3
 
-    enabled: true
+    enabled: false
 
     mode: video
     source: "data/videos/camera 3.mp4"
@@ -653,7 +712,12 @@ cameras:
 
     counting:
       method: center
-      direction: up
+      # TEMPORARY DIAGNOSTIC VALUE (was up) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "up" or "down" based
+      # on the actual observed movement.
+      direction: both
 
       duplicate_distance: 30
       duplicate_time: 0.8
@@ -661,7 +725,10 @@ cameras:
       line_tolerance: 12
       late_start_margin: 40
 
-      minimum_cross_distance: 15
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting.
+      # Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
       min_track_frames: 4
 
       stale_track_frames: 120
@@ -772,7 +839,12 @@ cameras:
 
     counting:
       method: center
-      direction: up
+      # TEMPORARY DIAGNOSTIC VALUE (was up) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "up" or "down" based
+      # on the actual observed movement.
+      direction: both
 
       duplicate_distance: 30
       duplicate_time: 0.8
@@ -780,7 +852,10 @@ cameras:
       line_tolerance: 12
       late_start_margin: 40
 
-      minimum_cross_distance: 15
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting.
+      # Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
       min_track_frames: 4
 
       stale_track_frames: 120

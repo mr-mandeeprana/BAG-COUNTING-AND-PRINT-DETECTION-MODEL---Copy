@@ -293,6 +293,38 @@ class Visualizer:
         )
 
     # ======================================================
+    # BAG COUNTING ENTRY ROI
+    #
+    # Draws the rectangular ROI used for physical-center
+    # bag-entry counting (the primary count event in
+    # counter.py). Purely visual -- the actual +1 decision
+    # is made in Counter, not here.
+    # ======================================================
+
+    @staticmethod
+    def draw_counting_entry_roi(
+        frame,
+        roi,
+        enabled=True,
+    ):
+        """
+        Draw rectangular ROI used for physical-center
+        bag-entry counting.
+        """
+
+        if not enabled or not roi:
+            return
+
+        Visualizer._draw_rectangular_roi(
+            frame=frame,
+            roi=roi,
+            color=(0, 255, 255),
+            title="BAG COUNTING ENTRY ROI",
+            fill_alpha=0.06,
+            thickness=3,
+        )
+
+    # ======================================================
     # GENERIC RECTANGULAR ROI
     # ======================================================
 
@@ -640,26 +672,37 @@ class Visualizer:
     def draw_count_summary(
         frame,
         count,
+        entry_roi_count,
         printed_count,
         missing_count,
     ):
 
         cv2.putText(
             frame,
-            f"Count : {count}",
+            f"Line Count : {count}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.8,
             (0, 255, 0),
             2,
         )
 
         cv2.putText(
             frame,
-            f"Printed : {printed_count}",
-            (20, 80),
+            f"Entry ROI Count : {entry_roi_count}",
+            (20, 75),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
+            (0, 255, 255),
+            2,
+        )
+
+        cv2.putText(
+            frame,
+            f"Printed : {printed_count}",
+            (20, 110),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
             (255, 200, 0),
             2,
         )
@@ -667,9 +710,9 @@ class Visualizer:
         cv2.putText(
             frame,
             f"Not Printed : {missing_count}",
-            (20, 115),
+            (20, 145),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (0, 0, 255),
             2,
         )
@@ -2184,6 +2227,7 @@ class Visualizer:
         frame,
         camera_name,
         count,
+        entry_roi_count,
         printed_count,
         missing_count,
         fps,
@@ -2193,6 +2237,7 @@ class Visualizer:
         print_results,
         display_config,
         counted_bags=None,
+        counting_entry_roi=None,
 
         # --------------------------------------------------
         # CONDITION A
@@ -2451,6 +2496,21 @@ class Visualizer:
                     frame,
                     roi,
                 )
+
+        # ==================================================
+        # BAG COUNTING ENTRY ROI
+        # ==================================================
+
+        if (
+            show_roi
+            and counting_entry_roi
+        ):
+
+            self.draw_counting_entry_roi(
+                frame=frame,
+                roi=counting_entry_roi,
+                enabled=True,
+            )
 
         # ==================================================
         # CONDITION A ROI
@@ -2892,6 +2952,7 @@ class Visualizer:
             self.draw_count_summary(
                 frame,
                 count,
+                entry_roi_count,
                 printed_count,
                 missing_count,
             )

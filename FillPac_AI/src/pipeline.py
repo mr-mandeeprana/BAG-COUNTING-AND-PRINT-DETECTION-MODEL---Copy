@@ -74,6 +74,7 @@ import cv2
 from src.bag_spacing_detector import BagSpacingDetector
 from src.camera import Camera
 from src.counter import Counter
+from src.entry_roi_counter import EntryROICounter
 from src.jam_detector import JamDetector
 from src.roi_occupancy_detector import ROIOccupancyDetector
 from src.print_detector import PrintDetector
@@ -149,6 +150,9 @@ class Pipeline:
         self.last_count = 0
         self.last_print_status = None
 
+        # Separate ROI-entry count
+        self.entry_roi_count = 0
+
         self.printed_count = 0
         self.missing_count = 0
 
@@ -194,6 +198,18 @@ class Pipeline:
         counting_config = (
             camera_config.get(
                 "counting",
+                {},
+            )
+            or {}
+        )
+
+        # ==================================================
+        # ENTRY ROI COUNTING CONFIGURATION
+        # ==================================================
+
+        entry_roi_counting_config = (
+            camera_config.get(
+                "entry_roi_counting",
                 {},
             )
             or {}
@@ -284,36 +300,38 @@ class Pipeline:
         # COUNTER
         # ==================================================
 
-        if isinstance(self.roi, dict):
+        counting_roi = camera_config.get(
+            "roi"
+        )
 
-            if self.roi.get("y") is not None:
-                counting_line_y = self.roi["y"]
-
-            elif self.roi.get("roi_y") is not None:
-                counting_line_y = self.roi["roi_y"]
-
-            elif self.roi.get("y1") is not None:
-                counting_line_y = self.roi["y1"]
-
-            elif self.roi.get("y2") is not None:
-                counting_line_y = self.roi["y2"]
-
-            else:
-                counting_line_y = None
-
-        else:
-            counting_line_y = self.roi
-
-        if counting_line_y is None:
-
+        if not isinstance(counting_roi, dict):
             raise ValueError(
-                f"{self.name}: counting ROI Y coordinate "
-                f"is missing. ROI={self.roi}"
+                f"{self.name}: counting ROI must be a "
+                f"dictionary with x1,y1,x2,y2. "
+                f"Got: {counting_roi}"
+            )
+
+        required_roi_keys = {
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+        }
+
+        missing_keys = (
+            required_roi_keys
+            - set(counting_roi.keys())
+        )
+
+        if missing_keys:
+            raise ValueError(
+                f"{self.name}: counting ROI is missing "
+                f"{sorted(missing_keys)}"
             )
 
         self.counter = Counter(
 
-            roi_y=int(counting_line_y),
+            roi=counting_roi,
 
             direction=counting_config.get(
                 "direction",
@@ -363,6 +381,50 @@ class Pipeline:
                 ),
             ),
         )
+
+        # ==================================================
+        # SEPARATE ENTRY ROI BAG COUNTER
+        # ==================================================
+
+        self.entry_roi_counting_enabled = bool(
+            entry_roi_counting_config.get(
+                "enabled",
+                False,
+            )
+        )
+
+        entry_roi = (
+            entry_roi_counting_config.get(
+                "roi",
+                {},
+            )
+            or {}
+        )
+
+        if self.entry_roi_counting_enabled:
+
+            self.entry_roi_counter = EntryROICounter(
+                roi=entry_roi,
+
+                min_track_frames=entry_roi_counting_config.get(
+                    "min_track_frames",
+                    4,
+                ),
+
+                duplicate_distance=entry_roi_counting_config.get(
+                    "duplicate_distance",
+                    50,
+                ),
+
+                max_history=entry_roi_counting_config.get(
+                    "max_history",
+                    300,
+                ),
+            )
+
+        else:
+
+            self.entry_roi_counter = None
 
         # ==================================================
         # PRINT DETECTION
@@ -1162,13 +1224,46 @@ class Pipeline:
             )
 
             # ==============================================
-            # PHYSICAL-CENTER COUNTING
-            #
-            # Jam does NOT block counting.
+            # EXISTING PHYSICAL-CENTER LINE COUNTING
             # ==============================================
 
             count = self.count(
                 countable_tracks
+            )
+
+            # ==============================================
+            # NEW ENTRY ROI COUNTING
+            #
+            # OUTSIDE → INSIDE ROI = +1
+            # ==============================================
+
+            if (
+                self.entry_roi_counter is not None
+            ):
+
+                self.entry_roi_count = (
+                    self.entry_roi_counter.update(
+                        countable_tracks
+                    )
+                )
+
+            if (
+                self.entry_roi_counter is not None
+                and self.entry_roi_counter.last_counted_bags
+            ):
+
+                print(
+                    f"[{self.name}] "
+                    f"ENTRY ROI COUNT +"
+                    f"{len(self.entry_roi_counter.last_counted_bags)} "
+                    f"| TOTAL = "
+                    f"{self.entry_roi_count}"
+                )
+
+            entry_roi_count = (
+                self.entry_roi_counter.total_count
+                if self.entry_roi_counter is not None
+                else 0
             )
 
             # ==============================================
@@ -1188,6 +1283,7 @@ class Pipeline:
                 print_results,
                 count,
                 fps,
+                entry_roi_count,
             )
 
             self._set_latest_frame(
@@ -1886,6 +1982,7 @@ class Pipeline:
         print_results,
         count,
         fps,
+        entry_roi_count=0,
     ):
 
         self.visualizer.visualize(
@@ -1895,6 +1992,8 @@ class Pipeline:
             camera_name=self.name,
 
             count=count,
+
+            entry_roi_count=entry_roi_count,
 
             printed_count=self.printed_count,
 

@@ -36,7 +36,9 @@ bag_spacing:
 
     enabled: true
 
-    direction: up
+    # Camera 2:
+    # bags move RIGHT -> LEFT
+    direction: left
 
     minimum_safe_gap_mm: 300.0
     measurement_margin_mm: 5.0
@@ -48,24 +50,24 @@ bag_spacing:
     ignore_motion_jumps: true
 
     roi:
-        x1: 0
-        y1: 150
-        x2: 477
-        y2: 500
+        x1: 273
+        y1: 120
+        x2: 1007
+        y2: 600
 
     calibration:
 
         image_points:
-            - [150, 150]
-            - [400, 150]
-            - [470, 500]
-            - [60, 500]
+            - [YOUR_P1_X, YOUR_P1_Y]
+            - [YOUR_P2_X, YOUR_P2_Y]
+            - [YOUR_P3_X, YOUR_P3_Y]
+            - [YOUR_P4_X, YOUR_P4_Y]
 
         world_points_mm:
             - [0, 0]
-            - [800, 0]
-            - [800, 2000]
-            - [0, 2000]
+            - [YOUR_LENGTH_MM, 0]
+            - [YOUR_LENGTH_MM, YOUR_WIDTH_MM]
+            - [0, YOUR_WIDTH_MM]
 
 Output
 ------
@@ -173,11 +175,13 @@ class BagSpacingDetector:
         if self.direction not in {
             "up",
             "down",
+            "left",
+            "right",
         }:
 
             raise ValueError(
                 "BagSpacingDetector direction must "
-                "be 'up' or 'down'."
+                "be 'up', 'down', 'left' or 'right'."
             )
 
         # ==================================================
@@ -786,44 +790,50 @@ class BagSpacingDetector:
     # ORDER BAGS ALONG CONVEYOR
     # ======================================================
 
-    def _sort_bags(
-        self,
-        bags,
-    ):
+    def _sort_bags(self, bags):
+        """
+        Order bags along the physical conveyor direction.
 
-        # --------------------------------------------------
-        # Image coordinates:
-        #
-        # top    -> smaller Y
-        # bottom -> larger Y
-        #
-        # Direction UP:
-        # bag with smaller Y is physically ahead/front.
-        #
-        # Direction DOWN:
-        # bag with larger Y is physically ahead/front.
-        # --------------------------------------------------
+        Image coordinates:
+            X -> left/right
+            Y -> top/bottom
 
-        if self.direction == "up":
+        For horizontal conveyor:
+            left  -> right
+            right -> left
 
+        For vertical conveyor:
+            up
+            down
+        """
+
+        if self.direction == "right":
+            # Smaller X is physically behind.
+            # Larger X is physically ahead.
             return sorted(
                 bags,
-                key=lambda bag:
-                    bag[
-                        "center"
-                    ][
-                        1
-                    ],
+                key=lambda bag: bag["center"][0],
+                reverse=True,
             )
 
+        if self.direction == "left":
+            # Larger X is physically behind.
+            # Smaller X is physically ahead.
+            return sorted(
+                bags,
+                key=lambda bag: bag["center"][0],
+            )
+
+        if self.direction == "up":
+            return sorted(
+                bags,
+                key=lambda bag: bag["center"][1],
+            )
+
+        # down
         return sorted(
             bags,
-            key=lambda bag:
-                bag[
-                    "center"
-                ][
-                    1
-                ],
+            key=lambda bag: bag["center"][1],
             reverse=True,
         )
 
@@ -837,88 +847,129 @@ class BagSpacingDetector:
         rear_bag,
     ):
         """
-        Returns facing edge reference points in image pixels.
+        Return the two bag edges that face each other.
 
-        UP conveyor:
+        The conveyor direction determines which edges
+        are used.
 
-                FRONT BAG
-              +-----------+
-              |           |
-              +-----*-----+  <- bottom-center
+        LEFT movement:
 
-                    GAP
+            REAR BAG          FRONT BAG
+            ┌─────────┐ GAP ┌─────────┐
+            │         │     │         │
+            └─────────┘     └─────────┘
+                      ↑     ↑
+                    right  left
+                     edge  edge
 
-              +-----*-----+  <- top-center
-              |           |
-              +-----------+
-                 REAR BAG
+        RIGHT movement:
 
+            FRONT BAG          REAR BAG
+            ┌─────────┐ GAP ┌─────────┐
+            │         │     │         │
+            └─────────┘     └─────────┘
+                      ↑     ↑
+                    right  left
+                     edge  edge
 
-        DOWN conveyor:
+        UP movement:
+            bottom / top
 
-                 REAR BAG
-              +-----------+
-              |           |
-              +-----*-----+
-
-                    GAP
-
-              +-----*-----+
-              |           |
-              +-----------+
-                FRONT BAG
-
-        These image edge points are transformed through
-        homography before the physical gap is calculated.
+        DOWN movement:
+            top / bottom
         """
 
         fx1, fy1, fx2, fy2 = (
-            front_bag[
-                "bbox"
-            ]
+            front_bag["bbox"]
         )
 
         rx1, ry1, rx2, ry2 = (
-            rear_bag[
-                "bbox"
-            ]
+            rear_bag["bbox"]
         )
 
+        front_cy = (
+            fy1 + fy2
+        ) / 2.0
+
+        rear_cy = (
+            ry1 + ry2
+        ) / 2.0
+
         front_cx = (
-            fx1
-            +
-            fx2
+            fx1 + fx2
         ) / 2.0
 
         rear_cx = (
-            rx1
-            +
-            rx2
+            rx1 + rx2
         ) / 2.0
 
-        if self.direction == "up":
+        # ============================================
+        # LEFT
+        # ============================================
 
-            # Front bag trailing edge.
+        if self.direction == "left":
+
+            # Front bag is on the LEFT.
+            # Its trailing edge is RIGHT edge.
+            front_edge = (
+                fx2,
+                front_cy,
+            )
+
+            # Rear bag is on the RIGHT.
+            # Its leading edge is LEFT edge.
+            rear_edge = (
+                rx1,
+                rear_cy,
+            )
+
+        # ============================================
+        # RIGHT
+        # ============================================
+
+        elif self.direction == "right":
+
+            # Front bag is on the RIGHT.
+            # Its trailing edge is LEFT edge.
+            front_edge = (
+                fx1,
+                front_cy,
+            )
+
+            # Rear bag is on the LEFT.
+            # Its leading edge is RIGHT edge.
+            rear_edge = (
+                rx2,
+                rear_cy,
+            )
+
+        # ============================================
+        # UP
+        # ============================================
+
+        elif self.direction == "up":
+
             front_edge = (
                 front_cx,
                 fy2,
             )
 
-            # Rear bag leading edge.
             rear_edge = (
                 rear_cx,
                 ry1,
             )
 
+        # ============================================
+        # DOWN
+        # ============================================
+
         else:
 
-            # Front bag trailing edge.
             front_edge = (
                 front_cx,
                 fy1,
             )
 
-            # Rear bag leading edge.
             rear_edge = (
                 rear_cx,
                 ry2,
@@ -978,35 +1029,42 @@ class BagSpacingDetector:
         # --------------------------------------------------
         # PHYSICAL LONGITUDINAL GAP
         #
-        # World Y represents the conveyor travel axis.
+        # Horizontal conveyor:
+        #     World X = conveyor direction
         #
-        # We intentionally DO NOT use pixel distance.
+        # Vertical conveyor:
+        #     World Y = conveyor direction
         #
-        # We also intentionally DO NOT use full 2-D
-        # Euclidean distance because lateral X displacement
-        # should not increase the longitudinal bag spacing.
-        #
-        # Therefore:
-        #
-        # gap = |rear_world_y - front_world_y|
+        # Only longitudinal displacement is measured.
         # --------------------------------------------------
 
-        front_world_y = float(
-            front_edge_world[
-                1
-            ]
-        )
+        if self.direction in {
+            "left",
+            "right",
+        }:
 
-        rear_world_y = float(
-            rear_edge_world[
-                1
-            ]
-        )
+            front_world_axis = float(
+                front_edge_world[0]
+            )
+
+            rear_world_axis = float(
+                rear_edge_world[0]
+            )
+
+        else:
+
+            front_world_axis = float(
+                front_edge_world[1]
+            )
+
+            rear_world_axis = float(
+                rear_edge_world[1]
+            )
 
         gap_mm = abs(
-            rear_world_y
+            rear_world_axis
             -
-            front_world_y
+            front_world_axis
         )
 
         if not math.isfinite(
@@ -1258,6 +1316,19 @@ class BagSpacingDetector:
                 gap_mm_out,
 
             "distance_px":
+                round(
+                    abs(
+                        front_edge_px[0]
+                        -
+                        rear_edge_px[0]
+                    ),
+                    2,
+                )
+                if self.direction in {
+                    "left",
+                    "right",
+                }
+                else
                 round(
                     abs(
                         front_edge_px[1]

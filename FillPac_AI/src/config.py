@@ -1467,12 +1467,14 @@ class Config:
         if direction not in {
             "up",
             "down",
+            "left",
+            "right",
         }:
 
             raise ValueError(
                 f"{camera_name}: "
-                "bag_spacing direction must "
-                "be 'up' or 'down'."
+                "bag_spacing direction must be "
+                "'up', 'down', 'left' or 'right'."
             )
 
         # --------------------------------------------------
