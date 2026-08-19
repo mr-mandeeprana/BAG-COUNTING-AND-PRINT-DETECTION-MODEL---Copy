@@ -1,63 +1,59 @@
 {
-  "system_status": "online",
-  "startup_time": "2026-08-12T10:16:05.809795+00:00",
-  "updated_at": "2026-08-12T10:57:33.632881+00:00",
+  "system_status": "offline",
+  "startup_time": "2026-08-19T09:21:28.028943+00:00",
+  "updated_at": "2026-08-19T09:24:36.069145+00:00",
   "service_status": {
-    "model_loaded": true,
-    "inference_manager_running": true,
+    "model_loaded": false,
+    "inference_manager_running": false,
     "elasticsearch_connected": false,
     "dashboard_enabled": true
   },
-  "total_count": 20,
+  "total_count": 24,
   "total_printed_count": 0,
-  "total_missing_count": 19,
+  "total_missing_count": 24,
   "total_printed_bags_count": 0,
-  "total_not_printed_bags_count": 19,
+  "total_not_printed_bags_count": 24,
   "cameras": {
     "Camera 1": {
       "id": 1,
       "name": "Camera 1",
       "enabled": true,
       "configured": true,
-      "mode": "rtsp",
-      "source_type": "rtsp",
-      "status": "online",
-      "count": 20,
-      "total_count": 20,
+      "mode": "video",
+      "source_type": "video",
+      "status": "offline",
+      "count": 12,
+      "total_count": 12,
       "printed_count": 0,
-      "missing_count": 19,
+      "missing_count": 12,
       "printed_bags_count": 0,
-      "not_printed_bags_count": 19,
+      "not_printed_bags_count": 12,
       "print_detection_enabled": true,
-      "print_status": "missing",
+      "print_status": "offline",
       "jam_detection_enabled": true,
       "jam_status": "normal",
       "jam_detected": false,
       "jam_warning": false,
-      "active_jam_count": 1,
-      "active_jam_track_ids": [
-        214
-      ],
+      "active_jam_count": 0,
+      "active_jam_track_ids": [],
       "condition_c_enabled": true,
       "condition_c_detected": false,
-      "condition_c_bag_count": 1,
-      "condition_c_track_ids": [
-        214
-      ],
+      "condition_c_bag_count": 0,
+      "condition_c_track_ids": [],
       "condition_c_status": "normal",
       "condition_c_minimum_gap_mm": null,
       "condition_c_distances": [],
       "condition_c_image_path": null,
       "condition_c_image_url": null,
-      "condition_c_timestamp": "2026-08-12T10:57:33.632881+00:00",
-      "fps": 3.557197241592179,
-      "frame_count": 22356,
-      "last_frame_at": "2026-08-12T10:57:33.632881+00:00",
+      "condition_c_timestamp": "2026-08-19T09:24:35.900845+00:00",
+      "fps": 0.0,
+      "frame_count": 832,
+      "last_frame_at": "2026-08-19T09:24:35.473608+00:00",
       "last_detection_at": null,
-      "last_count_at": "2026-08-12T10:54:10.956933+00:00",
+      "last_count_at": "2026-08-19T09:24:23.915461+00:00",
       "last_error": null,
-      "registered_at": "2026-08-12T10:16:06.537821+00:00",
-      "updated_at": "2026-08-12T10:57:33.632881+00:00",
+      "registered_at": "2026-08-19T09:21:28.499240+00:00",
+      "updated_at": "2026-08-19T09:24:36.069145+00:00",
       "metadata": {
         "roi": {
           "x1": 640,
@@ -66,7 +62,7 @@
           "y2": 600
         },
         "counting_method": "physical_center",
-        "counting_direction": "left",
+        "counting_direction": "right",
         "jam_detection_enabled": true,
         "jam_roi": {
           "x1": 180,
@@ -110,39 +106,151 @@
         "y2": 680
       },
       "condition_c_max_allowed_bags": 2,
-      "condition_c_roi_occupancy": 0.5,
+      "condition_c_roi_occupancy": 0.0,
       "condition_c_duration": 0,
       "jam_types": [],
-      "movement_jam_tracks": [
+      "entry_roi_count": 13,
+      "entry_roi_active_count": 1,
+      "entry_roi_active_track_ids": [
+        19
+      ],
+      "entry_roi_active_bags": [
         {
-          "track_id": 214,
-          "state": "normal",
-          "center_x": 777.0,
-          "center_y": 459.0,
-          "inside_roi": true,
-          "history_ready": true,
-          "distance_pixels": 284.253,
-          "speed_px_s": 366.006,
-          "history_duration_seconds": 0.777,
-          "stationary_seconds": 0.0
+          "track_id": 19,
+          "center": [
+            361.0,
+            345.0
+          ]
         }
       ],
-      "jam_tracks": [
-        {
-          "track_id": 214,
-          "state": "normal",
-          "center_x": 777.0,
-          "center_y": 459.0,
-          "inside_roi": true,
-          "history_ready": true,
-          "distance_pixels": 284.253,
-          "speed_px_s": 366.006,
-          "history_duration_seconds": 0.777,
-          "stationary_seconds": 0.0
+      "entry_roi": {
+        "x1": 273,
+        "y1": 120,
+        "x2": 640,
+        "y2": 600
+      },
+      "movement_jam_tracks": [],
+      "jam_tracks": []
+    },
+    "Camera 2": {
+      "id": 2,
+      "name": "Camera 2",
+      "enabled": true,
+      "configured": true,
+      "mode": "video",
+      "source_type": "video",
+      "status": "offline",
+      "count": 12,
+      "total_count": 12,
+      "printed_count": 0,
+      "missing_count": 12,
+      "printed_bags_count": 0,
+      "not_printed_bags_count": 12,
+      "print_detection_enabled": true,
+      "print_status": "offline",
+      "jam_detection_enabled": true,
+      "jam_status": "normal",
+      "jam_detected": false,
+      "jam_warning": false,
+      "active_jam_count": 0,
+      "active_jam_track_ids": [],
+      "condition_c_enabled": true,
+      "condition_c_detected": false,
+      "condition_c_bag_count": 0,
+      "condition_c_track_ids": [],
+      "condition_c_status": "normal",
+      "condition_c_minimum_gap_mm": null,
+      "condition_c_distances": [],
+      "condition_c_image_path": null,
+      "condition_c_image_url": null,
+      "condition_c_timestamp": "2026-08-19T09:24:36.063181+00:00",
+      "fps": 0.0,
+      "frame_count": 832,
+      "last_frame_at": "2026-08-19T09:24:36.035219+00:00",
+      "last_detection_at": null,
+      "last_count_at": "2026-08-19T09:24:23.998591+00:00",
+      "last_error": null,
+      "registered_at": "2026-08-19T09:21:28.504081+00:00",
+      "updated_at": "2026-08-19T09:24:36.069145+00:00",
+      "metadata": {
+        "roi": {
+          "x1": 640,
+          "y1": 120,
+          "x2": 640,
+          "y2": 600
+        },
+        "counting_method": "physical_center",
+        "counting_direction": "both",
+        "jam_detection_enabled": true,
+        "jam_roi": {
+          "x1": 273,
+          "y1": 120,
+          "x2": 1007,
+          "y2": 600
+        },
+        "bag_spacing_enabled": true,
+        "spacing_roi": {
+          "x1": 180,
+          "y1": 90,
+          "x2": 1220,
+          "y2": 680
+        },
+        "spacing_threshold_mm": 305.0,
+        "condition_c_enabled": true,
+        "condition_c_roi": {
+          "x1": 180,
+          "y1": 90,
+          "x2": 1220,
+          "y2": 680
         }
-      ]
+      },
+      "movement_jam_enabled": true,
+      "movement_jam_status": "normal",
+      "movement_jam_detected": false,
+      "movement_jam_warning": false,
+      "movement_jam_track_ids": [],
+      "spacing_detection_enabled": true,
+      "spacing_status": "normal",
+      "spacing_jam_detected": false,
+      "spacing_threshold_mm": 305.0,
+      "minimum_gap_mm": null,
+      "spacing_pairs": [],
+      "spacing_jam_pairs": [],
+      "spacing_jam_track_ids": [],
+      "condition_c_roi": {
+        "x1": 180,
+        "y1": 90,
+        "x2": 1220,
+        "y2": 680
+      },
+      "condition_c_max_allowed_bags": 2,
+      "condition_c_roi_occupancy": 0.0,
+      "condition_c_duration": 0,
+      "jam_types": [],
+      "entry_roi_count": 13,
+      "entry_roi_active_count": 1,
+      "entry_roi_active_track_ids": [
+        19
+      ],
+      "entry_roi_active_bags": [
+        {
+          "track_id": 19,
+          "center": [
+            361.0,
+            345.0
+          ]
+        }
+      ],
+      "entry_roi": {
+        "x1": 273,
+        "y1": 120,
+        "x2": 640,
+        "y2": 600
+      },
+      "movement_jam_tracks": [],
+      "jam_tracks": []
     }
   },
   "state_stale": false,
-  "uptime_seconds": 2488.032000000003
+  "uptime_seconds": 188.04699999999139
 }

@@ -1162,6 +1162,18 @@ img {
     background: var(--danger-bg);
 }
 
+.camera-count-row {
+    display: flex;
+
+    gap: 12px;
+}
+
+.camera-count-row .camera-main-count {
+    flex: 1;
+
+    min-width: 0;
+}
+
 .camera-main-count {
     display: flex;
 
@@ -1226,6 +1238,72 @@ img {
 
     font-size: 11px;
     font-weight: 600;
+}
+
+
+/* ----------------------------------------------------------
+   ROI DETAIL STATS (secondary tier)
+
+   Line Count and Frame ROI Count are shown at equal size in
+   .camera-count-row above. These two remaining fields (how
+   many bags are inside the ROI right now, and which ones)
+   stay smaller/lighter as supporting detail beneath them.
+   ---------------------------------------------------------- */
+
+.camera-roi-stats {
+    display: grid;
+
+    grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+
+    gap: 8px;
+
+    padding: 8px 0;
+
+    border-bottom:
+        1px solid var(--border);
+}
+
+.camera-roi-stats > div {
+    min-width: 0;
+}
+
+.camera-roi-stats span {
+    display: block;
+
+    overflow: hidden;
+
+    font-size: 7px;
+
+    color: var(--text-secondary);
+
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.camera-roi-stats strong {
+    display: block;
+
+    margin-top: 3px;
+
+    overflow: hidden;
+
+    font-size: 11px;
+    font-weight: 600;
+
+    color: var(--text-primary);
+
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.camera-roi-stats .camera-roi-bags strong {
+    font-size: 9px;
+    font-weight: 500;
+
+    color: var(--text-secondary);
+
+    white-space: normal;
 }
 
 

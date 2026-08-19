@@ -573,6 +573,17 @@ class Pipeline:
         )
 
         # ==================================================
+        # JAM EVENT LOGGING STATE
+        # ==================================================
+
+        self.previous_jam_detected = False
+        self.previous_jam_types = set()
+
+        self.previous_condition_a_jam = False
+        self.previous_condition_b_jam = False
+        self.previous_condition_c_jam = False
+
+        # ==================================================
         # VISUALIZER
         # ==================================================
 
@@ -1214,6 +1225,12 @@ class Pipeline:
             )
 
             # ==============================================
+            # PERSIST JAM EVENTS
+            # ==============================================
+
+            self._log_jam_events()
+
+            # ==============================================
             # FILTER COUNTING TRACKS
             # ==============================================
 
@@ -1247,18 +1264,52 @@ class Pipeline:
                     )
                 )
 
+            # ==============================================
+            # ENTRY ROI COUNT EVENTS
+            # ==============================================
+
             if (
                 self.entry_roi_counter is not None
                 and self.entry_roi_counter.last_counted_bags
             ):
 
-                print(
-                    f"[{self.name}] "
-                    f"ENTRY ROI COUNT +"
-                    f"{len(self.entry_roi_counter.last_counted_bags)} "
-                    f"| TOTAL = "
-                    f"{self.entry_roi_count}"
-                )
+                for roi_bag in (
+                    self.entry_roi_counter.last_counted_bags
+                ):
+
+                    track_id = roi_bag.get("track_id")
+                    center = roi_bag.get("center")
+
+                    print(
+                        f"[ENTRY ROI COUNT +1] "
+                        f"Track ID={track_id} "
+                        f"Center={center} "
+                        f"TOTAL={self.entry_roi_count}"
+                    )
+
+                    # ------------------------------------------
+                    # PERSIST ROI EVENT
+                    # ------------------------------------------
+                    if self.count_logger is not None:
+
+                        try:
+
+                            self.count_logger.log_event(
+                                event_type="roi_entry",
+                                camera_name=self.name,
+                                track_id=track_id,
+                                center=center,
+                                roi=self.entry_roi_counter.roi,
+                                roi_count=self.entry_roi_count,
+                            )
+
+                        except Exception as error:
+
+                            self.logger.warning(
+                                f"{self.name}: "
+                                f"failed to log ROI entry event: "
+                                f"{error}"
+                            )
 
             entry_roi_count = (
                 self.entry_roi_counter.total_count
@@ -1362,6 +1413,60 @@ class Pipeline:
             )
             else {}
         )
+
+    # ======================================================
+    # ENTRY ROI STATE
+    # ======================================================
+
+    def _get_entry_roi_state(self):
+        """
+        Return current bags whose physical center
+        is inside the Entry ROI.
+        """
+
+        if self.entry_roi_counter is None:
+            return {
+                "count": 0,
+                "track_ids": [],
+                "bags": [],
+            }
+
+        bags = []
+
+        for track_id, inside in (
+            self.entry_roi_counter.track_inside_roi.items()
+        ):
+
+            if not inside:
+                continue
+
+            center = (
+                self.entry_roi_counter.track_centers.get(
+                    track_id
+                )
+            )
+
+            if center is None:
+                continue
+
+            bags.append(
+                {
+                    "track_id": track_id,
+                    "center": [
+                        float(center[0]),
+                        float(center[1]),
+                    ],
+                }
+            )
+
+        return {
+            "count": len(bags),
+            "track_ids": [
+                bag["track_id"]
+                for bag in bags
+            ],
+            "bags": bags,
+        }
 
     # ======================================================
     # BUILD FINAL JAM RESULT
@@ -1587,6 +1692,113 @@ class Pipeline:
                     "image_path"
                 ),
         }
+
+    # ======================================================
+    # JAM EVENT LOGGER
+    # ======================================================
+
+    def _log_jam_events(self):
+
+        if self.count_logger is None:
+            return
+
+        try:
+            # --------------------------------------------------
+            # CONDITION A - MOVEMENT JAM
+            # --------------------------------------------------
+
+            condition_a_jam = bool(
+                self.jam_result.get("jam", False)
+            )
+
+            if condition_a_jam != self.previous_condition_a_jam:
+
+                self.count_logger.log_event(
+                    event_type=(
+                        "jam_condition_a"
+                        if condition_a_jam
+                        else "jam_condition_a_recovered"
+                    ),
+                    camera_name=self.name,
+                    status=(
+                        "jam"
+                        if condition_a_jam
+                        else "normal"
+                    ),
+                    jam_result=self.jam_result,
+                    roi=self.jam_roi,
+                )
+
+                self.previous_condition_a_jam = (
+                    condition_a_jam
+                )
+
+            # --------------------------------------------------
+            # CONDITION B - BAG SPACING JAM
+            # --------------------------------------------------
+
+            condition_b_jam = bool(
+                self.spacing_result.get("jam", False)
+            )
+
+            if condition_b_jam != self.previous_condition_b_jam:
+
+                self.count_logger.log_event(
+                    event_type=(
+                        "jam_condition_b"
+                        if condition_b_jam
+                        else "jam_condition_b_recovered"
+                    ),
+                    camera_name=self.name,
+                    status=(
+                        "jam"
+                        if condition_b_jam
+                        else "normal"
+                    ),
+                    spacing_result=self.spacing_result,
+                    roi=self.spacing_roi,
+                )
+
+                self.previous_condition_b_jam = (
+                    condition_b_jam
+                )
+
+            # --------------------------------------------------
+            # CONDITION C - ROI OCCUPANCY JAM
+            # --------------------------------------------------
+
+            condition_c_jam = bool(
+                self._condition_c().get("jam", False)
+            )
+
+            if condition_c_jam != self.previous_condition_c_jam:
+
+                self.count_logger.log_event(
+                    event_type=(
+                        "jam_condition_c"
+                        if condition_c_jam
+                        else "jam_condition_c_recovered"
+                    ),
+                    camera_name=self.name,
+                    status=(
+                        "jam"
+                        if condition_c_jam
+                        else "normal"
+                    ),
+                    condition_c_result=self.condition_c_result,
+                    roi=self.condition_c_roi,
+                )
+
+                self.previous_condition_c_jam = (
+                    condition_c_jam
+                )
+
+        except Exception as error:
+
+            self.logger.warning(
+                f"{self.name}: failed to log jam events: "
+                f"{error}"
+            )
 
     # ======================================================
     # PIPELINE THREAD
@@ -2289,6 +2501,12 @@ class Pipeline:
             count_event=bool(
                 counted_results
             ),
+
+            entry_roi_count=(
+                self.entry_roi_counter.total_count
+                if self.entry_roi_counter is not None
+                else 0
+            ),
         )
 
         # ==================================================
@@ -2614,6 +2832,7 @@ class Pipeline:
         force=False,
         frame_processed=False,
         count_event=False,
+        entry_roi_count=None,
     ):
 
         if self.dashboard_state is None:
@@ -2893,6 +3112,14 @@ class Pipeline:
             or []
         )
 
+        # ==================================================
+        # ENTRY ROI STATE
+        # ==================================================
+
+        entry_roi_state = (
+            self._get_entry_roi_state()
+        )
+
         try:
 
             self.dashboard_state.update_camera(
@@ -2903,6 +3130,38 @@ class Pipeline:
 
                 total_count=(
                     self.counter.total_count
+                ),
+
+                # ==========================================
+                # ENTRY ROI COUNT
+                # ==========================================
+
+                entry_roi_count=(
+                    entry_roi_count
+                    if entry_roi_count is not None
+                    else (
+                        self.entry_roi_counter.total_count
+                        if self.entry_roi_counter is not None
+                        else 0
+                    )
+                ),
+
+                entry_roi_active_count=(
+                    entry_roi_state["count"]
+                ),
+
+                entry_roi_active_track_ids=(
+                    entry_roi_state["track_ids"]
+                ),
+
+                entry_roi_active_bags=(
+                    entry_roi_state["bags"]
+                ),
+
+                entry_roi=(
+                    self.entry_roi_counter.roi
+                    if self.entry_roi_counter is not None
+                    else None
                 ),
 
                 fps=fps,

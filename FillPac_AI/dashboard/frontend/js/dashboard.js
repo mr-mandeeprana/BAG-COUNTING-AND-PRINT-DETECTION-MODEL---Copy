@@ -174,6 +174,52 @@ function formatPercent(value) {
 }
 
 
+function formatRoiBagDetail(bags) {
+
+    const list =
+        Array.isArray(bags)
+            ? bags
+            : [];
+
+    if (list.length === 0) {
+        return "--";
+    }
+
+    return list
+        .map(
+            bag => {
+
+                const trackId =
+                    bag?.track_id
+                    ??
+                    "?";
+
+                const center =
+                    Array.isArray(bag?.center)
+                        ? bag.center
+                        : null;
+
+                if (!center) {
+                    return `${trackId}`;
+                }
+
+                const x =
+                    Math.round(
+                        safeNumber(center[0], 0)
+                    );
+
+                const y =
+                    Math.round(
+                        safeNumber(center[1], 0)
+                    );
+
+                return `${trackId} @ (${x}, ${y})`;
+            }
+        )
+        .join(", ");
+}
+
+
 function formatUptime(totalSeconds) {
 
     const seconds =
@@ -1468,6 +1514,24 @@ function renderCameraCard(
 
 
         setText(
+            `camera${index}RoiCount`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}RoiActive`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}RoiTracks`,
+            "--"
+        );
+
+
+        setText(
             `camera${index}Fps`,
             "0.0"
         );
@@ -1491,6 +1555,24 @@ function renderCameraCard(
         0;
 
 
+    const entryRoiCount =
+        camera.entry_roi_count
+        ??
+        0;
+
+
+    const entryRoiActiveCount =
+        camera.entry_roi_active_count
+        ??
+        0;
+
+
+    const entryRoiActiveBags =
+        camera.entry_roi_active_bags
+        ??
+        [];
+
+
     const printed =
         camera.printed_count
         ??
@@ -1510,6 +1592,24 @@ function renderCameraCard(
     setText(
         `camera${index}Count`,
         formatInteger(count)
+    );
+
+
+    setText(
+        `camera${index}RoiCount`,
+        formatInteger(entryRoiCount)
+    );
+
+
+    setText(
+        `camera${index}RoiActive`,
+        formatInteger(entryRoiActiveCount)
+    );
+
+
+    setText(
+        `camera${index}RoiTracks`,
+        formatRoiBagDetail(entryRoiActiveBags)
     );
 
 
