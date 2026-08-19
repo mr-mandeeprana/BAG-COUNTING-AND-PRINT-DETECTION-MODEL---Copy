@@ -3,10 +3,11 @@ setlocal EnableDelayedExpansion
 title FillPac AI Launcher
 
 REM ==========================================================
-REM FillPac AI
+REM FILLPAC AI
 REM Production Vision System + Dashboard Launcher
 REM ==========================================================
 
+REM Always work from the folder containing this BAT file
 cd /d "%~dp0"
 
 echo.
@@ -22,33 +23,17 @@ REM ==========================================================
 
 set "PYTHON_CMD=python"
 
-set "IMPORT_CHECK=import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn"
+echo Checking Python dependencies...
 
-REM ==========================================================
-REM CHECK PARENT VIRTUAL ENVIRONMENT
-REM ==========================================================
+python -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
 
-if exist "..\.venv\Scripts\python.exe" (
+if errorlevel 1 (
 
-    "..\.venv\Scripts\python.exe" -c "%IMPORT_CHECK%" >nul 2>nul
-
-    if not errorlevel 1 (
-        set "PYTHON_CMD=..\.venv\Scripts\python.exe"
-    )
-)
-
-REM ==========================================================
-REM CHECK LOCAL VIRTUAL ENVIRONMENT
-REM ==========================================================
-
-if "%PYTHON_CMD%"=="python" (
-
-    if exist ".venv\Scripts\python.exe" (
-
-        ".venv\Scripts\python.exe" -c "%IMPORT_CHECK%" >nul 2>nul
-
-        if not errorlevel 1 (
-            set "PYTHON_CMD=.venv\Scripts\python.exe"
+    if exist ".\venv\Scripts\python.exe" (
+        set "PYTHON_CMD=.\venv\Scripts\python.exe"
+    ) else (
+        if exist ".\.venv\Scripts\python.exe" (
+            set "PYTHON_CMD=.\.venv\Scripts\python.exe"
         )
     )
 )
@@ -66,34 +51,11 @@ if errorlevel 1 (
     echo ERROR: Python could not be found
     echo ==========================================================
     echo.
-    echo Install Python or create the project virtual environment.
-    echo.
-    pause
-    exit /b 1
-)
 
-REM ==========================================================
-REM VERIFY REQUIRED DEPENDENCIES
-REM ==========================================================
+    echo Current directory:
+    cd
+    echo.
 
-echo Checking Python dependencies...
-
-%PYTHON_CMD% -c "%IMPORT_CHECK%" >nul 2>nul
-
-if errorlevel 1 (
-
-    echo.
-    echo ==========================================================
-    echo ERROR: Required Python packages are missing
-    echo ==========================================================
-    echo.
-    echo Python:
-    echo %PYTHON_CMD%
-    echo.
-    echo Install dependencies using:
-    echo.
-    echo %PYTHON_CMD% -m pip install -r requirements.txt
-    echo.
     pause
     exit /b 1
 )
@@ -101,7 +63,6 @@ if errorlevel 1 (
 echo [OK] Python environment ready.
 echo [OK] Required packages available.
 echo.
-
 echo Python:
 echo %PYTHON_CMD%
 echo.
@@ -117,9 +78,11 @@ if not exist "main.py" (
     echo ERROR: main.py not found
     echo ==========================================================
     echo.
+
     echo Current directory:
     cd
     echo.
+
     pause
     exit /b 1
 )
@@ -137,6 +100,7 @@ if not exist "config.yaml" (
     echo ERROR: config.yaml not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -154,6 +118,7 @@ if not exist "src\pipeline.py" (
     echo ERROR: src\pipeline.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -165,6 +130,7 @@ if not exist "src\camera.py" (
     echo ERROR: src\camera.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -176,6 +142,7 @@ if not exist "src\tracker.py" (
     echo ERROR: src\tracker.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -187,6 +154,7 @@ if not exist "src\counter.py" (
     echo ERROR: src\counter.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -198,6 +166,7 @@ if not exist "src\print_detector.py" (
     echo ERROR: src\print_detector.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -209,6 +178,7 @@ if not exist "src\visualizer.py" (
     echo ERROR: src\visualizer.py not found
     echo ==========================================================
     echo.
+
     pause
     exit /b 1
 )
@@ -226,8 +196,10 @@ if not exist "src\jam_detector.py" (
     echo ERROR: src\jam_detector.py not found
     echo ==========================================================
     echo.
+
     echo Jam Detection V1 cannot start.
     echo.
+
     pause
     exit /b 1
 )
@@ -235,10 +207,7 @@ if not exist "src\jam_detector.py" (
 echo [OK] Jam Detector V1 found.
 
 REM ==========================================================
-REM VERIFY PYTHON SOURCE IMPORTS
-REM
-REM This catches syntax/import errors before starting the
-REM frontend and production application.
+REM SOURCE IMPORT TEST
 REM ==========================================================
 
 echo.
@@ -253,17 +222,12 @@ if errorlevel 1 (
     echo ERROR: FillPac AI source import check failed
     echo ==========================================================
     echo.
-    echo Possible causes:
-    echo   - Python syntax error
-    echo   - Missing Python module
-    echo   - Invalid JamDetector import
-    echo   - Invalid Pipeline import
-    echo   - Invalid Visualizer import
-    echo.
-    echo Run this command manually for the full traceback:
+
+    echo Run this command for the complete traceback:
     echo.
     echo %PYTHON_CMD% -c "from src.pipeline import Pipeline; from src.jam_detector import JamDetector; from src.visualizer import Visualizer"
     echo.
+
     pause
     exit /b 1
 )
@@ -273,7 +237,7 @@ echo [OK] JamDetector import successful.
 echo [OK] Visualizer import successful.
 
 REM ==========================================================
-REM VERIFY CONFIG YAML PARSING
+REM CONFIG YAML TEST
 REM ==========================================================
 
 echo.
@@ -288,12 +252,7 @@ if errorlevel 1 (
     echo ERROR: config.yaml could not be parsed
     echo ==========================================================
     echo.
-    echo Check YAML indentation and syntax.
-    echo.
-    echo Run:
-    echo.
-    echo %PYTHON_CMD% -c "import yaml; print(yaml.safe_load(open('config.yaml','r',encoding='utf-8')))"
-    echo.
+
     pause
     exit /b 1
 )
@@ -301,7 +260,18 @@ if errorlevel 1 (
 echo [OK] config.yaml syntax valid.
 
 REM ==========================================================
-REM VERIFY DASHBOARD FILES
+REM VERIFY DASHBOARD
+REM
+REM IMPORTANT:
+REM run_model.bat is inside FillPac_AI.
+REM Therefore dashboard paths are:
+REM
+REM dashboard\backend
+REM dashboard\frontend
+REM
+REM NOT:
+REM
+REM FillPac_AI\dashboard
 REM ==========================================================
 
 if not exist "dashboard\backend\server.py" (
@@ -311,6 +281,11 @@ if not exist "dashboard\backend\server.py" (
     echo ERROR: dashboard\backend\server.py not found
     echo ==========================================================
     echo.
+
+    echo Expected:
+    echo %CD%\dashboard\backend\server.py
+    echo.
+
     pause
     exit /b 1
 )
@@ -322,11 +297,34 @@ if not exist "dashboard\frontend\index.html" (
     echo ERROR: dashboard\frontend\index.html not found
     echo ==========================================================
     echo.
+
+    echo Expected:
+    echo %CD%\dashboard\frontend\index.html
+    echo.
+
     pause
     exit /b 1
 )
 
-echo [OK] Dashboard files found.
+if not exist "dashboard\frontend\js\dashboard.js" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: dashboard\frontend\js\dashboard.js not found
+    echo ==========================================================
+    echo.
+
+    echo Expected:
+    echo %CD%\dashboard\frontend\js\dashboard.js
+    echo.
+
+    pause
+    exit /b 1
+)
+
+echo [OK] Dashboard backend found.
+echo [OK] Dashboard frontend found.
+echo [OK] Dashboard JavaScript found.
 
 REM ==========================================================
 REM CREATE RUNTIME DIRECTORIES
@@ -344,17 +342,10 @@ if not exist "data\output" (
     mkdir "data\output"
 )
 
-if not exist "dashboard\backend" (
-    mkdir "dashboard\backend"
-)
-
 echo [OK] Runtime directories ready.
 
 REM ==========================================================
-REM PORT CHECK - BACKEND
-REM
-REM main.py owns port 8000.
-REM We must NOT start another Uvicorn process.
+REM CHECK PORT 8000
 REM ==========================================================
 
 echo.
@@ -369,17 +360,13 @@ if not errorlevel 1 (
     echo ERROR: Port 8000 is already in use
     echo ==========================================================
     echo.
-    echo Another FillPac dashboard/Uvicorn instance may
-    echo already be running.
-    echo.
-    echo Process information:
-    echo.
 
     netstat -ano | findstr ":8000 "
 
     echo.
-    echo Close the existing process and run this launcher again.
+    echo Stop the existing process and run this launcher again.
     echo.
+
     pause
     exit /b 1
 )
@@ -387,7 +374,7 @@ if not errorlevel 1 (
 echo [OK] Port 8000 available.
 
 REM ==========================================================
-REM PORT CHECK - FRONTEND
+REM CHECK PORT 8080
 REM ==========================================================
 
 echo Checking dashboard frontend port 8080...
@@ -401,16 +388,13 @@ if not errorlevel 1 (
     echo ERROR: Port 8080 is already in use
     echo ==========================================================
     echo.
-    echo Another dashboard frontend may already be running.
-    echo.
-    echo Process information:
-    echo.
 
     netstat -ano | findstr ":8080 "
 
     echo.
-    echo Close the existing process and run this launcher again.
+    echo Stop the existing dashboard and run this launcher again.
     echo.
+
     pause
     exit /b 1
 )
@@ -421,9 +405,7 @@ echo.
 REM ==========================================================
 REM START FRONTEND
 REM
-REM FastAPI backend is NOT started here.
-REM main.py starts it internally so it shares memory with the
-REM camera Pipeline objects required by Live Monitor.
+REM THIS IS THE IMPORTANT FIX
 REM ==========================================================
 
 echo ==========================================================
@@ -462,8 +444,6 @@ if !FRONTEND_ATTEMPTS! GEQ 20 (
     echo ==========================================================
     echo.
 
-    taskkill /FI "WINDOWTITLE eq FillPac AI - Dashboard Frontend*" /F >nul 2>nul
-
     pause
     exit /b 1
 )
@@ -472,113 +452,83 @@ timeout /t 1 /nobreak >nul
 
 goto WAIT_FRONTEND
 
-
 :FRONTEND_READY
 
 echo [OK] Dashboard frontend ready.
 echo.
 
 REM ==========================================================
-REM START FILLPAC AI
-REM
-REM main.py starts:
-REM
-REM   Application
-REM   Detector
-REM   InferenceManager
-REM   Camera pipelines
-REM   Tracker
-REM   Physical-center Counter
-REM   PrintDetector
-REM   JamDetector V1
-REM   DashboardState
-REM   FastAPI
-REM   Socket.IO
-REM   Live camera endpoints
-REM
-REM DO NOT start Uvicorn separately.
+REM START MAIN APPLICATION
 REM ==========================================================
 
 echo [2/2] Starting FillPac AI...
 echo.
 
 REM ==========================================================
-REM OPEN DASHBOARD
+REM OPEN NEW DASHBOARD
 REM ==========================================================
 
-start "" http://127.0.0.1:8080
+start "" http://127.0.0.1:8080/
 
 REM ==========================================================
-REM RUNTIME INFORMATION
+REM DISPLAY URLS
 REM ==========================================================
 
 echo ==========================================================
 echo                   FillPac AI Runtime
 echo ==========================================================
 echo.
+
 echo Dashboard UI:
-echo     http://127.0.0.1:8080
+echo     http://127.0.0.1:8080/
 echo.
+
 echo Dashboard API:
-echo     http://127.0.0.1:8000
+echo     http://127.0.0.1:8000/
 echo.
+
 echo Health API:
 echo     http://127.0.0.1:8000/health
 echo.
-echo ----------------------------------------------------------
-echo Live Camera Streams
-echo ----------------------------------------------------------
+
+echo ==========================================================
+echo                    DASHBOARD SOURCE
+echo ==========================================================
 echo.
-echo Camera 1:
-echo     http://127.0.0.1:8000/live/Camera%%201
+
+echo Frontend:
+echo     %CD%\dashboard\frontend\index.html
 echo.
-echo Camera 2:
-echo     http://127.0.0.1:8000/live/Camera%%202
+
+echo JavaScript:
+echo     %CD%\dashboard\frontend\js\dashboard.js
 echo.
-echo Camera 3:
-echo     http://127.0.0.1:8000/live/Camera%%203
+
+echo Backend:
+echo     %CD%\dashboard\backend\server.py
 echo.
-echo Camera 4:
-echo     http://127.0.0.1:8000/live/Camera%%204
+
+echo ==========================================================
+echo                    COUNTING DISPLAY
+echo ==========================================================
 echo.
-echo ----------------------------------------------------------
-echo Jam Detection V1
-echo ----------------------------------------------------------
+
+echo Dashboard should show:
 echo.
-echo Algorithm:
-echo     Bag center trajectory
-echo          +
-echo     Euclidean movement
-echo          +
-echo     Speed px/s
-echo          +
-echo     Stationary duration
+echo     Line Count
+echo     Frame ROI Count
+echo     Bags Inside ROI
+echo     ROI Track IDs
+echo     Printed Bags
+echo     Missing Bags
+echo     Jam Status
 echo.
-echo States:
-echo     NORMAL
-echo     SLOW
-echo     WARNING
-echo     JAM
-echo     RECOVERING
-echo.
-echo Jam detection is independent from bag counting.
-echo.
-echo Physical bag-center crossing remains the counting trigger.
-echo.
-echo ----------------------------------------------------------
-echo Controls
-echo ----------------------------------------------------------
-echo.
-echo Press ESC inside the OpenCV window
-echo or CTRL+C here to stop FillPac AI.
-echo.
+
 echo ==========================================================
 echo.
 
 REM ==========================================================
 REM RUN MAIN APPLICATION
-REM
-REM Keep this process attached to the launcher.
 REM ==========================================================
 
 %PYTHON_CMD% main.py
@@ -597,9 +547,6 @@ echo.
 
 REM ==========================================================
 REM STOP FRONTEND
-REM
-REM Backend does NOT need taskkill.
-REM main.py owns and shuts down Uvicorn itself.
 REM ==========================================================
 
 echo Stopping Dashboard Frontend...
@@ -616,7 +563,7 @@ REM ==========================================================
 if "%EXITCODE%"=="0" (
 
     echo ==========================================================
-    echo             FillPac AI Closed Successfully
+    echo        FillPac AI Closed Successfully
     echo ==========================================================
 
 ) else (
@@ -624,30 +571,15 @@ if "%EXITCODE%"=="0" (
     echo ==========================================================
     echo        FillPac AI Closed With Error (%EXITCODE%)
     echo ==========================================================
+
+    echo.
+    echo Check the traceback above.
+    echo.
+    echo Logs:
+    echo     %CD%\logs\
 )
 
 echo.
-
-REM ==========================================================
-REM TESTING INFORMATION
-REM ==========================================================
-
-if not "%EXITCODE%"=="0" (
-
-    echo Troubleshooting:
-    echo.
-    echo 1. Check the terminal traceback above.
-    echo.
-    echo 2. Check logs in:
-    echo       logs\
-    echo.
-    echo 3. Verify:
-    echo       config.yaml
-    echo       src\pipeline.py
-    echo       src\jam_detector.py
-    echo       src\visualizer.py
-    echo.
-)
 
 pause
 
