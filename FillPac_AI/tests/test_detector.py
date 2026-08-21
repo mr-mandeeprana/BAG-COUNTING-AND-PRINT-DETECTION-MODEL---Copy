@@ -1,3 +1,4 @@
+import threading
 import torch
 
 from src.detector import Detector
@@ -46,6 +47,8 @@ def make_detector(boxes, **overrides):
     )
     detector.detection_roi = overrides.get("detection_roi")
     detector.frame_index = 0
+    # Required because __init__() is bypassed by __new__()
+    detector._inference_lock = threading.Lock()
     detector.device = "cpu"
     detector.half = False
     return detector

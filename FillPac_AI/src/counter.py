@@ -52,7 +52,7 @@ class Counter:
 
     def __init__(
         self,
-        roi,
+        roi=None,
         direction="down",
         duplicate_distance=40,
         duplicate_time=0.8,
@@ -62,13 +62,31 @@ class Counter:
         min_track_frames=4,
         stale_track_frames=120,
         minimum_cross_distance=0,
+        roi_y=None,
+        recent_count_frames=24,
     ):
 
         # ==================================================
         # COUNTING LINE
         # ==================================================
 
-        if not isinstance(roi, dict):
+        # ==================================================
+        # BACKWARD-COMPATIBLE ROI SUPPORT
+        # ==================================================
+
+        if roi is None and roi_y is not None:
+
+            # Legacy/simple horizontal counting line.
+            # Preserve the existing physical-center logic.
+            roi = {
+                "x1": 0,
+                "y1": roi_y,
+                "x2": 1920,
+                "y2": roi_y,
+            }
+
+        elif not isinstance(roi, dict):
+
             raise ValueError(
                 "Counter roi must be a dictionary containing "
                 "x1, y1, x2, y2."
@@ -119,6 +137,12 @@ class Counter:
         self.duplicate_distance = max(float(duplicate_distance), 0.0)
 
         self.duplicate_time = max(float(duplicate_time), 0.0)
+
+        # Frame-based window used by _can_count() for duplicate
+        # suppression (see notes on recent_counts below). Kept
+        # alongside duplicate_time for entries written before this
+        # field existed.
+        self.recent_count_frames = max(int(recent_count_frames), 0)
 
         # ==================================================
         # TRACK HISTORY CONFIGURATION
@@ -182,7 +206,8 @@ class Counter:
         # {
         #     "center": (x, y),
         #     "timestamp": monotonic_time,
-        #     "track_id": id
+        #     "track_id": id,
+        #     "frame_index": frame_index,
         # }
         #
         # This protects against ByteTrack assigning a new
@@ -394,6 +419,7 @@ class Counter:
                 "center": center,
                 "timestamp": timestamp,
                 "track_id": track_id,
+                "frame_index": self.frame_index,
             }
         )
 
@@ -506,19 +532,66 @@ class Counter:
             )
 
         # --------------------------------------------------
-        # 7. COUNT
+        # 7. PENDING CENTER CROSSING
+        #
+        # Do NOT count immediately when the center first
+        # reaches/crosses the line.
+        #
+        # First mark the crossing as pending, then require
+        # minimum_cross_distance before confirming the count.
         # --------------------------------------------------
 
         if crossed:
-            self._advance_state(track_id, "CENTER_CROSSED")
-            return True
+
+            # No additional distance requirement.
+            if self.minimum_cross_distance <= 0:
+
+                self._advance_state(
+                    track_id,
+                    "COUNTED",
+                )
+
+                return True
+
+            # Crossing detected, but count is pending.
+            self._advance_state(
+                track_id,
+                "CENTER_CROSSED",
+            )
+
+            # Check whether enough physical center movement
+            # has already occurred.
+            if self._has_minimum_cross_distance(
+                center
+            ):
+
+                self._advance_state(
+                    track_id,
+                    "COUNTED",
+                )
+
+                return True
+
+            return False
 
         # --------------------------------------------------
-        # 8. PENDING CENTER CROSSING
+        # 8. CONFIRM PENDING CENTER CROSSING
         # --------------------------------------------------
 
-        if self.track_states.get(track_id) == "CENTER_CROSSED":
-            if self._has_minimum_cross_distance(center):
+        if (
+            self.track_states.get(track_id)
+            == "CENTER_CROSSED"
+        ):
+
+            if self._has_minimum_cross_distance(
+                center
+            ):
+
+                self._advance_state(
+                    track_id,
+                    "COUNTED",
+                )
+
                 return True
 
         return False
@@ -534,7 +607,12 @@ class Counter:
     # CAN COUNT
     # ======================================================
 
-    def _can_count(self, track_id, center, current_time):
+    def _can_count(
+        self,
+        track_id,
+        center,
+        current_time,
+    ):
 
         if track_id in self.counted_track_ids:
             return False
@@ -542,21 +620,59 @@ class Counter:
         # ----------------------------------------------
         # Physical duplicate detection
         #
-        # A detection is considered a duplicate only when:
+        # A nearby physical center is considered a
+        # duplicate only while it remains inside the
+        # configured recent-count frame window.
         #
-        # 1. It happens within duplicate_time seconds.
-        # 2. Its physical center is within
-        #    duplicate_distance pixels.
-        #
-        # This handles tracker ID changes near the line.
+        # This is important when ByteTrack changes the
+        # track ID of the same physical bag.
         # ----------------------------------------------
+
+        current_frame = getattr(
+            self,
+            "frame_index",
+            0,
+        )
 
         for item in self.recent_counts:
 
-            elapsed_time = current_time - item["timestamp"]
+            # ------------------------------------------
+            # Frame-based duplicate window
+            # ------------------------------------------
 
-            if elapsed_time > self.duplicate_time:
-                continue
+            counted_frame = item.get(
+                "frame_index"
+            )
+
+            if counted_frame is not None:
+
+                frame_age = (
+                    current_frame
+                    - counted_frame
+                )
+
+                if (
+                    frame_age
+                    > self.recent_count_frames
+                ):
+                    continue
+
+            else:
+                # --------------------------------------
+                # Backward compatibility for entries
+                # without frame_index.
+                # --------------------------------------
+
+                elapsed_time = (
+                    current_time
+                    - item["timestamp"]
+                )
+
+                if (
+                    elapsed_time
+                    > self.duplicate_time
+                ):
+                    continue
 
             previous_center = item["center"]
 
@@ -565,7 +681,10 @@ class Counter:
                 previous_center[1] - center[1],
             )
 
-            if distance <= self.duplicate_distance:
+            if (
+                distance
+                <= self.duplicate_distance
+            ):
                 return False
 
         return True
@@ -845,14 +964,18 @@ class Counter:
 
     def _trim_recent_counts(self, current_time):
 
-        if self.duplicate_time <= 0:
+        if self.duplicate_time <= 0 and self.recent_count_frames <= 0:
             self.recent_counts = []
             return
 
         self.recent_counts = [
             item
             for item in self.recent_counts
-            if (current_time - item["timestamp"]) <= self.duplicate_time
+            if (
+                (self.frame_index - item.get("frame_index", self.frame_index))
+                <= self.recent_count_frames
+            )
+            or ((current_time - item["timestamp"]) <= self.duplicate_time)
         ]
 
     # ======================================================
@@ -936,3 +1059,39 @@ class Counter:
             for track_id, frame_index in self.track_last_seen.items()
             if track_id in retained_set
         }
+
+        # --------------------------------------------------
+        # CLEAN PER-TRACK DUPLICATE TIME HISTORY
+        #
+        # duplicate_time is normally a single numeric config value
+        # (see _can_count()'s "elapsed_time > self.duplicate_time"),
+        # so this only applies when it's been set up as a per-track
+        # dict (e.g. by a test harness treating it as track state).
+        # --------------------------------------------------
+        if isinstance(self.duplicate_time, dict):
+            self.duplicate_time = {
+                track_id: value
+                for track_id, value in self.duplicate_time.items()
+                if track_id in retained_set
+            }
+
+        # --------------------------------------------------
+        # CLEAN STALE RECENT COUNT EVENTS
+        # --------------------------------------------------
+        if self.recent_count_frames > 0:
+            self.recent_counts = [
+                item
+                for item in self.recent_counts
+                if (
+                    self.frame_index
+                    - item.get(
+                        "frame",
+                        item.get(
+                            "frame_index",
+                            self.frame_index,
+                        ),
+                    )
+                ) <= self.recent_count_frames
+            ]
+        else:
+            self.recent_counts = []

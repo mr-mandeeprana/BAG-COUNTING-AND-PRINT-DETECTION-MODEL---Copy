@@ -273,6 +273,49 @@ class Camera:
         self._reconnecting = False
 
     # ======================================================
+    # RTSP HELPERS
+    # ======================================================
+
+    def _is_rtsp_source(self) -> bool:
+        """
+        Return True when this camera should be treated as an
+        RTSP/RTSPS stream.
+
+        True when either:
+        - the camera was explicitly configured with
+          mode="rtsp" (even if the source string doesn't look
+          like a URL, e.g. it was passed in some other form), or
+        - the source is a string that starts with an rtsp://
+          or rtsps:// scheme, regardless of mode.
+        """
+
+        if self.mode == "rtsp":
+            return True
+
+        return (
+            isinstance(self.source, str)
+            and self.source.strip().lower().startswith(
+                (
+                    "rtsp://",
+                    "rtsps://",
+                )
+            )
+        )
+
+    def _get_capture_backend(self):
+        """
+        Return the OpenCV capture backend for this camera.
+
+        RTSP streams explicitly use FFmpeg.
+        Other sources use OpenCV's default backend.
+        """
+
+        if self._is_rtsp_source():
+            return cv2.CAP_FFMPEG
+
+        return cv2.CAP_ANY
+
+    # ======================================================
     # CONNECT
     # ======================================================
 
@@ -346,28 +389,33 @@ class Camera:
 
         try:
 
+            backend = self._get_capture_backend()
+
             # ------------------------------------------------
-            # RTSP
+            # RTSP / RTSPS
             # ------------------------------------------------
 
             self._log(
                 "info",
-                f"{self.name}: Creating VideoCapture (backend=FFMPEG)"
+                f"{self.name}: Creating VideoCapture "
+                f"(backend="
+                f"{'FFMPEG' if backend == cv2.CAP_FFMPEG else 'ANY'})"
             )
 
             t0 = time.perf_counter()
 
-            if self.mode == "rtsp":
+            if self._is_rtsp_source():
 
                 self.cap = cv2.VideoCapture(
-                    self.source,    
-                    cv2.CAP_FFMPEG,
+                    self.source,
+                    backend,
                 )
+
                 self._log(
                     "info",
                     f"{self.name}: VideoCapture object created"
                 )
-            
+
             # ------------------------------------------------
             # VIDEO / USB CAMERA
             # ------------------------------------------------

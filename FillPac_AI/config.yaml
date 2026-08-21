@@ -92,10 +92,7 @@ counting:
   line_tolerance: 12
   late_start_margin: 40
 
-  # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
-  # restriction while verifying physical-center counting.
-  # Restore to 15 once Count is confirmed working.
-  minimum_cross_distance: 0
+  minimum_cross_distance: 15
   min_track_frames: 4
 
   stale_track_frames: 120
@@ -237,9 +234,9 @@ bag_spacing:
   # <=305 mm  = JAM
   # --------------------------------------------------------
 
-  minimum_safe_gap_mm: 300.0
+  minimum_safe_gap_mm: 650.0
   measurement_margin_mm: 5.0
-  jam_threshold_mm: 305.0
+  jam_threshold_mm: 655.0
 
   # --------------------------------------------------------
   # TRACK VALIDATION
@@ -358,7 +355,7 @@ condition_c:
   # FIXED: was 1, which meant 2 bags (the normal, expected occupancy)
   # incorrectly triggered ROI OCCUPANCY : JAM. Now allows 2 before
   # firing, matching the comment above and the ROI's actual sizing.
-  max_allowed_bags: 2
+  max_allowed_bags: 1
 
   # Ignore unstable tracks
   min_track_age: 4
@@ -399,7 +396,7 @@ cameras:
     source: "data/videos/camera1_test.mp4"
     # source: "rtsp://beumer:Beumer!123@172.20.45.131:554/video/live?channel=1&subtype=1"
 
-    buffer_size: 5
+    buffer_size: 1
 
     inference_timeout: 15
     dashboard_publish_interval: 0.5
@@ -412,17 +409,17 @@ cameras:
 
 
       device: cpu
-      image_size: 480
-      half: false
+      image_size: 640
+      half: true
 
-      max_detections: 20
+      max_detections: 50
       min_bbox_area: 800
 
       detection_roi:
         x1: 0
-        y1: 80
-        x2: 1280
-        y2: 720
+        y1: 120
+        x2: 1920
+        y2: 1080
 
       allowed_classes:
         - 0

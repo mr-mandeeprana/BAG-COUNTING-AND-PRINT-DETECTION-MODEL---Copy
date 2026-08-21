@@ -1,1 +1,1 @@
-{"timestamp": "2026-07-17T12:57:52.765269+00:00", "event": "bag_count", "camera": "Camera 1", "total_count": 3, "track_id": 42, "center_x": 100, "center_y": 200, "print_present": true, "printed_count": 2, "missing_count": 1}
+{"event_id":"b723f4d4b26248a09c3ccb201d5054a6","event":"bag_count","timestamp":"2026-08-20T11:22:34.877207+00:00","shift":"shift-a","camera":"Camera 1","total_count":3,"count":3,"track_id":42,"center_x":100.0,"center_y":200.0,"print_detection_enabled":true,"print_present":true,"print_status":"printed","printed_count":2,"missing_count":1}

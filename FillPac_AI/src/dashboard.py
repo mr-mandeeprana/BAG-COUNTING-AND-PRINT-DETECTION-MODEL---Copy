@@ -335,7 +335,40 @@ class DashboardState:
         publish_interval=0.5,
         stale_timeout=10.0,
         auto_publish=True,
+        enabled=True,
+        persist_interval_seconds=0.0,
     ):
+
+        # --------------------------------------------------
+        # Dashboard enabled
+        # --------------------------------------------------
+
+        self.enabled = safe_bool(
+            enabled,
+            True,
+        )
+
+        # --------------------------------------------------
+        # Disk-write throttle for callers that trigger an
+        # immediate publish (e.g. update_camera()).
+        #
+        # 0 (default) means every such call publishes right
+        # away -- the original synchronous behavior. A positive
+        # value means at most one disk write per that many
+        # seconds; in-memory state (get_state()/snapshot()) is
+        # always current regardless, only the on-disk file is
+        # throttled. The background auto-publish thread (if
+        # running) will still catch up any writes skipped by
+        # the throttle on its own publish_interval cadence.
+        # --------------------------------------------------
+
+        self.persist_interval_seconds = max(
+            0.0,
+            safe_float(
+                persist_interval_seconds,
+                0.0,
+            ),
+        )
 
         # --------------------------------------------------
         # State file
@@ -389,6 +422,10 @@ class DashboardState:
         self.auto_publish = bool(
             auto_publish
         )
+
+        # Explicit status set through set_system_status()
+        # must not be overwritten by automatic status detection.
+        self._system_status_explicit = False
 
 
         # --------------------------------------------------
@@ -495,6 +532,21 @@ class DashboardState:
 
 
         # --------------------------------------------------
+        # Load previously persisted state, if present.
+        #
+        # DashboardState is otherwise stateless across process
+        # restarts -- when state_file already exists on disk
+        # (written by a prior run, or by another process/
+        # instance), seed the in-memory state from it so
+        # cameras and totals aren't silently reset to empty
+        # every time a fresh DashboardState is constructed
+        # against the same file.
+        # --------------------------------------------------
+
+        self._load_persisted_state()
+
+
+        # --------------------------------------------------
         # Prepare directory
         # --------------------------------------------------
 
@@ -535,6 +587,114 @@ class DashboardState:
             "Dashboard publish interval: %.3fs",
             self.publish_interval,
         )
+
+
+    # ======================================================
+    # LOAD PERSISTED STATE
+    # ======================================================
+
+    def _load_persisted_state(
+        self,
+    ):
+        """
+        Merge previously persisted state.json content (if any)
+        into the freshly built self._state.
+
+        Called once during __init__, before the directory is
+        prepared and before the initial publish. Runs
+        single-threaded (no other thread has a reference to
+        this instance yet), so no locking is required here.
+
+        Malformed, unreadable, or missing files are ignored --
+        the freshly built in-memory defaults are kept in that
+        case.
+        """
+
+        try:
+
+            if not self.state_file.exists():
+                return
+
+            with open(
+                self.state_file,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                loaded = json.load(
+                    file
+                )
+
+        except (
+            OSError,
+            ValueError,
+        ):
+
+            logger.warning(
+                "Could not load existing dashboard state "
+                "file, starting fresh: %s",
+                self.state_file,
+            )
+
+            return
+
+        if not isinstance(
+            loaded,
+            dict,
+        ):
+            return
+
+        # ----------------------------------------------------
+        # Cameras -- restored as-is. Existing accessors read
+        # camera fields through .get(...) with defaults, so a
+        # persisted camera dict doesn't need to be re-run
+        # through the full register_camera() schema here.
+        # ----------------------------------------------------
+
+        if isinstance(
+            loaded.get("cameras"),
+            dict,
+        ):
+
+            self._state[
+                "cameras"
+            ] = loaded["cameras"]
+
+        # ----------------------------------------------------
+        # Service status -- merge over the defaults rather than
+        # replacing wholesale, so newly added health keys still
+        # get their default values even against an older file.
+        # ----------------------------------------------------
+
+        if isinstance(
+            loaded.get("service_status"),
+            dict,
+        ):
+
+            self._state[
+                "service_status"
+            ].update(
+                loaded["service_status"]
+            )
+
+        # ----------------------------------------------------
+        # Scalar top-level fields.
+        # ----------------------------------------------------
+
+        for key in (
+            "system_status",
+            "total_count",
+            "total_printed_count",
+            "total_missing_count",
+            "total_printed_bags_count",
+            "total_not_printed_bags_count",
+        ):
+
+            if key in loaded:
+
+                self._state[
+                    key
+                ] = loaded[key]
 
 
     # ======================================================
@@ -1641,10 +1801,18 @@ class DashboardState:
 
             self._recalculate_totals_locked()
 
-
-    # ======================================================
-    # CAMERA ONLINE
-    # ======================================================
+        # In-memory state is already current at this point
+        # (updated under the lock above). Whether this also
+        # hits disk right now depends on persist_interval_seconds:
+        # 0 (default) publishes immediately every call; a
+        # positive value throttles disk writes to at most once
+        # per that interval, while get_state()/snapshot() still
+        # reflect the latest in-memory values regardless. Any
+        # write skipped by the throttle stays "dirty" and will
+        # be caught by the background auto-publish thread (if
+        # running) on its own publish_interval cadence, or by an
+        # explicit flush().
+        self._publish_throttled()
 
     def camera_online(
         self,
@@ -1843,6 +2011,9 @@ class DashboardState:
     ):
         """
         Explicitly set application system status.
+
+        Explicit status is authoritative and must not be
+        overwritten by automatic system-status detection.
         """
 
         with self._lock:
@@ -1853,7 +2024,14 @@ class DashboardState:
                 status
             ).lower()
 
+            self._system_status_explicit = True
+
             self._touch_locked()
+
+        # Persist explicit system-status changes immediately.
+        self.publish(
+            force=True
+        )
 
 
     # ======================================================
@@ -2012,6 +2190,21 @@ class DashboardState:
 
 
     # ======================================================
+    # SNAPSHOT (ALIAS)
+    # ======================================================
+
+    def snapshot(
+        self,
+    ):
+        """
+        Alias for get_state(), for callers/tests using the
+        "snapshot" naming instead.
+        """
+
+        return self.get_state()
+
+
+    # ======================================================
     # GET STATUS
     # ======================================================
 
@@ -2163,6 +2356,7 @@ class DashboardState:
         Update high-level status from application health.
 
         Explicit stopping/offline/error states are preserved.
+        Explicitly assigned application states are also preserved.
         """
 
         current = str(
@@ -2171,6 +2365,15 @@ class DashboardState:
                 "",
             )
         ).lower()
+
+        # Explicit application status must not be
+        # overwritten by automatic health calculation.
+        if getattr(
+            self,
+            "_system_status_explicit",
+            False,
+        ):
+            return
 
 
         if current in {
@@ -2563,6 +2766,51 @@ class DashboardState:
         return self.publish(
             force=True
         )
+
+
+    # ======================================================
+    # THROTTLED PUBLISH
+    # ======================================================
+
+    def _publish_throttled(
+        self,
+    ):
+        """
+        Publish to disk, respecting persist_interval_seconds.
+
+        In-memory state is always current the moment a caller
+        like update_camera() returns -- this only decides
+        whether *this particular call* also writes state.json
+        right now, or leaves that to the next explicit flush()
+        or the background auto-publish thread.
+        """
+
+        if self.persist_interval_seconds <= 0:
+
+            self.publish(
+                force=True
+            )
+
+            return
+
+        with self._lock:
+
+            elapsed = (
+                time.monotonic()
+                - self._last_publish_monotonic
+            )
+
+        if elapsed >= self.persist_interval_seconds:
+
+            self.publish(
+                force=True
+            )
+
+        # Otherwise: leave _dirty set (already true from
+        # _touch_locked()). The background publisher picks it
+        # up on its own interval if auto_publish is running;
+        # otherwise the next throttled or explicit publish call
+        # will flush it once the interval has elapsed.
 
 
     # ======================================================

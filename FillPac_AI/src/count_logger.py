@@ -249,7 +249,12 @@ class CountLogger:
         file_path=None,
         enabled=True,
         flush_immediately=True,
+        log_file=None,
     ):
+
+        # Backward/test-compatible alias
+        if log_file is not None:
+            file_path = log_file
 
         self.enabled = bool(
             enabled
@@ -659,6 +664,43 @@ class CountLogger:
         )
 
         return event
+
+
+    # ======================================================
+    # COMPATIBILITY ALIAS (log_count_event)
+    # ======================================================
+
+    def log_count_event(
+        self,
+        camera_name,
+        total_count=0,
+        track_id=None,
+        center=None,
+        print_present=None,
+        printed_count=0,
+        missing_count=0,
+        print_detection_enabled=True,
+        **kwargs,
+    ):
+        """
+        Compatibility wrapper for log_count().
+
+        Keeps the public API compatible with tests and
+        older callers while using the existing log_count()
+        implementation.
+        """
+
+        return self.log_count(
+            camera_name=camera_name,
+            total_count=total_count,
+            track_id=track_id,
+            center=center,
+            print_present=print_present,
+            printed_count=printed_count,
+            missing_count=missing_count,
+            print_detection_enabled=print_detection_enabled,
+            **kwargs,
+        )
 
 
     # ======================================================

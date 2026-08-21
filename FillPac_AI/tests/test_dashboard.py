@@ -49,7 +49,11 @@ def test_dashboard_state_includes_camera_status(tmp_path):
             "queue_occupancy": 1,
             "frames_read": 12,
             "frames_dropped": 0,
+        },
+    )
 
+    state_file.write_text(
+        json.dumps(
             {
                 "system_status": "running",
                 "total_count": 5,

@@ -63,7 +63,12 @@ After a physical bag crossing is confirmed:
 UNKNOWN does not increase the missing count.
 ==========================================================
 """
-
+from database.repository import (
+    save_production_event,
+    save_print_event,
+    start_jam_event,
+    end_jam_event,
+)
 from datetime import datetime, timezone
 
 import threading
@@ -583,6 +588,16 @@ class Pipeline:
         self.previous_condition_b_jam = False
         self.previous_condition_c_jam = False
 
+        # SQL Server jam event tracking
+        self.condition_a_sql_jam_id = None
+        self.condition_a_sql_jam_start = None
+
+        self.condition_b_sql_jam_id = None
+        self.condition_b_sql_jam_start = None
+
+        self.condition_c_sql_jam_id = None
+        self.condition_c_sql_jam_start = None
+
         # ==================================================
         # VISUALIZER
         # ==================================================
@@ -620,6 +635,10 @@ class Pipeline:
             ),
             1,
         )
+
+        # Backward-compatible alias — some call sites and tests
+        # refer to this configuration value by this name.
+        self.min_print_votes = self.min_print_observations
 
         self.print_history_size = max(
             int(
@@ -1703,91 +1722,454 @@ class Pipeline:
             return
 
         try:
-            # --------------------------------------------------
+
+            # ==================================================
             # CONDITION A - MOVEMENT JAM
-            # --------------------------------------------------
+            # ==================================================
 
             condition_a_jam = bool(
-                self.jam_result.get("jam", False)
+                self.jam_result.get(
+                    "jam",
+                    False,
+                )
             )
 
             if condition_a_jam != self.previous_condition_a_jam:
 
-                self.count_logger.log_event(
-                    event_type=(
-                        "jam_condition_a"
-                        if condition_a_jam
-                        else "jam_condition_a_recovered"
-                    ),
-                    camera_name=self.name,
-                    status=(
-                        "jam"
-                        if condition_a_jam
-                        else "normal"
-                    ),
-                    jam_result=self.jam_result,
-                    roi=self.jam_roi,
-                )
+                # --------------------------------------------------
+                # JAM START
+                # --------------------------------------------------
+
+                if condition_a_jam:
+
+                    try:
+
+                        self.condition_a_sql_jam_start = (
+                            datetime.now(timezone.utc)
+                        )
+
+                        self.condition_a_sql_jam_id = (
+                            start_jam_event(
+                                camera_id=self.name,
+                                condition_code="A",
+                                jam_type="movement",
+                                track_ids=(
+                                    self.jam_result.get(
+                                        "active_jam_track_ids",
+                                        [],
+                                    )
+                                ),
+                                reason=(
+                                    self.jam_result.get(
+                                        "reason"
+                                    )
+                                ),
+                                metadata={
+                                    "condition_code": "A",
+                                    "condition_name": "MOVEMENT_JAM",
+                                    "jam_type": "movement",
+                                    "jam_result": self.jam_result,
+                                    "roi": self.jam_roi,
+                                    "track_ids": (
+                                        self.jam_result.get(
+                                            "active_jam_track_ids",
+                                            [],
+                                        )
+                                        or []
+                                    ),
+                                },
+                            )
+                        )
+
+                    except Exception as error:
+
+                        self.condition_a_sql_jam_id = None
+                        self.condition_a_sql_jam_start = None
+
+                        self.logger.warning(
+                            f"{self.name}: failed to start "
+                            f"SQL Condition A jam event: {error}"
+                        )
+
+                # --------------------------------------------------
+                # JAM RECOVERY
+                # --------------------------------------------------
+
+                else:
+
+                    if self.condition_a_sql_jam_id is not None:
+
+                        start_time = (
+                            self.condition_a_sql_jam_start
+                        )
+
+                        if start_time is not None:
+
+                            duration_seconds = (
+                                datetime.now(timezone.utc)
+                                - start_time
+                            ).total_seconds()
+
+                        else:
+
+                            duration_seconds = 0.0
+
+                        try:
+
+                            end_jam_event(
+                                jam_event_id=(
+                                    self.condition_a_sql_jam_id
+                                ),
+                                duration_seconds=(
+                                    duration_seconds
+                                ),
+                                status="RECOVERED",
+                            )
+
+                        except Exception as error:
+
+                            self.logger.warning(
+                                f"{self.name}: failed to end "
+                                f"SQL Condition A jam event: {error}"
+                            )
+
+                    self.condition_a_sql_jam_id = None
+                    self.condition_a_sql_jam_start = None
+
+                # --------------------------------------------------
+                # EXISTING COUNT LOGGER
+                # --------------------------------------------------
+
+                try:
+
+                    self.count_logger.log_event(
+                        event_type=(
+                            "jam_condition_a"
+                            if condition_a_jam
+                            else "jam_condition_a_recovered"
+                        ),
+                        camera_name=self.name,
+                        status=(
+                            "jam"
+                            if condition_a_jam
+                            else "normal"
+                        ),
+                        jam_result=self.jam_result,
+                        roi=self.jam_roi,
+                    )
+
+                except Exception as error:
+
+                    self.logger.warning(
+                        f"{self.name}: failed CountLogger "
+                        f"Condition A event: {error}"
+                    )
 
                 self.previous_condition_a_jam = (
                     condition_a_jam
                 )
 
-            # --------------------------------------------------
+            # ==================================================
             # CONDITION B - BAG SPACING JAM
-            # --------------------------------------------------
+            # ==================================================
 
             condition_b_jam = bool(
-                self.spacing_result.get("jam", False)
+                self.spacing_result.get(
+                    "jam",
+                    False,
+                )
             )
 
             if condition_b_jam != self.previous_condition_b_jam:
 
-                self.count_logger.log_event(
-                    event_type=(
-                        "jam_condition_b"
-                        if condition_b_jam
-                        else "jam_condition_b_recovered"
-                    ),
-                    camera_name=self.name,
-                    status=(
-                        "jam"
-                        if condition_b_jam
-                        else "normal"
-                    ),
-                    spacing_result=self.spacing_result,
-                    roi=self.spacing_roi,
-                )
+                # --------------------------------------------------
+                # JAM START
+                # --------------------------------------------------
+
+                if condition_b_jam:
+
+                    try:
+
+                        self.condition_b_sql_jam_start = (
+                            datetime.now(timezone.utc)
+                        )
+
+                        self.condition_b_sql_jam_id = (
+                            start_jam_event(
+                                camera_id=self.name,
+                                condition_code="B",
+                                jam_type="spacing",
+                                track_ids=(
+                                    self.spacing_result.get(
+                                        "active_jam_track_ids",
+                                        [],
+                                    )
+                                ),
+                                reason=(
+                                    self.spacing_result.get(
+                                        "reason"
+                                    )
+                                ),
+                                roi_snapshot_id=None,
+                                metadata={
+                                    "condition_code": "B",
+                                    "condition_name": "BAG_SPACING_JAM",
+                                    "jam_type": "spacing",
+                                    "spacing_result": (
+                                        self.spacing_result
+                                    ),
+                                    "roi": self.spacing_roi,
+                                    "track_ids": (
+                                        self.spacing_result.get(
+                                            "active_jam_track_ids",
+                                            [],
+                                        )
+                                        or []
+                                    ),
+                                },
+                            )
+                        )
+
+                    except Exception as error:
+
+                        self.condition_b_sql_jam_id = None
+                        self.condition_b_sql_jam_start = None
+
+                        self.logger.warning(
+                            f"{self.name}: failed to start "
+                            f"SQL Condition B jam event: {error}"
+                        )
+
+                # --------------------------------------------------
+                # JAM RECOVERY
+                # --------------------------------------------------
+
+                else:
+
+                    if self.condition_b_sql_jam_id is not None:
+
+                        start_time = (
+                            self.condition_b_sql_jam_start
+                        )
+
+                        if start_time is not None:
+
+                            duration_seconds = (
+                                datetime.now(timezone.utc)
+                                - start_time
+                            ).total_seconds()
+
+                        else:
+
+                            duration_seconds = 0.0
+
+                        try:
+
+                            end_jam_event(
+                                jam_event_id=(
+                                    self.condition_b_sql_jam_id
+                                ),
+                                duration_seconds=(
+                                    duration_seconds
+                                ),
+                                status="RECOVERED",
+                            )
+
+                        except Exception as error:
+
+                            self.logger.warning(
+                                f"{self.name}: failed to end "
+                                f"SQL Condition B jam event: {error}"
+                            )
+
+                    self.condition_b_sql_jam_id = None
+                    self.condition_b_sql_jam_start = None
+
+                # --------------------------------------------------
+                # EXISTING COUNT LOGGER
+                # --------------------------------------------------
+
+                try:
+
+                    self.count_logger.log_event(
+                        event_type=(
+                            "jam_condition_b"
+                            if condition_b_jam
+                            else "jam_condition_b_recovered"
+                        ),
+                        camera_name=self.name,
+                        status=(
+                            "jam"
+                            if condition_b_jam
+                            else "normal"
+                        ),
+                        spacing_result=self.spacing_result,
+                        roi=self.spacing_roi,
+                    )
+
+                except Exception as error:
+
+                    self.logger.warning(
+                        f"{self.name}: failed CountLogger "
+                        f"Condition B event: {error}"
+                    )
 
                 self.previous_condition_b_jam = (
                     condition_b_jam
                 )
 
-            # --------------------------------------------------
+            # ==================================================
             # CONDITION C - ROI OCCUPANCY JAM
-            # --------------------------------------------------
+            # ==================================================
+
+            condition_c_result = (
+                self._condition_c()
+            )
 
             condition_c_jam = bool(
-                self._condition_c().get("jam", False)
+                condition_c_result.get(
+                    "jam",
+                    False,
+                )
             )
 
             if condition_c_jam != self.previous_condition_c_jam:
 
-                self.count_logger.log_event(
-                    event_type=(
-                        "jam_condition_c"
-                        if condition_c_jam
-                        else "jam_condition_c_recovered"
-                    ),
-                    camera_name=self.name,
-                    status=(
-                        "jam"
-                        if condition_c_jam
-                        else "normal"
-                    ),
-                    condition_c_result=self.condition_c_result,
-                    roi=self.condition_c_roi,
-                )
+                # --------------------------------------------------
+                # JAM START
+                # --------------------------------------------------
+
+                if condition_c_jam:
+
+                    try:
+
+                        self.condition_c_sql_jam_start = (
+                            datetime.now(timezone.utc)
+                        )
+
+                        self.condition_c_sql_jam_id = (
+                            start_jam_event(
+                                camera_id=self.name,
+                                condition_code="C",
+                                jam_type="roi_occupancy",
+                                track_ids=(
+                                    condition_c_result.get(
+                                        "track_ids",
+                                        [],
+                                    )
+                                ),
+                                reason=(
+                                    condition_c_result.get(
+                                        "reason",
+                                        "ROI occupancy exceeded limit",
+                                    )
+                                ),
+                                metadata={
+                                    "condition_code": "C",
+                                    "condition_name": "ROI_OCCUPANCY_JAM",
+                                    "jam_type": "roi_occupancy",
+                                    "condition_c_result": (
+                                        condition_c_result
+                                    ),
+                                    "roi": (
+                                        self.condition_c_roi
+                                    ),
+                                    "track_ids": (
+                                        condition_c_result.get(
+                                            "track_ids",
+                                            [],
+                                        )
+                                        or []
+                                    ),
+                                },
+                            )
+                        )
+
+                    except Exception as error:
+
+                        self.condition_c_sql_jam_id = None
+                        self.condition_c_sql_jam_start = None
+
+                        self.logger.warning(
+                            f"{self.name}: failed to start "
+                            f"SQL Condition C jam event: {error}"
+                        )
+
+                # --------------------------------------------------
+                # JAM RECOVERY
+                # --------------------------------------------------
+
+                else:
+
+                    if self.condition_c_sql_jam_id is not None:
+
+                        start_time = (
+                            self.condition_c_sql_jam_start
+                        )
+
+                        if start_time is not None:
+
+                            duration_seconds = (
+                                datetime.now(timezone.utc)
+                                - start_time
+                            ).total_seconds()
+
+                        else:
+
+                            duration_seconds = 0.0
+
+                        try:
+
+                            end_jam_event(
+                                jam_event_id=(
+                                    self.condition_c_sql_jam_id
+                                ),
+                                duration_seconds=(
+                                    duration_seconds
+                                ),
+                                status="RECOVERED",
+                            )
+
+                        except Exception as error:
+
+                            self.logger.warning(
+                                f"{self.name}: failed to end "
+                                f"SQL Condition C jam event: {error}"
+                            )
+
+                    self.condition_c_sql_jam_id = None
+                    self.condition_c_sql_jam_start = None
+
+                # --------------------------------------------------
+                # EXISTING COUNT LOGGER
+                # --------------------------------------------------
+
+                try:
+
+                    self.count_logger.log_event(
+                        event_type=(
+                            "jam_condition_c"
+                            if condition_c_jam
+                            else "jam_condition_c_recovered"
+                        ),
+                        camera_name=self.name,
+                        status=(
+                            "jam"
+                            if condition_c_jam
+                            else "normal"
+                        ),
+                        condition_c_result=(
+                            condition_c_result
+                        ),
+                        roi=self.condition_c_roi,
+                    )
+
+                except Exception as error:
+
+                    self.logger.warning(
+                        f"{self.name}: failed CountLogger "
+                        f"Condition C event: {error}"
+                    )
 
                 self.previous_condition_c_jam = (
                     condition_c_jam
@@ -2153,11 +2535,17 @@ class Pipeline:
             votes
         )
 
-        if (
-            observation_count
-            <
-            self.min_print_observations
-        ):
+        min_print_votes = getattr(
+            self,
+            "min_print_votes",
+            getattr(
+                self,
+                "min_print_observations",
+                1,
+            ),
+        )
+
+        if observation_count < int(min_print_votes):
 
             return None
 
@@ -2181,6 +2569,81 @@ class Pipeline:
             >=
             self.print_vote_threshold
         )
+
+    # ======================================================
+    # FINALIZE PRINT STATUS
+    # ======================================================
+
+    def _finalize_print_status(
+        self,
+        track_id,
+    ):
+        """
+        Finalize print classification for one track.
+
+        Unlike _classify_print_history(), this does not wait
+        for a minimum observation count: it is called once a
+        track's physical bag crossing has already been
+        confirmed, so no further observations will arrive.
+        Whatever votes have been accumulated are classified
+        immediately using the configured vote threshold, and
+        the track's temporary print history is then removed.
+
+        Returns
+        -------
+        bool | None
+            True  -> printed
+            False -> missing / not printed
+            None  -> no observations recorded, or disabled
+        """
+
+        if not self.print_detection_enabled:
+            return None
+
+        votes = self.track_print_votes.get(
+            track_id,
+            [],
+        )
+
+        if not votes:
+            self.track_print_last_seen.pop(
+                track_id,
+                None,
+            )
+            return None
+
+        positive_count = sum(
+            1
+            for vote in votes
+            if vote
+        )
+
+        ratio = (
+            positive_count
+            /
+            max(
+                len(votes),
+                1,
+            )
+        )
+
+        result = (
+            ratio
+            >=
+            self.print_vote_threshold
+        )
+
+        self.track_print_votes.pop(
+            track_id,
+            None,
+        )
+
+        self.track_print_last_seen.pop(
+            track_id,
+            None,
+        )
+
+        return result
 
     # ======================================================
     # DRAW
@@ -2564,6 +3027,30 @@ class Pipeline:
                     "print event to Elasticsearch."
                 )
 
+            # ==================================================
+            # SQL SERVER PRINT EVENT
+            # ==================================================
+
+            try:
+
+                save_print_event(
+                    camera_id=self.name,
+                    result=counted_print_status,
+                    timestamp=None,
+                    metadata={
+                        "print_present": (
+                            counted_print_status == "printed"
+                        ),
+                    },
+                )
+
+            except Exception as e:
+
+                self.logger.error(
+                    f"{self.name}: failed saving "
+                    f"print event to SQL Server: {e}"
+                )
+
         # ==================================================
         # COUNT EVENTS
         # ==================================================
@@ -2594,6 +3081,57 @@ class Pipeline:
                         f"{self.name}: failed publishing "
                         "count event to Elasticsearch."
                     )
+
+            # ==================================================
+            # SQL SERVER PRODUCTION EVENT
+            # ==================================================
+
+            try:
+
+                save_production_event(
+                    camera_id=self.name,
+
+                    bag_count=self.counter.total_count,
+
+                    printed_count=self.printed_count,
+
+                    unprinted_count=self.missing_count,
+
+                    line_count=self.counter.total_count,
+
+                    frame_roi_count=(
+                        self.entry_roi_count
+                        if self.entry_roi_counter is not None
+                        else 0
+                    ),
+
+                    bags_inside_roi=(
+                        len(
+                            getattr(
+                                self.entry_roi_counter,
+                                "active_track_ids",
+                                []
+                            )
+                        )
+                        if self.entry_roi_counter is not None
+                        else 0
+                    ),
+
+                    metadata={
+                        "track_id": counted_bag.get("track_id"),
+                        "center": counted_bag.get("center"),
+                        "print_present": counted_bag.get("print_present"),
+                        "printed_count_event": counted_bag.get("printed_count"),
+                        "missing_count_event": counted_bag.get("missing_count"),
+                    },
+                )
+
+            except Exception as e:
+
+                self.logger.error(
+                    f"{self.name}: failed saving "
+                    f"production event to SQL Server: {e}"
+                )
 
             if self.count_logger is not None:
 

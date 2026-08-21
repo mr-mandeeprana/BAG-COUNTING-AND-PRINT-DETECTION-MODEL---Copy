@@ -1,18 +1,18 @@
 {
   "system_status": "offline",
-  "startup_time": "2026-08-19T10:53:23.975136+00:00",
-  "updated_at": "2026-08-19T11:01:28.216118+00:00",
+  "startup_time": "2026-08-21T05:53:28.975679+00:00",
+  "updated_at": "2026-08-21T05:54:16.666655+00:00",
   "service_status": {
     "model_loaded": false,
     "inference_manager_running": false,
     "elasticsearch_connected": false,
     "dashboard_enabled": true
   },
-  "total_count": 40,
+  "total_count": 222,
   "total_printed_count": 0,
-  "total_missing_count": 40,
+  "total_missing_count": 222,
   "total_printed_bags_count": 0,
-  "total_not_printed_bags_count": 40,
+  "total_not_printed_bags_count": 222,
   "cameras": {
     "Camera 1": {
       "id": 1,
@@ -22,12 +22,12 @@
       "mode": "video",
       "source_type": "video",
       "status": "offline",
-      "count": 20,
-      "total_count": 20,
+      "count": 118,
+      "total_count": 118,
       "printed_count": 0,
-      "missing_count": 20,
+      "missing_count": 118,
       "printed_bags_count": 0,
-      "not_printed_bags_count": 20,
+      "not_printed_bags_count": 118,
       "print_detection_enabled": true,
       "print_status": "offline",
       "jam_detection_enabled": true,
@@ -45,15 +45,15 @@
       "condition_c_distances": [],
       "condition_c_image_path": null,
       "condition_c_image_url": null,
-      "condition_c_timestamp": "2026-08-19T11:01:28.097369+00:00",
+      "condition_c_timestamp": "2026-08-21T05:54:16.562476+00:00",
       "fps": 0.0,
-      "frame_count": 1488,
-      "last_frame_at": "2026-08-19T11:01:27.698467+00:00",
+      "frame_count": 174,
+      "last_frame_at": "2026-08-21T05:54:16.293993+00:00",
       "last_detection_at": null,
-      "last_count_at": "2026-08-19T11:00:11.617140+00:00",
+      "last_count_at": "2026-08-21T05:54:12.874048+00:00",
       "last_error": null,
       "registered_at": "2026-08-19T10:53:24.431532+00:00",
-      "updated_at": "2026-08-19T11:01:28.216118+00:00",
+      "updated_at": "2026-08-21T05:54:16.666655+00:00",
       "metadata": {
         "roi": {
           "x1": 640,
@@ -77,7 +77,7 @@
           "x2": 1220,
           "y2": 680
         },
-        "spacing_threshold_mm": 305.0,
+        "spacing_threshold_mm": 655.0,
         "condition_c_enabled": true,
         "condition_c_roi": {
           "x1": 180,
@@ -94,7 +94,7 @@
       "spacing_detection_enabled": true,
       "spacing_status": "normal",
       "spacing_jam_detected": false,
-      "spacing_threshold_mm": 305.0,
+      "spacing_threshold_mm": 655.0,
       "minimum_gap_mm": null,
       "spacing_pairs": [],
       "spacing_jam_pairs": [],
@@ -105,32 +105,14 @@
         "x2": 1220,
         "y2": 680
       },
-      "condition_c_max_allowed_bags": 2,
+      "condition_c_max_allowed_bags": 1,
       "condition_c_roi_occupancy": 0.0,
       "condition_c_duration": 0,
       "jam_types": [],
-      "entry_roi_count": 22,
-      "entry_roi_active_count": 2,
-      "entry_roi_active_track_ids": [
-        29,
-        30
-      ],
-      "entry_roi_active_bags": [
-        {
-          "track_id": 29,
-          "center": [
-            534.0,
-            238.0
-          ]
-        },
-        {
-          "track_id": 30,
-          "center": [
-            492.0,
-            372.0
-          ]
-        }
-      ],
+      "entry_roi_count": 4,
+      "entry_roi_active_count": 0,
+      "entry_roi_active_track_ids": [],
+      "entry_roi_active_bags": [],
       "entry_roi": {
         "x1": 273,
         "y1": 120,
@@ -148,12 +130,12 @@
       "mode": "video",
       "source_type": "video",
       "status": "offline",
-      "count": 20,
-      "total_count": 20,
+      "count": 104,
+      "total_count": 104,
       "printed_count": 0,
-      "missing_count": 20,
+      "missing_count": 104,
       "printed_bags_count": 0,
-      "not_printed_bags_count": 20,
+      "not_printed_bags_count": 104,
       "print_detection_enabled": true,
       "print_status": "offline",
       "jam_detection_enabled": true,
@@ -171,15 +153,15 @@
       "condition_c_distances": [],
       "condition_c_image_path": null,
       "condition_c_image_url": null,
-      "condition_c_timestamp": "2026-08-19T11:01:28.030454+00:00",
+      "condition_c_timestamp": "2026-08-21T05:54:16.655404+00:00",
       "fps": 0.0,
-      "frame_count": 1487,
-      "last_frame_at": "2026-08-19T11:01:27.575146+00:00",
+      "frame_count": 175,
+      "last_frame_at": "2026-08-21T05:54:16.161583+00:00",
       "last_detection_at": null,
-      "last_count_at": "2026-08-19T11:00:11.891719+00:00",
+      "last_count_at": "2026-08-21T05:54:11.891793+00:00",
       "last_error": null,
       "registered_at": "2026-08-19T10:53:24.431532+00:00",
-      "updated_at": "2026-08-19T11:01:28.216118+00:00",
+      "updated_at": "2026-08-21T05:54:16.666655+00:00",
       "metadata": {
         "roi": {
           "x1": 640,
@@ -203,7 +185,7 @@
           "x2": 1220,
           "y2": 680
         },
-        "spacing_threshold_mm": 305.0,
+        "spacing_threshold_mm": 655.0,
         "condition_c_enabled": true,
         "condition_c_roi": {
           "x1": 180,
@@ -220,7 +202,7 @@
       "spacing_detection_enabled": true,
       "spacing_status": "normal",
       "spacing_jam_detected": false,
-      "spacing_threshold_mm": 305.0,
+      "spacing_threshold_mm": 655.0,
       "minimum_gap_mm": null,
       "spacing_pairs": [],
       "spacing_jam_pairs": [],
@@ -231,32 +213,14 @@
         "x2": 1220,
         "y2": 680
       },
-      "condition_c_max_allowed_bags": 2,
+      "condition_c_max_allowed_bags": 1,
       "condition_c_roi_occupancy": 0.0,
       "condition_c_duration": 0,
       "jam_types": [],
-      "entry_roi_count": 22,
-      "entry_roi_active_count": 2,
-      "entry_roi_active_track_ids": [
-        29,
-        30
-      ],
-      "entry_roi_active_bags": [
-        {
-          "track_id": 29,
-          "center": [
-            516.0,
-            244.0
-          ]
-        },
-        {
-          "track_id": 30,
-          "center": [
-            470.0,
-            374.0
-          ]
-        }
-      ],
+      "entry_roi_count": 4,
+      "entry_roi_active_count": 0,
+      "entry_roi_active_track_ids": [],
+      "entry_roi_active_bags": [],
       "entry_roi": {
         "x1": 273,
         "y1": 120,
@@ -268,5 +232,5 @@
     }
   },
   "state_stale": false,
-  "uptime_seconds": 484.25
+  "uptime_seconds": 47.687999999994645
 }

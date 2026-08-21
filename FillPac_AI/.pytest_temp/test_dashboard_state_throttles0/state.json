@@ -1,24 +1,19 @@
 {
-  "system_status": "idle",
-  "startup_time": "2026-07-17T12:57:52.909737+00:00",
-  "service_status": {},
-  "total_count": 1,
+  "system_status": "starting",
+  "startup_time": "2026-08-20T11:22:35.078924+00:00",
+  "updated_at": "2026-08-20T11:22:35.078924+00:00",
+  "service_status": {
+    "model_loaded": false,
+    "inference_manager_running": false,
+    "elasticsearch_connected": false,
+    "dashboard_enabled": true
+  },
+  "total_count": 0,
   "total_printed_count": 0,
   "total_missing_count": 0,
   "total_printed_bags_count": 0,
   "total_not_printed_bags_count": 0,
-  "cameras": {
-    "Camera 1": {
-      "count": 1,
-      "printed_count": 0,
-      "missing_count": 0,
-      "printed_bags_count": 0,
-      "not_printed_bags_count": 0,
-      "fps": 10.0,
-      "status": "online",
-      "print_status": "ok",
-      "camera_status": null,
-      "updated_at": "2026-07-17T12:57:52.917498+00:00"
-    }
-  }
+  "cameras": {},
+  "state_stale": false,
+  "uptime_seconds": 0.0
 }
