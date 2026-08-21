@@ -24,7 +24,7 @@ DashboardState
       +---- System Status
       |
       v
-dashboard/backend/state.json
+SQL Server (dbo.system_state / dbo.camera_status)
       |
       v
 Dashboard Backend
@@ -57,11 +57,8 @@ the camera pipeline.
 ==========================================================
 """
 
-import json
 import logging
 import math
-import os
-import tempfile
 import threading
 import time
 
@@ -69,28 +66,11 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from database.repository import load_dashboard_state, save_dashboard_state
+
 
 logger = logging.getLogger(
     "fillpac.dashboard_state"
-)
-
-
-# ==========================================================
-# PROJECT PATHS
-# ==========================================================
-
-PROJECT_ROOT = (
-    Path(__file__)
-    .resolve()
-    .parent
-    .parent
-)
-
-DEFAULT_STATE_FILE = (
-    PROJECT_ROOT
-    / "dashboard"
-    / "backend"
-    / "state.json"
 )
 
 
@@ -317,12 +297,11 @@ class DashboardState:
     One instance should be shared by all camera pipelines
     and the main application.
 
-    The state is periodically written to:
-
-        dashboard/backend/state.json
-
-    The dashboard server reads that file and broadcasts
-    changes through Socket.IO.
+    The state is periodically written to SQL Server
+    (dbo.system_state / dbo.camera_status) via repository.py.
+    state.json is no longer used -- the dashboard backend
+    should read the same SQL tables directly instead of
+    watching a file.
     """
 
     # ======================================================
@@ -371,32 +350,21 @@ class DashboardState:
         )
 
         # --------------------------------------------------
-        # State file
+        # State file (DEPRECATED)
+        #
+        # state.json has been replaced by SQL Server storage.
+        # The parameter is still accepted so existing callers
+        # (config.yaml / application.py) don't break, but it
+        # is no longer used for anything.
         # --------------------------------------------------
 
-        if state_file is None:
+        if state_file is not None:
 
-            self.state_file = (
-                DEFAULT_STATE_FILE
+            logger.warning(
+                "DashboardState(state_file=...) is deprecated "
+                "and ignored -- state is now stored in SQL "
+                "Server (dbo.system_state / dbo.camera_status)."
             )
-
-        else:
-
-            self.state_file = Path(
-                state_file
-            )
-
-            if not self.state_file.is_absolute():
-
-                self.state_file = (
-                    PROJECT_ROOT
-                    /
-                    self.state_file
-                )
-
-        self.state_file = (
-            self.state_file.resolve()
-        )
 
 
         # --------------------------------------------------
@@ -535,25 +503,14 @@ class DashboardState:
         # Load previously persisted state, if present.
         #
         # DashboardState is otherwise stateless across process
-        # restarts -- when state_file already exists on disk
-        # (written by a prior run, or by another process/
-        # instance), seed the in-memory state from it so
-        # cameras and totals aren't silently reset to empty
-        # every time a fresh DashboardState is constructed
-        # against the same file.
+        # restarts -- when a snapshot already exists in SQL
+        # Server (written by a prior run, or by another
+        # process/instance), seed the in-memory state from it
+        # so cameras and totals aren't silently reset to empty
+        # every time a fresh DashboardState is constructed.
         # --------------------------------------------------
 
         self._load_persisted_state()
-
-
-        # --------------------------------------------------
-        # Prepare directory
-        # --------------------------------------------------
-
-        self.state_file.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
 
 
         # --------------------------------------------------
@@ -579,8 +536,8 @@ class DashboardState:
         )
 
         logger.info(
-            "Dashboard state file: %s",
-            self.state_file,
+            "Dashboard state storage: SQL Server "
+            "(dbo.system_state / dbo.camera_status)"
         )
 
         logger.info(
@@ -597,43 +554,31 @@ class DashboardState:
         self,
     ):
         """
-        Merge previously persisted state.json content (if any)
+        Merge previously persisted dashboard state (if any)
         into the freshly built self._state.
 
-        Called once during __init__, before the directory is
-        prepared and before the initial publish. Runs
-        single-threaded (no other thread has a reference to
-        this instance yet), so no locking is required here.
+        Called once during __init__, before the initial
+        publish. Runs single-threaded (no other thread has a
+        reference to this instance yet), so no locking is
+        required here.
 
-        Malformed, unreadable, or missing files are ignored --
-        the freshly built in-memory defaults are kept in that
-        case.
+        State is loaded from SQL Server (dbo.system_state /
+        dbo.camera_status) via repository.load_dashboard_state().
+        A missing snapshot, or a database that isn't reachable
+        yet, is not fatal -- the freshly built in-memory
+        defaults are kept in that case.
         """
 
         try:
 
-            if not self.state_file.exists():
-                return
+            loaded = load_dashboard_state()
 
-            with open(
-                self.state_file,
-                "r",
-                encoding="utf-8",
-            ) as file:
-
-                loaded = json.load(
-                    file
-                )
-
-        except (
-            OSError,
-            ValueError,
-        ):
+        except Exception:
 
             logger.warning(
-                "Could not load existing dashboard state "
-                "file, starting fresh: %s",
-                self.state_file,
+                "Could not load persisted dashboard state "
+                "from SQL Server, starting fresh.",
+                exc_info=True,
             )
 
             return
@@ -2236,10 +2181,8 @@ class DashboardState:
                 "stale_timeout":
                     self.stale_timeout,
 
-                "state_file":
-                    str(
-                        self.state_file
-                    ),
+                "storage":
+                    "sql-server",
 
                 "publish_count":
                     self._publish_count,
@@ -2528,29 +2471,16 @@ class DashboardState:
         force=False,
     ):
         """
-        Atomically publish dashboard state to JSON.
-
-        A temporary file + os.replace() is used so the
-        dashboard server never reads half-written JSON.
+        Publish dashboard state to SQL Server.
 
         The entire method runs under a dedicated
-        ``_publish_lock`` so only one thread is ever
-        writing the temp file / doing the atomic replace
-        at a time. ``_lock`` alone was not sufficient here
-        because it was only held while copying state, not
-        while the file was actually being written -- two
-        publisher/caller threads could race past that copy
-        step at nearly the same moment and then contend for
-        the destination file during os.replace().
-
-        On Windows, os.replace() can also raise
-        PermissionError when another process (commonly
-        antivirus/Windows Defender, or a file indexer/backup
-        agent) briefly holds an open handle to the
-        destination file. That lock is normally released
-        within a couple hundred milliseconds on affected
-        machines, so the replace is retried a bounded number
-        of times with a short backoff before giving up.
+        ``_publish_lock`` so only one thread is ever writing
+        to the database at a time. ``_lock`` alone was not
+        sufficient here because it was only held while
+        copying state, not while the write was actually
+        happening -- two publisher/caller threads could race
+        past that copy step at nearly the same moment and
+        then contend over the same SQL Server rows.
         """
 
         with self._publish_lock:
@@ -2589,113 +2519,11 @@ class DashboardState:
                 )
 
 
-            temp_path = None
-
-
             try:
 
-                self.state_file.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
+                save_dashboard_state(
+                    snapshot
                 )
-
-
-                fd, temp_name = (
-                    tempfile.mkstemp(
-                        prefix=(
-                            self.state_file.name
-                            + "."
-                        ),
-                        suffix=".tmp",
-                        dir=str(
-                            self.state_file.parent
-                        ),
-                        text=True,
-                    )
-                )
-
-
-                temp_path = Path(
-                    temp_name
-                )
-
-
-                with os.fdopen(
-                    fd,
-                    "w",
-                    encoding="utf-8",
-                ) as file:
-
-                    json.dump(
-                        snapshot,
-                        file,
-                        ensure_ascii=False,
-                        indent=2,
-                        default=str,
-                    )
-
-                    file.flush()
-
-                    try:
-
-                        os.fsync(
-                            file.fileno()
-                        )
-
-                    except OSError:
-
-                        pass
-
-
-                # ------------------------------------------------
-                # Atomic replace, with retry.
-                #
-                # Windows can transiently deny os.replace() with a
-                # PermissionError while Defender/AV, a backup
-                # agent, or a file indexer has state.json open for
-                # scanning. On corporate laptops this hold can run
-                # 100-200ms, so the backoff is sized above that.
-                # ------------------------------------------------
-
-                replace_error = None
-
-                max_replace_attempts = 20
-
-                for attempt in range(
-                    max_replace_attempts
-                ):
-
-                    try:
-
-                        os.replace(
-                            temp_path,
-                            self.state_file,
-                        )
-
-                        replace_error = None
-
-                        break
-
-                    except PermissionError as error:
-
-                        replace_error = error
-
-                        logger.warning(
-                            (
-                                "Dashboard state file "
-                                "locked, retrying "
-                                "replace (%d/%d): %s"
-                            ),
-                            attempt + 1,
-                            max_replace_attempts,
-                            self.state_file,
-                        )
-
-                        time.sleep(0.2)
-
-                if replace_error is not None:
-
-                    raise replace_error
 
 
                 with self._lock:
@@ -2730,23 +2558,9 @@ class DashboardState:
 
 
                 logger.exception(
-                    "Failed publishing dashboard state."
+                    "Failed publishing dashboard state "
+                    "to SQL Server."
                 )
-
-
-                if (
-                    temp_path is not None
-                    and
-                    temp_path.exists()
-                ):
-
-                    try:
-
-                        temp_path.unlink()
-
-                    except OSError:
-
-                        pass
 
 
                 return False

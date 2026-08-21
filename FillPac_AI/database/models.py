@@ -70,6 +70,44 @@ SCHEMA_STATEMENTS = [
     """,
 
     # ======================================================
+    # SYSTEM STATE / CAMERA STATUS -- LIVE PAYLOAD COLUMN
+    #
+    # DashboardState used to publish its full in-memory
+    # snapshot to dashboard/backend/state.json. That file is
+    # being removed; the same snapshot now lives in SQL
+    # Server instead. Rather than redesigning the dashboard
+    # payload into many narrow columns (which would require
+    # rewriting every dashboard consumer at the same time),
+    # a `state_json` column holds the full snapshot for each
+    # side, while the existing structured columns above stay
+    # populated for simple/fast queries.
+    # ======================================================
+
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('dbo.system_state')
+          AND name = 'state_json'
+    )
+    BEGIN
+        ALTER TABLE dbo.system_state
+        ADD state_json NVARCHAR(MAX) NULL;
+    END
+    """,
+
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('dbo.camera_status')
+          AND name = 'state_json'
+    )
+    BEGIN
+        ALTER TABLE dbo.camera_status
+        ADD state_json NVARCHAR(MAX) NULL;
+    END
+    """,
+
+    # ======================================================
     # PRINT EVENTS
     # ======================================================
 
@@ -133,6 +171,7 @@ SCHEMA_STATEMENTS = [
             duration_seconds FLOAT,
             jam_type NVARCHAR(100),
             condition_code NVARCHAR(10),
+            condition_name NVARCHAR(50),
             status NVARCHAR(50),
             track_ids NVARCHAR(MAX),
             reason NVARCHAR(1000),
@@ -144,6 +183,54 @@ SCHEMA_STATEMENTS = [
                 FOREIGN KEY (roi_snapshot_id)
                 REFERENCES dbo.roi_snapshots(id)
         );
+    END
+    """,
+
+    # ======================================================
+    # JAM EVENTS -- condition_name column
+    #
+    # Added after jam_events already existed in some
+    # deployments (condition_name was only ever written into
+    # metadata_json, never as its own column). This ALTER
+    # brings existing tables up to date the same way the
+    # state_json columns above were added.
+    # ======================================================
+
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('dbo.jam_events')
+          AND name = 'condition_name'
+    )
+    BEGIN
+        ALTER TABLE dbo.jam_events
+        ADD condition_name NVARCHAR(50) NULL;
+    END
+    """,
+
+    # ======================================================
+    # JAM EVENTS -- backfill condition_name on old rows
+    #
+    # Rows written before the column above existed have
+    # condition_name = NULL. This backfills them from
+    # condition_code every time the schema initializes --
+    # idempotent (WHERE condition_name IS NULL), so it's a
+    # no-op once everything is backfilled.
+    # ======================================================
+
+    """
+    IF OBJECT_ID('dbo.jam_events', 'U') IS NOT NULL
+    BEGIN
+        UPDATE dbo.jam_events
+        SET condition_name =
+            CASE condition_code
+                WHEN 'A' THEN 'MOVEMENT_JAM'
+                WHEN 'B' THEN 'BAG_SPACING_JAM'
+                WHEN 'C' THEN 'ROI_OCCUPANCY_JAM'
+                ELSE condition_name
+            END
+        WHERE condition_name IS NULL
+          AND condition_code IN ('A', 'B', 'C');
     END
     """,
 

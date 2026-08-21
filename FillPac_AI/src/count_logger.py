@@ -6,8 +6,8 @@ Production Count Event Logger
 
 Purpose
 -------
-Stores one persistent JSONL record whenever a physical
-bag crossing event is confirmed.
+Persists one record to SQL Server whenever a physical bag
+crossing event is confirmed.
 
 Architecture
 ------------
@@ -28,7 +28,7 @@ Counter
    v
 CountLogger
    |
-   +----> logs/count_events.jsonl
+   +----> SQL Server (dbo.production_events)
    |
    +----> Dashboard Events
    |
@@ -45,39 +45,30 @@ Counting remains the responsibility of the existing
 physical-center crossing logic.
 
 The logger only records confirmed events.
-==========================================================
+
+CHANGE LOG
+----------
+count_events.jsonl has been removed. Every confirmed bag
+crossing (log_count / log_count_event / log) is now written
+straight to dbo.production_events via database/repository.py.
+Generic events (log_event) are written to
+dbo.application_logs instead. The public API of this class
+is unchanged so existing callers do not need to change.
 """
 
-import json
 import logging
-import os
-import threading
 import uuid
 
 from datetime import datetime, timezone
-from pathlib import Path
+
+from database.repository import (
+    save_application_log,
+    save_production_event,
+)
 
 
 logger = logging.getLogger(
     "fillpac.count_logger"
-)
-
-
-# ==========================================================
-# DEFAULT EVENT FILE
-# ==========================================================
-
-PROJECT_ROOT = (
-    Path(__file__)
-    .resolve()
-    .parent
-    .parent
-)
-
-DEFAULT_EVENT_FILE = (
-    PROJECT_ROOT
-    / "logs"
-    / "count_events.jsonl"
 )
 
 
@@ -240,8 +231,17 @@ class CountLogger:
     """
     Thread-safe persistent bag count event logger.
 
-    Each confirmed bag crossing is stored as one JSON object
-    per line in count_events.jsonl.
+    Each confirmed bag crossing is stored as one row in
+    dbo.production_events. Each row represents exactly ONE
+    confirmed bag (bag_count = 1, printed_count / unprinted_
+    count reflect that single bag's print result) -- totals
+    are obtained on the dashboard/reporting side with
+    SUM(bag_count), SUM(printed_count), etc.
+
+    The full original event (including diagnostic-only
+    fields like track_id and physical center) is preserved
+    in the row's metadata_json column so nothing is lost
+    compared to the old JSONL format.
     """
 
     def __init__(
@@ -256,40 +256,24 @@ class CountLogger:
         if log_file is not None:
             file_path = log_file
 
+        if file_path is not None:
+
+            logger.warning(
+                "CountLogger(file_path=...) is deprecated and "
+                "ignored -- count events are now written to "
+                "SQL Server (dbo.production_events)."
+            )
+
         self.enabled = bool(
             enabled
         )
 
+        # Kept for backward compatibility. SQL Server writes
+        # are always immediately committed, so this no longer
+        # changes behavior, but existing callers may still
+        # read/pass the attribute.
         self.flush_immediately = bool(
             flush_immediately
-        )
-
-        if file_path is None:
-
-            self.file_path = (
-                DEFAULT_EVENT_FILE
-            )
-
-        else:
-
-            self.file_path = Path(
-                file_path
-            )
-
-            if not self.file_path.is_absolute():
-
-                self.file_path = (
-                    PROJECT_ROOT
-                    /
-                    self.file_path
-                )
-
-        self.file_path = (
-            self.file_path.resolve()
-        )
-
-        self._lock = (
-            threading.Lock()
         )
 
         self._events_written = 0
@@ -301,38 +285,13 @@ class CountLogger:
         self._last_error = None
 
 
-        # --------------------------------------------------
-        # Create event directory
-        # --------------------------------------------------
-
-        try:
-
-            self.file_path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-        except OSError as error:
-
-            logger.exception(
-                "Unable to create count event directory: %s",
-                self.file_path.parent,
-            )
-
-            self._last_error = str(
-                error
-            )
-
-            raise
-
-
         logger.info(
             "CountLogger initialized."
         )
 
         logger.info(
-            "Count event file: %s",
-            self.file_path,
+            "Count event storage: SQL Server "
+            "(dbo.production_events)"
         )
 
         logger.info(
@@ -370,7 +329,9 @@ class CountLogger:
             Camera that produced the confirmed count.
 
         total_count:
-            Current camera count after crossing.
+            Current camera count after crossing. Stored in
+            metadata_json for reference; the row's own
+            bag_count column is always 1 (one confirmed bag).
 
         track_id:
             Tracker ID associated with the detection.
@@ -387,10 +348,12 @@ class CountLogger:
             None  -> no classification / unknown
 
         printed_count:
-            Camera cumulative printed count.
+            Camera cumulative printed count (diagnostic,
+            stored in metadata_json).
 
         missing_count:
-            Camera cumulative missing-print count.
+            Camera cumulative missing-print count
+            (diagnostic, stored in metadata_json).
 
         print_detection_enabled:
             Whether print inspection is enabled for camera.
@@ -508,14 +471,12 @@ class CountLogger:
 
 
         # --------------------------------------------------
-        # Build event
+        # Build event (kept for return value / last_event /
+        # metadata_json fidelity -- same shape as the old
+        # JSONL record).
         # --------------------------------------------------
 
         event = {
-
-            # ----------------------------------------------
-            # Identity
-            # ----------------------------------------------
 
             "event_id":
                 uuid.uuid4().hex,
@@ -523,51 +484,26 @@ class CountLogger:
             "event":
                 "bag_count",
 
-
-            # ----------------------------------------------
-            # Time
-            # ----------------------------------------------
-
             "timestamp":
                 timestamp_iso,
 
             "shift":
                 shift,
 
-
-            # ----------------------------------------------
-            # Camera
-            # ----------------------------------------------
-
             "camera":
                 str(
                     camera_name
                 ),
-
-
-            # ----------------------------------------------
-            # Production
-            # ----------------------------------------------
 
             "total_count":
                 safe_int(
                     total_count
                 ),
 
-            # Alias used by some dashboard components.
             "count":
                 safe_int(
                     total_count
                 ),
-
-
-            # ----------------------------------------------
-            # Tracking metadata
-            #
-            # Track ID is recorded for diagnostics only.
-            # Physical center crossing remains the actual
-            # counting trigger.
-            # ----------------------------------------------
 
             "track_id":
                 (
@@ -578,21 +514,11 @@ class CountLogger:
                     else None
                 ),
 
-
-            # ----------------------------------------------
-            # Physical bag center
-            # ----------------------------------------------
-
             "center_x":
                 center_x,
 
             "center_y":
                 center_y,
-
-
-            # ----------------------------------------------
-            # Print inspection
-            # ----------------------------------------------
 
             "print_detection_enabled":
                 bool(
@@ -622,11 +548,6 @@ class CountLogger:
                 ),
         }
 
-
-        # --------------------------------------------------
-        # Optional metadata
-        # --------------------------------------------------
-
         if extra_fields:
 
             for (
@@ -634,7 +555,6 @@ class CountLogger:
                 value,
             ) in extra_fields.items():
 
-                # Protect important standard event fields.
                 if key in event:
                     continue
 
@@ -646,7 +566,13 @@ class CountLogger:
 
 
         # --------------------------------------------------
-        # Write
+        # Write to SQL Server
+        #
+        # Each confirmed bag is one row. bag_count is always
+        # 1; printed_count/unprinted_count reflect this bag's
+        # own print result (0/1), not the camera's running
+        # totals -- those are queried with SUM() downstream.
+        # The full event above is kept in metadata_json.
         # --------------------------------------------------
 
         success = (
@@ -770,65 +696,112 @@ class CountLogger:
         event,
     ):
         """
-        Append one JSON object to JSONL file.
+        Persist one confirmed bag-count event to
+        dbo.production_events.
+
+        One confirmed bag = one SQL row. line_count,
+        frame_roi_count and bags_inside_roi are read from the
+        event dict (pipeline.py already passes them into
+        log_count() as extra_fields) and mapped onto the
+        matching save_production_event() columns -- previously
+        these were left at their 0 defaults even though the
+        values were already sitting in metadata_json.
         """
 
         try:
 
-            serialized = json.dumps(
-                event,
-                ensure_ascii=False,
-                separators=(
-                    ",",
-                    ":",
-                ),
-                default=str,
+            # --------------------------------------------------
+            # Extract complete production event information
+            # --------------------------------------------------
+
+            line_count = event.get(
+                "line_count",
+                0,
             )
 
-            with self._lock:
+            frame_roi_count = event.get(
+                "frame_roi_count",
+                0,
+            )
 
-                with open(
-                    self.file_path,
-                    "a",
-                    encoding="utf-8",
-                    buffering=1,
-                ) as file:
+            bags_inside_roi = event.get(
+                "bags_inside_roi",
+                0,
+            )
 
-                    file.write(
-                        serialized
-                    )
+            # Make sure numeric values are valid
+            try:
+                line_count = int(line_count or 0)
+            except (TypeError, ValueError):
+                line_count = 0
 
-                    file.write(
-                        "\n"
-                    )
+            try:
+                frame_roi_count = int(
+                    frame_roi_count or 0
+                )
+            except (TypeError, ValueError):
+                frame_roi_count = 0
 
-                    if self.flush_immediately:
+            try:
+                bags_inside_roi = int(
+                    bags_inside_roi or 0
+                )
+            except (TypeError, ValueError):
+                bags_inside_roi = 0
 
-                        file.flush()
+            # --------------------------------------------------
+            # Save complete event to SQL Server
+            # --------------------------------------------------
 
-                        try:
+            save_production_event(
 
-                            os.fsync(
-                                file.fileno()
-                            )
+                camera_id=
+                    event.get("camera"),
 
-                        except OSError:
+                bag_count=
+                    1,
 
-                            # fsync failure should not
-                            # invalidate an otherwise
-                            # successful JSONL append.
-                            pass
+                printed_count=
+                    1
+                    if event.get("print_status") == "printed"
+                    else 0,
 
+                unprinted_count=
+                    1
+                    if event.get("print_status") == "missing"
+                    else 0,
 
-                self._events_written += 1
+                # --------------------------------------------------
+                # IMPORTANT: these were previously missing
+                # --------------------------------------------------
 
+                line_count=
+                    line_count,
+
+                frame_roi_count=
+                    frame_roi_count,
+
+                bags_inside_roi=
+                    bags_inside_roi,
+
+                timestamp=
+                    event.get("timestamp"),
+
+                metadata=
+                    event,
+            )
+
+            self._events_written += 1
 
             logger.debug(
                 (
                     "Count event persisted | "
                     "camera=%s | "
                     "count=%s | "
-                    "print=%s"
+                    "print=%s | "
+                    "line_count=%s | "
+                    "frame_roi_count=%s | "
+                    "bags_inside_roi=%s"
                 ),
                 event.get(
                     "camera"
@@ -839,16 +812,15 @@ class CountLogger:
                 event.get(
                     "print_status"
                 ),
+                line_count,
+                frame_roi_count,
+                bags_inside_roi,
             )
 
             return True
 
 
-        except (
-            OSError,
-            TypeError,
-            ValueError,
-        ) as error:
+        except Exception as error:
 
             self._write_errors += 1
 
@@ -858,9 +830,8 @@ class CountLogger:
 
             logger.exception(
                 (
-                    "Failed writing count event | "
-                    "camera=%s | "
-                    "count=%s"
+                    "Failed writing count event to SQL "
+                    "Server | camera=%s | count=%s"
                 ),
                 event.get(
                     "camera"
@@ -884,9 +855,9 @@ class CountLogger:
         **data,
     ):
         """
-        Write a generic FillPac event.
+        Write a generic FillPac event to dbo.application_logs.
 
-        This is available for future events such as:
+        This is available for events such as:
 
         camera_online
         camera_offline
@@ -948,13 +919,46 @@ class CountLogger:
             )
 
 
-        success = (
-            self._write_event(
-                event
-            )
-        )
+        try:
 
-        if not success:
+            save_application_log(
+
+                level=
+                    "INFO",
+
+                logger=
+                    "fillpac.count_logger",
+
+                message=
+                    str(event_type),
+
+                event_type=
+                    str(event_type),
+
+                camera_id=
+                    event.get("camera"),
+
+                metadata=
+                    event,
+            )
+
+            self._events_written += 1
+
+        except Exception as error:
+
+            self._write_errors += 1
+
+            self._last_error = str(
+                error
+            )
+
+            logger.exception(
+                "Failed writing generic event to SQL Server | "
+                "event=%s | camera=%s",
+                event_type,
+                camera_name,
+            )
+
             return None
 
 
@@ -997,15 +1001,6 @@ class CountLogger:
         ):
 
             return value.isoformat()
-
-        if isinstance(
-            value,
-            Path,
-        ):
-
-            return str(
-                value
-            )
 
         if isinstance(
             value,
@@ -1090,10 +1085,8 @@ class CountLogger:
             "enabled":
                 self.enabled,
 
-            "file":
-                str(
-                    self.file_path
-                ),
+            "storage":
+                "sql-server",
 
             "events_written":
                 self._events_written,
@@ -1144,11 +1137,15 @@ class CountLogger:
 
 
     # ======================================================
-    # EVENT FILE PATH
+    # EVENT FILE PATH (DEPRECATED)
     # ======================================================
 
     def get_file_path(
         self,
     ):
+        """
+        Deprecated. Count events are stored in SQL Server,
+        not a file. Kept only so old callers don't crash.
+        """
 
-        return self.file_path
+        return None

@@ -8,7 +8,6 @@ Elasticsearch Module
 import time
 import queue
 import threading
-import time
 from datetime import datetime
 
 from elasticsearch import Elasticsearch

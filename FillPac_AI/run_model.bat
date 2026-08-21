@@ -18,24 +18,128 @@ echo ==========================================================
 echo.
 
 REM ==========================================================
-REM PYTHON ENVIRONMENT
+REM PYTHON ENVIRONMENT + DEPENDENCY CHECK
+REM
+REM FIX: the old version only used the dependency check to
+REM decide whether to LOOK for a venv -- it never re-checked
+REM packages against the venv it found, and never aborted if
+REM no venv existed either. It then printed "[OK] Required
+REM packages available." unconditionally, even when they
+REM weren't. That's fixed below: DEPS_OK is only set to 1 once
+REM a python executable that actually has the packages is
+REM found, and the script aborts with a clear message if none
+REM of them do.
 REM ==========================================================
 
 set "PYTHON_CMD=python"
+set "DEPS_OK=0"
 
 echo Checking Python dependencies...
 
 python -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
+if not errorlevel 1 (
+    set "DEPS_OK=1"
+)
 
-if errorlevel 1 (
+if "!DEPS_OK!"=="0" (
 
     if exist ".\venv\Scripts\python.exe" (
-        set "PYTHON_CMD=.\venv\Scripts\python.exe"
-    ) else (
-        if exist ".\.venv\Scripts\python.exe" (
-            set "PYTHON_CMD=.\.venv\Scripts\python.exe"
+
+        ".\venv\Scripts\python.exe" -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
+
+        if not errorlevel 1 (
+            set "PYTHON_CMD=.\venv\Scripts\python.exe"
+            set "DEPS_OK=1"
         )
     )
+)
+
+if "!DEPS_OK!"=="0" (
+
+    if exist ".\.venv\Scripts\python.exe" (
+
+        ".\.venv\Scripts\python.exe" -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
+
+        if not errorlevel 1 (
+            set "PYTHON_CMD=.\.venv\Scripts\python.exe"
+            set "DEPS_OK=1"
+        )
+    )
+)
+
+REM ==========================================================
+REM FIX: some setups keep the venv one directory above
+REM FillPac_AI itself (e.g. "...\BAG-COUNTING...\venv" with
+REM FillPac_AI as a subfolder), rather than inside it. The two
+REM checks above only ever look in the current folder, so that
+REM layout fell straight through to the "packages missing"
+REM error even though a perfectly good venv existed one level
+REM up. These two checks cover that layout the same way.
+REM ==========================================================
+
+if "!DEPS_OK!"=="0" (
+
+    if exist "..\venv\Scripts\python.exe" (
+
+        "..\venv\Scripts\python.exe" -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
+
+        if not errorlevel 1 (
+            set "PYTHON_CMD=..\venv\Scripts\python.exe"
+            set "DEPS_OK=1"
+        )
+    )
+)
+
+if "!DEPS_OK!"=="0" (
+
+    if exist "..\.venv\Scripts\python.exe" (
+
+        "..\.venv\Scripts\python.exe" -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn" >nul 2>nul
+
+        if not errorlevel 1 (
+            set "PYTHON_CMD=..\.venv\Scripts\python.exe"
+            set "DEPS_OK=1"
+        )
+    )
+)
+
+if "!DEPS_OK!"=="0" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: Required Python packages are missing or broken
+    echo ==========================================================
+    echo.
+    echo Checked:
+    echo   - python                    (system / active venv)
+    echo   - .\venv\Scripts\python.exe
+    echo   - .\.venv\Scripts\python.exe
+    echo   - ..\venv\Scripts\python.exe
+    echo   - ..\.venv\Scripts\python.exe
+    echo.
+    echo Required packages:
+    echo   cv2, ultralytics, torch, supervision, yaml,
+    echo   fastapi, socketio, uvicorn
+    echo.
+    echo The actual error is shown below ^(run with
+    echo %PYTHON_CMD% so it matches what main.py will use^):
+    echo.
+
+    %PYTHON_CMD% -c "import cv2, ultralytics, torch, supervision, yaml, fastapi, socketio, uvicorn"
+
+    echo.
+    echo If the error above is "No module named 'X'", install it,
+    echo e.g.:
+    echo   pip install -r requirements.txt
+    echo.
+    echo If the error above is a DLL / import error instead
+    echo ^(common for torch/cv2 on Windows^), that package is
+    echo installed but broken -- reinstalling requirements.txt
+    echo alone may not fix it.
+    echo.
+
+    pause
+    exit /b 1
 )
 
 REM ==========================================================
@@ -207,6 +311,86 @@ if not exist "src\jam_detector.py" (
 echo [OK] Jam Detector V1 found.
 
 REM ==========================================================
+REM VERIFY DATABASE MODULE (SQL SERVER LAYER)
+REM
+REM FIX: src\pipeline.py, src\dashboard.py, and
+REM src\count_logger.py all import from database.repository at
+REM module load time. If this package is missing, the app
+REM doesn't fail with a clean message here -- it fails deep
+REM inside the "SOURCE IMPORT TEST" below with a generic
+REM traceback. Checking for it explicitly, with the same
+REM pattern as the other required-file checks, gives a
+REM specific, actionable error instead.
+REM ==========================================================
+
+if not exist "database\repository.py" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: database\repository.py not found
+    echo ==========================================================
+    echo.
+
+    echo src\pipeline.py, src\dashboard.py, and
+    echo src\count_logger.py all import from database.repository
+    echo -- FillPac AI cannot start without it.
+    echo.
+
+    pause
+    exit /b 1
+)
+
+if not exist "database\models.py" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: database\models.py not found
+    echo ==========================================================
+    echo.
+
+    pause
+    exit /b 1
+)
+
+if not exist "database\connection.py" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: database\connection.py not found
+    echo ==========================================================
+    echo.
+
+    pause
+    exit /b 1
+)
+
+REM ==========================================================
+REM FIX: database\repository.py now imports database\failsafe.py
+REM at module load time (the local SQL-outage failover queue).
+REM Same reasoning as the other database\*.py checks above --
+REM catch a missing file here with a specific message instead of
+REM a generic traceback during the source import test below.
+REM ==========================================================
+
+if not exist "database\failsafe.py" (
+
+    echo.
+    echo ==========================================================
+    echo ERROR: database\failsafe.py not found
+    echo ==========================================================
+    echo.
+
+    echo database\repository.py imports database\failsafe.py at
+    echo module load time -- FillPac AI cannot start without it.
+    echo.
+
+    pause
+    exit /b 1
+)
+
+echo [OK] Database module found.
+
+REM ==========================================================
 REM SOURCE IMPORT TEST
 REM ==========================================================
 
@@ -342,6 +526,13 @@ if not exist "data\output" (
     mkdir "data\output"
 )
 
+REM database\failsafe.py also creates this on demand, but
+REM creating it here too means it shows up immediately instead
+REM of only appearing the first time SQL Server has an outage.
+if not exist "logs\sql_failover" (
+    mkdir "logs\sql_failover"
+)
+
 echo [OK] Runtime directories ready.
 
 REM ==========================================================
@@ -404,8 +595,6 @@ echo.
 
 REM ==========================================================
 REM START FRONTEND
-REM
-REM THIS IS THE IMPORTANT FIX
 REM ==========================================================
 
 echo ==========================================================
@@ -547,13 +736,33 @@ echo.
 
 REM ==========================================================
 REM STOP FRONTEND
+REM
+REM FIX: the old command had no /T, so it only closed the
+REM cmd.exe window ("start" always spawns cmd.exe as the
+REM direct child) without killing the "python -m http.server"
+REM process running inside it. That left the frontend server
+REM running in the background, holding port 8080, so the very
+REM next launch would fail the "port 8080 already in use"
+REM check for no visible reason. /T kills the whole process
+REM tree. The result is also checked now instead of always
+REM printing "[OK]" regardless of whether it worked.
 REM ==========================================================
 
 echo Stopping Dashboard Frontend...
 
-taskkill /FI "WINDOWTITLE eq FillPac AI - Dashboard Frontend*" /F >nul 2>nul
+taskkill /FI "WINDOWTITLE eq FillPac AI - Dashboard Frontend*" /T /F >nul 2>nul
 
-echo [OK] Dashboard frontend stopped.
+if errorlevel 1 (
+
+    echo [WARN] Could not confirm the dashboard frontend process
+    echo        was stopped. If port 8080 is still in use on the
+    echo        next run, close it manually via Task Manager.
+
+) else (
+
+    echo [OK] Dashboard frontend stopped.
+)
+
 echo.
 
 REM ==========================================================

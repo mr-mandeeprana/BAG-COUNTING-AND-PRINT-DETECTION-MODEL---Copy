@@ -30,9 +30,6 @@ Important:
 - This allows two bags that enter very close together to both count.
 """
 
-import math
-
-
 class EntryROICounter:
 
     def __init__(
@@ -274,16 +271,6 @@ class EntryROICounter:
 
             current_inside = (
                 self._center_inside_roi(center)
-            )
-
-            # Previous ROI state.
-            #
-            # False is used when this is the first observation.
-            previous_inside = (
-                self.track_inside_roi.get(
-                    track_id,
-                    False,
-                )
             )
 
             # --------------------------------------------------

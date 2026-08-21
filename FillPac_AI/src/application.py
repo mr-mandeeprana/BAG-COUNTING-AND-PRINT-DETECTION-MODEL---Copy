@@ -162,16 +162,12 @@ class Application:
         # ==================================================
         # DASHBOARD STATE
         #
-        # DashboardState is the ONLY writer of state.json
-        # inside the AI application.
+        # DashboardState persists to SQL Server
+        # (dbo.system_state / dbo.camera_status) -- there is
+        # no state.json file to configure anymore.
         # ==================================================
 
         self.dashboard_state = DashboardState(
-
-            state_file=dashboard_config.get(
-                "state_file",
-                "dashboard/backend/state.json",
-            ),
 
             publish_interval=dashboard_config.get(
                 "publish_interval",
@@ -214,6 +210,10 @@ class Application:
 
         # ==================================================
         # COUNT EVENT LOGGER
+        #
+        # CountLogger writes confirmed bag counts straight to
+        # SQL Server (dbo.production_events) -- there is no
+        # count_events.jsonl file to configure anymore.
         # ==================================================
 
         logging_config = (
@@ -227,18 +227,8 @@ class Application:
 
         self.count_logger = CountLogger(
 
-            file_path=logging_config.get(
-                "count_file",
-                "logs/count_events.jsonl",
-            ),
-
             enabled=logging_config.get(
                 "count_events_enabled",
-                True,
-            ),
-
-            flush_immediately=logging_config.get(
-                "count_flush_immediately",
                 True,
             ),
         )
@@ -1211,7 +1201,7 @@ class Application:
         # FINAL DASHBOARD STATE
         #
         # DashboardState.stop(mark_offline=True) performs
-        # the final atomic state.json write and stops the
+        # the final state publish to SQL Server and stops the
         # background state publisher.
         # ==================================================
 

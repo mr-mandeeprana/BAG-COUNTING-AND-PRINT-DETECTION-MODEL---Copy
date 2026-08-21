@@ -306,6 +306,7 @@ class Visualizer:
         frame,
         roi,
         enabled=True,
+        avoid_rects=None,
     ):
         """
         Draw rectangular ROI used for physical-center
@@ -322,11 +323,99 @@ class Visualizer:
             title="BAG COUNTING ENTRY ROI",
             fill_alpha=0.06,
             thickness=3,
+            avoid_rects=avoid_rects,
         )
 
     # ======================================================
     # GENERIC RECTANGULAR ROI
     # ======================================================
+
+    @staticmethod
+    def _rects_overlap(a, b):
+
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+
+        return not (
+            ax2 < bx1
+            or bx2 < ax1
+            or ay2 < by1
+            or by2 < ay1
+        )
+
+    @staticmethod
+    def _place_title_y(
+        x_min,
+        title_y,
+        title_width,
+        title_height,
+        title_baseline,
+        avoid_rects,
+        frame_height,
+        max_attempts=25,
+    ):
+        """
+        Given a desired title_y, nudge it downward until its
+        drawn bounding box (background + text) doesn't overlap
+        any rect already in avoid_rects (other titles, or the
+        reserved top summary-panel area). The final placed rect
+        is appended to avoid_rects so later titles avoid it too.
+
+        This is what stops ROI zone titles from stacking on top
+        of each other, and stops them from bleeding out past the
+        edge of the top summary panel where the panel's own
+        background no longer covers them.
+        """
+
+        if avoid_rects is None:
+
+            return title_y
+
+        candidate_rect = (
+            x_min + 2,
+            title_y - title_height - 4,
+            x_min + 9 + title_width,
+            title_y + title_baseline + 2,
+        )
+
+        for _ in range(max_attempts):
+
+            collision_rect = None
+
+            for rect in avoid_rects:
+
+                if Visualizer._rects_overlap(
+                    candidate_rect,
+                    rect,
+                ):
+
+                    collision_rect = rect
+                    break
+
+            if collision_rect is None:
+                break
+
+            title_y = (
+                collision_rect[3]
+                + title_height
+                + 16
+            )
+
+            title_y = min(
+                title_y,
+                frame_height - 10,
+            )
+
+            candidate_rect = (
+                x_min + 2,
+                title_y - title_height - 4,
+                x_min + 9 + title_width,
+                title_y + title_baseline + 2,
+            )
+
+        avoid_rects.append(candidate_rect)
+
+        return title_y
 
     @staticmethod
     def _draw_rectangular_roi(
@@ -336,6 +425,8 @@ class Visualizer:
         title,
         fill_alpha=0.05,
         thickness=2,
+        title_offset=0,
+        avoid_rects=None,
     ):
 
         if not roi:
@@ -483,15 +574,62 @@ class Visualizer:
 
         if title:
 
+            title_y = max(
+                y_min + 25,
+                25,
+            ) + title_offset
+
+            (
+                title_width,
+                title_height,
+            ), title_baseline = cv2.getTextSize(
+                title,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                2,
+            )
+
+            title_y = Visualizer._place_title_y(
+                x_min=x_min,
+                title_y=title_y,
+                title_width=title_width,
+                title_height=title_height,
+                title_baseline=title_baseline,
+                avoid_rects=avoid_rects,
+                frame_height=height,
+            )
+
+            title_bg_overlay = frame.copy()
+
+            cv2.rectangle(
+                title_bg_overlay,
+                (
+                    x_min + 2,
+                    title_y - title_height - 4,
+                ),
+                (
+                    x_min + 9 + title_width,
+                    title_y + title_baseline + 2,
+                ),
+                (0, 0, 0),
+                -1,
+            )
+
+            cv2.addWeighted(
+                title_bg_overlay,
+                0.5,
+                frame,
+                0.5,
+                0,
+                frame,
+            )
+
             cv2.putText(
                 frame,
                 title,
                 (
                     x_min + 5,
-                    max(
-                        y_min + 25,
-                        25,
-                    ),
+                    title_y,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -508,6 +646,7 @@ class Visualizer:
         frame,
         roi,
         status="normal",
+        avoid_rects=None,
     ):
 
         color = Visualizer.get_jam_color(
@@ -529,6 +668,7 @@ class Visualizer:
             title="MOVEMENT JAM ZONE",
             fill_alpha=0.08,
             thickness=thickness,
+            avoid_rects=avoid_rects,
         )
 
     # ======================================================
@@ -540,6 +680,7 @@ class Visualizer:
         frame,
         roi,
         status="normal",
+        avoid_rects=None,
     ):
 
         status = str(
@@ -566,6 +707,7 @@ class Visualizer:
             title="BAG SPACING ZONE",
             fill_alpha=0.04,
             thickness=thickness,
+            avoid_rects=avoid_rects,
         )
 
     # ======================================================
@@ -577,6 +719,7 @@ class Visualizer:
         frame,
         roi,
         jam=False,
+        avoid_rects=None,
     ):
 
         color = (
@@ -594,6 +737,7 @@ class Visualizer:
             title="ROI OCCUPANCY",
             fill_alpha=0.04,
             thickness=thickness,
+            avoid_rects=avoid_rects,
         )
 
     # ======================================================
@@ -665,7 +809,562 @@ class Visualizer:
         )
 
     # ======================================================
-    # COUNT SUMMARY
+    # TOP SUMMARY PANEL
+    #
+    # All top-left diagnostic text (counts, camera name,
+    # FPS, jam status/reason, movement, spacing, ROI
+    # occupancy) is collected into a single ordered list of
+    # (text, color) lines and drawn together in one solid
+    # panel. This replaces the old approach of several
+    # independent cv2.putText calls at hardcoded y-values,
+    # which is what caused the text to overlap the ROI zone
+    # titles and each other -- every caller assumed it owned
+    # a fixed row of pixels near the top of the frame, but
+    # ROI titles and print-status labels floated at whatever
+    # y-position their box happened to be at, and if that box
+    # was near the top of the frame they landed in the same
+    # rows as this stats text.
+    #
+    # Drawing this panel LAST (after every ROI box/label) and
+    # giving it its own solid background guarantees it is
+    # always fully readable at the top of the view, regardless
+    # of what ROI boxes or labels are drawn underneath it.
+    #
+    # visualize() also computes this panel's rectangle UP FRONT
+    # (before any ROI box is drawn) via _compute_panel_rect()
+    # and seeds it into the shared avoid_rects list, so ROI
+    # titles placed afterwards are pushed clear of the panel
+    # instead of drawing text that sticks out past its edge.
+    # ======================================================
+
+    @staticmethod
+    def _compute_panel_rect(
+        frame,
+        lines,
+        x=15,
+        y=28,
+        line_height=26,
+        font_scale=0.62,
+        thickness=2,
+        padding=10,
+    ):
+
+        lines = [
+            line
+            for line in (lines or [])
+            if line and line[0]
+        ]
+
+        if not lines:
+            return None
+
+        max_text_width = 0
+
+        for text, _color in lines:
+
+            (
+                text_width,
+                _text_height,
+            ), _baseline = cv2.getTextSize(
+                str(text),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                thickness,
+            )
+
+            max_text_width = max(
+                max_text_width,
+                text_width,
+            )
+
+        panel_x1 = max(
+            x - padding,
+            0,
+        )
+
+        panel_y1 = max(
+            y - padding - 14,
+            0,
+        )
+
+        panel_x2 = (
+            x
+            +
+            max_text_width
+            +
+            padding
+        )
+
+        panel_y2 = (
+            y
+            +
+            line_height
+            *
+            len(lines)
+            -
+            (line_height - 18)
+            +
+            padding
+        )
+
+        height, width = frame.shape[:2]
+
+        panel_x2 = min(
+            panel_x2,
+            width - 1,
+        )
+
+        panel_y2 = min(
+            panel_y2,
+            height - 1,
+        )
+
+        return (
+            panel_x1,
+            panel_y1,
+            panel_x2,
+            panel_y2,
+        )
+
+    @staticmethod
+    def draw_top_panel(
+        frame,
+        lines,
+        x=15,
+        y=28,
+        line_height=26,
+        font_scale=0.62,
+        thickness=2,
+        padding=10,
+        bg_alpha=0.55,
+    ):
+
+        lines = [
+            line
+            for line in (lines or [])
+            if line and line[0]
+        ]
+
+        if not lines:
+            return
+
+        panel_rect = Visualizer._compute_panel_rect(
+            frame,
+            lines,
+            x=x,
+            y=y,
+            line_height=line_height,
+            font_scale=font_scale,
+            thickness=thickness,
+            padding=padding,
+        )
+
+        if panel_rect is None:
+            return
+
+        (
+            panel_x1,
+            panel_y1,
+            panel_x2,
+            panel_y2,
+        ) = panel_rect
+
+        overlay = frame.copy()
+
+        cv2.rectangle(
+            overlay,
+            (
+                panel_x1,
+                panel_y1,
+            ),
+            (
+                panel_x2,
+                panel_y2,
+            ),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.addWeighted(
+            overlay,
+            bg_alpha,
+            frame,
+            1.0 - bg_alpha,
+            0,
+            frame,
+        )
+
+        cv2.rectangle(
+            frame,
+            (
+                panel_x1,
+                panel_y1,
+            ),
+            (
+                panel_x2,
+                panel_y2,
+            ),
+            (90, 90, 90),
+            1,
+        )
+
+        for index, (text, color) in enumerate(lines):
+
+            cv2.putText(
+                frame,
+                str(text),
+                (
+                    x,
+                    y
+                    +
+                    index
+                    *
+                    line_height,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                color,
+                thickness,
+            )
+
+    # ======================================================
+    # LINE BUILDERS
+    #
+    # Each of these returns (text, color) tuples instead of
+    # drawing directly, so visualize() can assemble them, in
+    # order, into a single draw_top_panel() call.
+    # ======================================================
+
+    @staticmethod
+    def _camera_line(
+        name,
+    ):
+
+        return (
+            str(name),
+            (255, 255, 255),
+        )
+
+    @staticmethod
+    def _count_summary_lines(
+        count,
+        entry_roi_count,
+        printed_count,
+        missing_count,
+    ):
+
+        return [
+            (
+                f"Line Count : {count}",
+                (0, 255, 0),
+            ),
+            (
+                f"Entry ROI Count : {entry_roi_count}",
+                (0, 255, 255),
+            ),
+            (
+                f"Printed : {printed_count}",
+                (255, 200, 0),
+            ),
+            (
+                f"Not Printed : {missing_count}",
+                (0, 0, 255),
+            ),
+        ]
+
+    @staticmethod
+    def _fps_line(
+        fps,
+    ):
+
+        return (
+            f"FPS : {fps:.2f}",
+            (255, 255, 0),
+        )
+
+    @staticmethod
+    def _final_jam_lines(
+        final_jam_result,
+    ):
+
+        if not final_jam_result:
+            return []
+
+        status = str(
+            final_jam_result.get(
+                "status",
+                "normal",
+            )
+        ).lower()
+
+        color = Visualizer.get_jam_color(
+            status
+        )
+
+        lines = [
+            (
+                f"JAM STATUS : {status.upper()}",
+                color,
+            )
+        ]
+
+        jam_types = (
+            final_jam_result.get(
+                "jam_types",
+                [],
+            )
+            or []
+        )
+
+        if jam_types:
+
+            readable = []
+
+            for jam_type in jam_types:
+
+                if jam_type == "movement":
+
+                    readable.append(
+                        "MOVEMENT"
+                    )
+
+                elif jam_type == "bag_spacing":
+
+                    readable.append(
+                        "BAG SPACING"
+                    )
+
+                elif jam_type == "roi_occupancy":
+
+                    readable.append(
+                        "ROI OCCUPANCY"
+                    )
+
+                else:
+
+                    readable.append(
+                        str(
+                            jam_type
+                        ).upper()
+                    )
+
+            reason = " + ".join(
+                readable
+            )
+
+            lines.append(
+                (
+                    f"Reason : {reason}",
+                    color,
+                )
+            )
+
+        return lines
+
+    @staticmethod
+    def _movement_jam_line(
+        jam_result,
+    ):
+
+        if not jam_result:
+            return None
+
+        if not jam_result.get(
+            "enabled",
+            False,
+        ):
+
+            return None
+
+        status = str(
+            jam_result.get(
+                "status",
+                "normal",
+            )
+        ).lower()
+
+        color = Visualizer.get_jam_color(
+            status
+        )
+
+        return (
+            f"Movement : {status.upper()}",
+            color,
+        )
+
+    @staticmethod
+    def _spacing_status_lines(
+        spacing_result,
+    ):
+
+        if not spacing_result:
+            return []
+
+        enabled = spacing_result.get(
+            "enabled",
+            True,
+        )
+
+        if not enabled:
+            return []
+
+        status = str(
+            spacing_result.get(
+                "status",
+                "normal",
+            )
+        ).lower()
+
+        color = Visualizer.get_jam_color(
+            status
+        )
+
+        lines = [
+            (
+                f"Spacing : {status.upper()}",
+                color,
+            )
+        ]
+
+        threshold_mm = (
+            spacing_result.get(
+                "threshold_mm"
+            )
+        )
+
+        if threshold_mm is not None:
+
+            try:
+
+                threshold_text = (
+                    f"Threshold : "
+                    f"{float(threshold_mm):.1f} mm"
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                threshold_text = (
+                    f"Threshold : {threshold_mm}"
+                )
+
+            lines.append(
+                (
+                    threshold_text,
+                    color,
+                )
+            )
+
+        minimum_gap_mm = (
+            spacing_result.get(
+                "minimum_gap_mm"
+            )
+        )
+
+        if minimum_gap_mm is not None:
+
+            try:
+
+                gap_text = (
+                    f"Minimum Gap : "
+                    f"{float(minimum_gap_mm):.1f} mm"
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                gap_text = (
+                    f"Minimum Gap : "
+                    f"{minimum_gap_mm}"
+                )
+
+            lines.append(
+                (
+                    gap_text,
+                    color,
+                )
+            )
+
+        return lines
+
+    @staticmethod
+    def _condition_c_lines(
+        result,
+        max_bags=None,
+    ):
+
+        if not result:
+            return []
+
+        jam = result.get(
+            "jam",
+            False,
+        )
+
+        bag_count = result.get(
+            "bag_count",
+            0,
+        )
+
+        minimum_gap_mm = result.get(
+            "minimum_gap_mm"
+        )
+
+        color = (
+            (0, 0, 255)
+            if jam
+            else (255, 0, 255)
+        )
+
+        status = (
+            "JAM"
+            if jam
+            else "NORMAL"
+        )
+
+        if max_bags is not None:
+
+            bags_text = (
+                f"ROI Bags : {bag_count} / {max_bags}"
+            )
+
+        else:
+
+            bags_text = (
+                f"ROI Bags Inside : {bag_count}"
+            )
+
+        lines = [
+            (
+                f"ROI Occupancy : {status}",
+                color,
+            ),
+            (
+                bags_text,
+                color,
+            ),
+        ]
+
+        if minimum_gap_mm is not None:
+
+            lines.append(
+                (
+                    f"ROI Minimum Gap : {minimum_gap_mm:.1f} mm",
+                    color,
+                )
+            )
+
+        return lines
+
+    # ======================================================
+    # COUNT SUMMARY (legacy direct-draw, kept for any other
+    # callers -- visualize() no longer calls this directly,
+    # it uses _count_summary_lines() + draw_top_panel()
+    # instead so counts share one panel with everything else)
     # ======================================================
 
     @staticmethod
@@ -677,48 +1376,19 @@ class Visualizer:
         missing_count,
     ):
 
-        cv2.putText(
+        Visualizer.draw_top_panel(
             frame,
-            f"Line Count : {count}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2,
-        )
-
-        cv2.putText(
-            frame,
-            f"Entry ROI Count : {entry_roi_count}",
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2,
-        )
-
-        cv2.putText(
-            frame,
-            f"Printed : {printed_count}",
-            (20, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 200, 0),
-            2,
-        )
-
-        cv2.putText(
-            frame,
-            f"Not Printed : {missing_count}",
-            (20, 145),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2,
+            Visualizer._count_summary_lines(
+                count,
+                entry_roi_count,
+                printed_count,
+                missing_count,
+            ),
         )
 
     # ======================================================
-    # CAMERA NAME
+    # CAMERA NAME (legacy direct-draw, kept for any other
+    # callers -- see note on draw_count_summary above)
     # ======================================================
 
     @staticmethod
@@ -2411,6 +3081,112 @@ class Visualizer:
         )
 
         # ==================================================
+        # TOP SUMMARY PANEL -- ASSEMBLED FIRST
+        #
+        # Every value the panel needs (count, fps, jam
+        # results, etc.) is already available as a
+        # parameter, so the panel's line list -- and
+        # therefore its exact on-screen rectangle -- can be
+        # computed before anything else is drawn.
+        #
+        # That rectangle is seeded into `avoid_rects` below,
+        # which every ROI title-drawing call also receives.
+        # Titles are pushed clear of anything already in
+        # avoid_rects (the panel, or an earlier title), so
+        # ROI zone titles never bleed out past the panel's
+        # edge and never stack on top of each other, even
+        # when two ROIs share a similar top-left corner.
+        #
+        # The panel itself is still PAINTED last (see the
+        # end of this method), so it still sits cleanly on
+        # top of every box/label drawn underneath it.
+        # ==================================================
+
+        top_panel_lines = [
+            self._camera_line(
+                camera_name
+            )
+        ]
+
+        if show_count:
+
+            top_panel_lines.extend(
+                self._count_summary_lines(
+                    count,
+                    entry_roi_count,
+                    printed_count,
+                    missing_count,
+                )
+            )
+
+        if show_fps:
+
+            top_panel_lines.append(
+                self._fps_line(
+                    fps
+                )
+            )
+
+        if show_jam_status:
+
+            top_panel_lines.extend(
+                self._final_jam_lines(
+                    final_jam_result
+                )
+            )
+
+            movement_line = (
+                self._movement_jam_line(
+                    jam_result
+                )
+            )
+
+            if movement_line:
+
+                top_panel_lines.append(
+                    movement_line
+                )
+
+        spacing_enabled = bool(
+            spacing_result.get(
+                "enabled",
+                True,
+            )
+        )
+
+        if (
+            show_spacing_status
+            and
+            spacing_enabled
+        ):
+
+            top_panel_lines.extend(
+                self._spacing_status_lines(
+                    spacing_result
+                )
+            )
+
+        if show_condition_c_status:
+
+            top_panel_lines.extend(
+                self._condition_c_lines(
+                    condition_c_result,
+                    max_bags=condition_c_max_bags,
+                )
+            )
+
+        panel_rect = self._compute_panel_rect(
+            frame,
+            top_panel_lines,
+        )
+
+        avoid_rects = (
+            [panel_rect]
+            if panel_rect is not None
+            else []
+        )
+
+        # ==================================================
         # COUNT FLASH MEMORY
         # ==================================================
 
@@ -2510,6 +3286,7 @@ class Visualizer:
                 frame=frame,
                 roi=counting_entry_roi,
                 enabled=True,
+                avoid_rects=avoid_rects,
             )
 
         # ==================================================
@@ -2532,18 +3309,12 @@ class Visualizer:
                     "status",
                     "normal",
                 ),
+                avoid_rects=avoid_rects,
             )
 
         # ==================================================
         # CONDITION B ROI
         # ==================================================
-
-        spacing_enabled = bool(
-            spacing_result.get(
-                "enabled",
-                True,
-            )
-        )
 
         if (
             show_spacing_roi
@@ -2560,6 +3331,7 @@ class Visualizer:
                     "status",
                     "normal",
                 ),
+                avoid_rects=avoid_rects,
             )
 
         # ==================================================
@@ -2578,6 +3350,8 @@ class Visualizer:
                     "jam",
                     False,
                 ),
+
+                avoid_rects=avoid_rects,
             )
 
         # ==================================================
@@ -2944,75 +3718,15 @@ class Visualizer:
             )
 
         # ==================================================
-        # COUNT SUMMARY
+        # TOP SUMMARY PANEL -- PAINTED LAST
+        #
+        # Lines were assembled up front (see above); drawing
+        # happens here, after every ROI box/title, so the
+        # panel's solid background still sits cleanly on top
+        # of anything underneath it.
         # ==================================================
 
-        if show_count:
-
-            self.draw_count_summary(
-                frame,
-                count,
-                entry_roi_count,
-                printed_count,
-                missing_count,
-            )
-
-        # ==================================================
-        # CAMERA
-        # ==================================================
-
-        self.draw_camera(
+        self.draw_top_panel(
             frame,
-            camera_name,
+            top_panel_lines,
         )
-
-        # ==================================================
-        # FPS
-        # ==================================================
-
-        if show_fps:
-
-            self.draw_fps(
-                frame,
-                fps,
-            )
-
-        # ==================================================
-        # FINAL JAM STATUS
-        # ==================================================
-
-        if show_jam_status:
-
-            self.draw_final_jam_status(
-                frame,
-                final_jam_result,
-            )
-
-            # Condition A status shown separately.
-            self.draw_movement_jam_status(
-                frame,
-                jam_result,
-            )
-
-        # ==================================================
-        # CONDITION B STATUS
-        # ==================================================
-
-        if (
-            show_spacing_status
-            and
-            spacing_enabled
-        ):
-
-            self.draw_spacing_status(
-                frame,
-                spacing_result,
-            )
-
-        if show_condition_c_status:
-
-            self.draw_condition_c_status(
-                frame,
-                condition_c_result,
-                max_bags=condition_c_max_bags,
-            )

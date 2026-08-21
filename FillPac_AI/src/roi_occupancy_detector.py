@@ -7,11 +7,21 @@ Condition C
 
 Condition C declares a jam when the number of bags inside
 the configured ROI exceeds max_allowed_bags.
+
+CHANGE LOG
+----------
+The per-event JSON log file (logs/jam_events/*.json) has
+been removed. ROI snapshot images are still written to disk
+(SQL Server has no good way to store binary image data), but
+the event metadata that used to accompany each image in its
+own JSON file should now be persisted by the caller via
+database/repository.py -- e.g. start_jam_event(condition_code
+="C", ...) and save_roi_snapshot(image_path=..., ...) -- using
+the dict returned by process() below, which is unchanged.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,12 +100,13 @@ class ROIOccupancyDetector:
             )
         )
 
-        self.save_logs = bool(
-            self.config.get(
-                "save_logs",
-                True,
-            )
-        )
+        # "save_logs" (per-event JSON log file) is deprecated --
+        # event metadata now belongs in SQL Server, written by
+        # the caller through database/repository.py using the
+        # dict returned by process(). The key is still accepted
+        # in config.yaml so it doesn't need to be removed, but
+        # it no longer does anything.
+        self.save_logs = False
 
         self.save_distances = bool(
             self.config.get(
@@ -118,19 +129,7 @@ class ROIOccupancyDetector:
             )
         )
 
-        self.log_directory = Path(
-            self.config.get(
-                "log_directory",
-                "logs/condition_c/events",
-            )
-        )
-
         self.image_directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.log_directory.mkdir(
             parents=True,
             exist_ok=True,
         )
@@ -560,37 +559,27 @@ class ROIOccupancyDetector:
             except Exception:
                 pass
 
-        if self.save_logs:
-
-            try:
-
-                log_payload = dict(
-                    result
-                )
-
-                log_payload["camera"] = (
-                    camera_name
-                    or self.camera_name
-                )
-
-                log_payload["event"] = "condition_c"
-
-                log_payload["image_path"] = image_path
-
-                with open(
-                    self.log_directory
-                    /
-                    f"{file_timestamp}.json",
-                    "w",
-                ) as fp:
-
-                    json.dump(
-                        log_payload,
-                        fp,
-                        indent=4,
-                    )
-
-            except Exception:
-                pass
+        # NOTE: The per-event JSON log file that used to be
+        # written here has been removed. The caller (pipeline)
+        # is responsible for persisting this event to SQL
+        # Server -- e.g.:
+        #
+        #   snapshot_id = save_roi_snapshot(
+        #       camera_id=camera_name or self.camera_name,
+        #       event_type="condition_c",
+        #       image_path=image_path,
+        #       metadata=result,
+        #   )
+        #
+        #   start_jam_event(
+        #       camera_id=camera_name or self.camera_name,
+        #       jam_type="ROI_OCCUPANCY_JAM",
+        #       condition_code="C",
+        #       track_ids=result.get("track_ids"),
+        #       roi_snapshot_id=snapshot_id,
+        #       metadata=result,
+        #   )
+        #
+        # using the `result` dict returned by process().
 
         return image_path

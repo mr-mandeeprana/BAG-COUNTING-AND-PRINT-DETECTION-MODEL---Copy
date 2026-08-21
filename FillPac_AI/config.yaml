@@ -368,7 +368,10 @@ condition_c:
 
   save_full_frame: false
 
-  save_logs: true
+  # save_logs / log_directory are deprecated: the per-event
+  # JSON log file has been removed. Condition C events are
+  # now persisted to SQL Server (dbo.jam_events / dbo.roi_
+  # snapshots) by the pipeline, using the image saved below.
 
   save_distances: true
 
@@ -376,7 +379,6 @@ condition_c:
 
   image_directory: logs/roi_images
 
-  log_directory: logs/jam_events      
 # ==========================================================
 # CAMERAS
 # ==========================================================
@@ -991,7 +993,9 @@ dashboard:
   host: 0.0.0.0
   port: 8000
 
-  state_file: dashboard/backend/state.json
+  # state.json has been removed. DashboardState now persists
+  # to SQL Server (dbo.system_state / dbo.camera_status) on
+  # every publish -- there is no file to configure.
 
   publish_interval: 0.25
   stale_timeout: 10.0
@@ -1006,7 +1010,8 @@ logging:
 
   file: logs/application.log
 
-  count_events_enabled: true
-  count_file: logs/count_events.jsonl
+  # count_events.jsonl has been removed. Confirmed bag counts
+  # are now written straight to SQL Server (dbo.production_events)
+  # by CountLogger -- there is no file to configure.
 
   count_flush_immediately: true

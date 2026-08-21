@@ -6,8 +6,12 @@ Production Dashboard API + Socket.IO Server
 
 Dashboard responsibilities
 --------------------------
-- Read DashboardState from state.json
-- Read count_events.jsonl
+- Read DashboardState from SQL Server
+  (dbo.system_state / dbo.camera_status)
+- Read confirmed bag-count history from SQL Server
+  (dbo.production_events)
+- Read Condition C (ROI occupancy) jam history from SQL
+  Server (dbo.jam_events)
 - Expose REST APIs
 - Broadcast state through Socket.IO
 - Calculate production analytics
@@ -28,13 +32,20 @@ Jam detection remains inside the camera Pipeline.
 
 The dashboard only displays the jam state produced by
 the AI pipeline.
+
+CHANGE LOG
+----------
+state.json and count_events.jsonl have been removed. This
+server now reads everything from SQL Server through
+database/repository.py. ROI snapshot *images* are still read
+from disk (SQL Server has no good place to put binary image
+data) -- only the JSON event/state files are gone.
 ==========================================================
 """
 
 import asyncio
 import csv
 import io
-import json
 import logging
 import math
 
@@ -49,8 +60,15 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
 )
+from fastapi.staticfiles import StaticFiles
 
 import socketio
+
+from database.repository import (
+    get_condition_c_events as db_get_condition_c_events,
+    get_recent_production_events,
+    load_dashboard_state,
+)
 
 
 # ==========================================================
@@ -73,15 +91,14 @@ DASHBOARD_DIR = BACKEND_DIR.parent
 
 PROJECT_ROOT = DASHBOARD_DIR.parent
 
-STATE_FILE = BACKEND_DIR / "state.json"
-
 CONFIG_FILE = PROJECT_ROOT / "config.yaml"
 
-COUNT_EVENTS_FILE = (
-    PROJECT_ROOT
-    / "logs"
-    / "count_events.jsonl"
-)
+# NOTE: state.json, count_events.jsonl and the
+# logs/condition_c/events/*.json files are gone -- that data
+# now lives in SQL Server (dbo.system_state, dbo.camera_status,
+# dbo.production_events, dbo.jam_events). ROI snapshot images
+# themselves are still written to disk by ROIOccupancyDetector,
+# so CONDITION_C_IMAGES_DIR is kept.
 
 CONDITION_C_IMAGES_DIR = (
     PROJECT_ROOT
@@ -90,11 +107,16 @@ CONDITION_C_IMAGES_DIR = (
     / "images"
 )
 
-CONDITION_C_EVENTS_DIR = (
-    PROJECT_ROOT
-    / "logs"
-    / "condition_c"
-    / "events"
+# The dashboard frontend (index.html, js/, css/, assets/) lives
+# alongside this backend, under dashboard/frontend. Serving it
+# from this same FastAPI app means the browser can load
+# http://127.0.0.1:8000/ and get a working dashboard that talks
+# to this API on the same origin -- no separate static server
+# or file:// URL needed.
+
+FRONTEND_DIR = (
+    DASHBOARD_DIR
+    / "frontend"
 )
 
 
@@ -102,15 +124,22 @@ CONDITION_C_EVENTS_DIR = (
 # SERVER CONFIGURATION
 # ==========================================================
 
+# SQL Server reads get a smaller retry budget than the old
+# file reads did -- a transient file lock clears in
+# milliseconds, but a SQL connection problem generally won't
+# resolve within the same request, so retrying 10 times at
+# 30ms only added latency without helping. These retries exist
+# for genuinely transient issues (a momentary connection blip).
+
 STATE_WATCH_INTERVAL = 0.20
 
-STATE_READ_RETRIES = 10
+STATE_READ_RETRIES = 3
 
-STATE_READ_RETRY_DELAY = 0.03
+STATE_READ_RETRY_DELAY = 0.10
 
 EVENT_READ_RETRIES = 3
 
-EVENT_READ_RETRY_DELAY = 0.02
+EVENT_READ_RETRY_DELAY = 0.10
 
 LIVE_FRAME_INTERVAL = 0.10
 
@@ -395,12 +424,6 @@ def default_dashboard_state(
 
 async def read_dashboard_state():
 
-    if not STATE_FILE.exists():
-
-        return default_dashboard_state(
-            "offline"
-        )
-
     last_error = None
 
     for attempt in range(
@@ -409,13 +432,15 @@ async def read_dashboard_state():
 
         try:
 
-            with open(
-                STATE_FILE,
-                "r",
-                encoding="utf-8",
-            ) as file:
+            state = await asyncio.to_thread(
+                load_dashboard_state
+            )
 
-                state = json.load(file)
+            if state is None:
+
+                return default_dashboard_state(
+                    "offline"
+                )
 
             if not isinstance(
                 state,
@@ -465,11 +490,7 @@ async def read_dashboard_state():
 
             return state
 
-        except (
-            json.JSONDecodeError,
-            OSError,
-            ValueError,
-        ) as error:
+        except Exception as error:
 
             last_error = error
 
@@ -484,7 +505,8 @@ async def read_dashboard_state():
                 )
 
     logger.warning(
-        "Could not read dashboard state: %s",
+        "Could not read dashboard state from "
+        "SQL Server: %s",
         last_error,
     )
 
@@ -686,9 +708,6 @@ def normalize_event(
 
 async def read_count_events():
 
-    if not COUNT_EVENTS_FILE.exists():
-        return []
-
     last_error = None
 
     for attempt in range(
@@ -697,46 +716,29 @@ async def read_count_events():
 
         try:
 
+            raw_events = await asyncio.to_thread(
+                get_recent_production_events
+            )
+
             events = []
 
-            with open(
-                COUNT_EVENTS_FILE,
-                "r",
-                encoding="utf-8",
-            ) as file:
+            for event in raw_events:
 
-                for line in file:
+                if not isinstance(
+                    event,
+                    dict,
+                ):
+                    continue
 
-                    line = line.strip()
-
-                    if not line:
-                        continue
-
-                    try:
-
-                        event = json.loads(
-                            line
-                        )
-
-                    except json.JSONDecodeError:
-
-                        continue
-
-                    if not isinstance(
-                        event,
-                        dict,
-                    ):
-                        continue
-
-                    events.append(
-                        normalize_event(
-                            event
-                        )
+                events.append(
+                    normalize_event(
+                        event
                     )
+                )
 
             return events
 
-        except OSError as error:
+        except Exception as error:
 
             last_error = error
 
@@ -751,7 +753,8 @@ async def read_count_events():
                 )
 
     logger.warning(
-        "Could not read count events: %s",
+        "Could not read count events from "
+        "SQL Server: %s",
         last_error,
     )
 
@@ -764,58 +767,30 @@ async def read_count_events():
 
 async def read_condition_c_events():
 
-    if not CONDITION_C_EVENTS_DIR.exists():
-        return []
-
     try:
 
-        files = sorted(
-            CONDITION_C_EVENTS_DIR.glob(
-                "*.json"
-            )
+        events = await asyncio.to_thread(
+            db_get_condition_c_events
         )
 
-    except OSError as error:
+    except Exception as error:
 
         logger.warning(
-            "Could not list Condition C "
-            "events: %s",
+            "Could not read Condition C events "
+            "from SQL Server: %s",
             error,
         )
 
         return []
 
-    events = []
+    return [
 
-    for file_path in files:
+        event
 
-        try:
+        for event in events
 
-            with open(
-                file_path,
-                "r",
-                encoding="utf-8",
-            ) as file:
-
-                event = json.load(
-                    file
-                )
-
-        except (
-            OSError,
-            json.JSONDecodeError,
-        ):
-            continue
-
-        if not isinstance(
-            event,
-            dict,
-        ):
-            continue
-
-        events.append(event)
-
-    return events
+        if isinstance(event, dict)
+    ]
 
 
 # ==========================================================
@@ -1610,6 +1585,32 @@ def read_safe_config():
 @api.get("/")
 async def root():
 
+    index_file = (
+        FRONTEND_DIR
+        / "index.html"
+    )
+
+    if index_file.exists():
+
+        return FileResponse(
+            index_file,
+            media_type="text/html",
+        )
+
+    # Frontend not found on disk -- fall back to the API
+    # status payload so the server still reports something
+    # useful instead of a bare 404.
+
+    return await api_info()
+
+
+# ==========================================================
+# API INFO
+# ==========================================================
+
+@api.get("/api")
+async def api_info():
+
     return {
 
         "service":
@@ -1632,16 +1633,49 @@ async def root():
         "timestamp":
             utc_now_iso(),
 
-        "state_file":
-            str(
-                STATE_FILE
-            ),
-
-        "events_file":
-            str(
-                COUNT_EVENTS_FILE
-            ),
+        "storage":
+            "sql-server",
     }
+
+
+# ==========================================================
+# FRONTEND STATIC ASSETS
+#
+# Matches index.html's relative references:
+#   href="css/dashboard.css"
+#   src="js/dashboard.js"
+#   src="assets/Logo-BEUMER-Group.webp"
+# ==========================================================
+
+if (FRONTEND_DIR / "js").is_dir():
+
+    api.mount(
+        "/js",
+        StaticFiles(
+            directory=str(FRONTEND_DIR / "js")
+        ),
+        name="frontend-js",
+    )
+
+if (FRONTEND_DIR / "css").is_dir():
+
+    api.mount(
+        "/css",
+        StaticFiles(
+            directory=str(FRONTEND_DIR / "css")
+        ),
+        name="frontend-css",
+    )
+
+if (FRONTEND_DIR / "assets").is_dir():
+
+    api.mount(
+        "/assets",
+        StaticFiles(
+            directory=str(FRONTEND_DIR / "assets")
+        ),
+        name="frontend-assets",
+    )
 
 
 # ==========================================================
@@ -1805,10 +1839,8 @@ async def health():
         "service_status":
             service_status,
 
-        "state_file":
-            str(
-                STATE_FILE
-            ),
+        "storage":
+            "sql-server",
     }
 
 
@@ -3109,8 +3141,8 @@ async def dashboard_state_watcher():
     )
 
     logger.info(
-        "Watching state file: %s",
-        STATE_FILE,
+        "Watching SQL Server: dbo.system_state / "
+        "dbo.camera_status"
     )
 
     last_signature = None
@@ -3119,46 +3151,48 @@ async def dashboard_state_watcher():
 
         try:
 
-            if STATE_FILE.exists():
+            snapshot = (
+                await read_dashboard_state()
+            )
 
-                stat = (
-                    STATE_FILE.stat()
+            signature = (
+
+                snapshot.get(
+                    "updated_at"
+                ),
+
+                len(
+                    snapshot.get(
+                        "cameras",
+                        {},
+                    )
+                    or {}
+                ),
+            )
+
+            if (
+                snapshot.get(
+                    "system_status"
                 )
-
-                signature = (
-
-                    stat.st_mtime_ns,
-
-                    stat.st_size,
-                )
-
-                if (
+                != "error"
+                and
+                (
                     last_signature is None
                     or
                     signature
                     !=
                     last_signature
-                ):
+                )
+            ):
 
-                    snapshot = (
-                        await read_dashboard_state()
-                    )
+                await sio.emit(
+                    "dashboard_state",
+                    snapshot,
+                )
 
-                    if (
-                        snapshot.get(
-                            "system_status"
-                        )
-                        != "error"
-                    ):
-
-                        await sio.emit(
-                            "dashboard_state",
-                            snapshot,
-                        )
-
-                        last_signature = (
-                            signature
-                        )
+                last_signature = (
+                    signature
+                )
 
         except asyncio.CancelledError:
 
@@ -3194,18 +3228,24 @@ async def startup_event():
     )
 
     logger.info(
-        "State file: %s",
-        STATE_FILE,
-    )
-
-    logger.info(
-        "Events file: %s",
-        COUNT_EVENTS_FILE,
+        "State source: SQL Server "
+        "(dbo.system_state / dbo.camera_status)",
     )
 
     logger.info(
         "Config file: %s",
         CONFIG_FILE,
+    )
+
+    index_file = (
+        FRONTEND_DIR
+        / "index.html"
+    )
+
+    logger.info(
+        "Frontend dir: %s (index.html found: %s)",
+        FRONTEND_DIR,
+        index_file.exists(),
     )
 
     api.state.dashboard_watcher = (

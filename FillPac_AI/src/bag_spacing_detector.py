@@ -1538,6 +1538,28 @@ class BagSpacingDetector:
         )
 
         # ==================================================
+        # JAM REASON
+        # ==================================================
+
+        reason = None
+
+        if jam_detected:
+
+            if (
+                minimum_gap_mm is not None
+                and minimum_gap_mm < self.jam_threshold_mm
+            ):
+                reason = (
+                    f"Minimum bag spacing "
+                    f"{minimum_gap_mm:.2f} mm "
+                    f"is below threshold "
+                    f"{self.jam_threshold_mm:.2f} mm"
+                )
+
+            else:
+                reason = "Minimum spacing between bags exceeded limit"
+
+        # ==================================================
         # ACTIVE JAM TRACK IDS
         # ==================================================
 
@@ -1581,6 +1603,9 @@ class BagSpacingDetector:
                     if jam_detected
                     else None
                 ),
+
+            "reason":
+                reason,
 
             # ==============================================
             # CONFIGURATION

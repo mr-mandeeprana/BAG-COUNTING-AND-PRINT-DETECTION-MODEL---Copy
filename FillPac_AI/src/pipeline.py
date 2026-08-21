@@ -64,8 +64,8 @@ UNKNOWN does not increase the missing count.
 ==========================================================
 """
 from database.repository import (
-    save_production_event,
     save_print_event,
+    save_roi_snapshot,
     start_jam_event,
     end_jam_event,
 )
@@ -746,6 +746,14 @@ class Pipeline:
                 or 0
             )
 
+            restored_entry_roi_count = int(
+                camera_state.get(
+                    "entry_roi_count",
+                    0,
+                )
+                or 0
+            )
+
             restored_printed = int(
                 camera_state.get(
                     "printed_count",
@@ -776,6 +784,18 @@ class Pipeline:
 
                 self.last_count = (
                     restored_count
+                )
+
+            if restored_entry_roi_count > 0:
+
+                if self.entry_roi_counter is not None:
+
+                    self.entry_roi_counter.total_count = (
+                        restored_entry_roi_count
+                    )
+
+                self.entry_roi_count = (
+                    restored_entry_roi_count
                 )
 
             self.printed_count = max(
@@ -882,10 +902,16 @@ class Pipeline:
 
                 camera_name=self.name,
 
-                count=self.counter.total_count,
+                count=(
+                    self.entry_roi_counter.total_count
+                    if self.entry_roi_counter is not None
+                    else 0
+                ),
 
                 total_count=(
-                    self.counter.total_count
+                    self.entry_roi_counter.total_count
+                    if self.entry_roi_counter is not None
+                    else 0
                 ),
 
                 printed_count=self.printed_count,
@@ -1752,6 +1778,7 @@ class Pipeline:
                             start_jam_event(
                                 camera_id=self.name,
                                 condition_code="A",
+                                condition_name="MOVEMENT_JAM",
                                 jam_type="movement",
                                 track_ids=(
                                     self.jam_result.get(
@@ -1875,7 +1902,7 @@ class Pipeline:
 
             condition_b_jam = bool(
                 self.spacing_result.get(
-                    "jam",
+                    "jam_detected",
                     False,
                 )
             )
@@ -1898,6 +1925,7 @@ class Pipeline:
                             start_jam_event(
                                 camera_id=self.name,
                                 condition_code="B",
+                                condition_name="BAG_SPACING_JAM",
                                 jam_type="spacing",
                                 track_ids=(
                                     self.spacing_result.get(
@@ -2047,10 +2075,72 @@ class Pipeline:
                             datetime.now(timezone.utc)
                         )
 
+                        # ------------------------------------------
+                        # Save the ROI snapshot image FIRST so we
+                        # have a snapshot ID to attach to the jam
+                        # event below. Without this, roi_snapshots
+                        # stayed empty and jam_events.roi_snapshot_id
+                        # was always NULL even though the detector
+                        # already wrote the image to disk.
+                        # ------------------------------------------
+
+                        condition_c_snapshot_id = None
+
+                        condition_c_image_path = (
+                            condition_c_result.get("image_path")
+                        )
+
+                        if condition_c_image_path:
+
+                            try:
+
+                                condition_c_snapshot_id = (
+                                    save_roi_snapshot(
+                                        camera_id=self.name,
+                                        event_type="condition_c",
+                                        image_path=str(
+                                            condition_c_image_path
+                                        ),
+                                        metadata={
+                                            "condition_code": "C",
+                                            "condition_name": (
+                                                "ROI_OCCUPANCY_JAM"
+                                            ),
+                                            "jam_type": (
+                                                "roi_occupancy"
+                                            ),
+                                            "condition_c_result": (
+                                                condition_c_result
+                                            ),
+                                            "roi": (
+                                                self.condition_c_roi
+                                            ),
+                                            "track_ids": (
+                                                condition_c_result.get(
+                                                    "track_ids",
+                                                    [],
+                                                )
+                                                or []
+                                            ),
+                                        },
+                                    )
+                                )
+
+                            except Exception as error:
+
+                                condition_c_snapshot_id = None
+
+                                self.logger.warning(
+                                    f"{self.name}: failed to save "
+                                    "Condition C ROI snapshot to "
+                                    f"SQL: {error}"
+                                )
+
                         self.condition_c_sql_jam_id = (
                             start_jam_event(
                                 camera_id=self.name,
                                 condition_code="C",
+                                condition_name="ROI_OCCUPANCY_JAM",
                                 jam_type="roi_occupancy",
                                 track_ids=(
                                     condition_c_result.get(
@@ -2063,6 +2153,9 @@ class Pipeline:
                                         "reason",
                                         "ROI occupancy exceeded limit",
                                     )
+                                ),
+                                roi_snapshot_id=(
+                                    condition_c_snapshot_id
                                 ),
                                 metadata={
                                     "condition_code": "C",
@@ -3084,62 +3177,21 @@ class Pipeline:
 
             # ==================================================
             # SQL SERVER PRODUCTION EVENT
+            #
+            # Written once, via count_logger.log_count(), which
+            # is the single source of truth for dbo.production_
+            # events (one row per confirmed bag, bag_count=1).
+            #
+            # A duplicate direct save_production_event() call
+            # used to live here as well -- it wrote a SECOND row
+            # per bag with bag_count=self.counter.total_count
+            # (the camera's running total, not a per-event count
+            # of 1), which both double-counted events and put the
+            # wrong value in bag_count. Removed in favor of the
+            # single call below.
             # ==================================================
 
-            try:
-
-                save_production_event(
-                    camera_id=self.name,
-
-                    bag_count=self.counter.total_count,
-
-                    printed_count=self.printed_count,
-
-                    unprinted_count=self.missing_count,
-
-                    line_count=self.counter.total_count,
-
-                    frame_roi_count=(
-                        self.entry_roi_count
-                        if self.entry_roi_counter is not None
-                        else 0
-                    ),
-
-                    bags_inside_roi=(
-                        len(
-                            getattr(
-                                self.entry_roi_counter,
-                                "active_track_ids",
-                                []
-                            )
-                        )
-                        if self.entry_roi_counter is not None
-                        else 0
-                    ),
-
-                    metadata={
-                        "track_id": counted_bag.get("track_id"),
-                        "center": counted_bag.get("center"),
-                        "print_present": counted_bag.get("print_present"),
-                        "printed_count_event": counted_bag.get("printed_count"),
-                        "missing_count_event": counted_bag.get("missing_count"),
-                    },
-                )
-
-            except Exception as e:
-
-                self.logger.error(
-                    f"{self.name}: failed saving "
-                    f"production event to SQL Server: {e}"
-                )
-
             if self.count_logger is not None:
-
-                import traceback
-
-                print("=" * 80)
-                print(counted_bag)
-                print("=" * 80)
 
                 try:
 
@@ -3172,15 +3224,36 @@ class Pipeline:
                         print_detection_enabled=(
                             self.print_detection_enabled
                         ),
+
+                        # Extra diagnostic fields -- preserved in
+                        # metadata_json (same fields the removed
+                        # direct save_production_event() call used
+                        # to pass as top-level columns).
+                        line_count=self.counter.total_count,
+
+                        frame_roi_count=(
+                            self.entry_roi_counter.total_count
+                            if self.entry_roi_counter is not None
+                            else 0
+                        ),
+
+                        bags_inside_roi=(
+                            sum(
+                                1
+                                for inside in
+                                self.entry_roi_counter.track_inside_roi.values()
+                                if inside
+                            )
+                            if self.entry_roi_counter is not None
+                            else 0
+                        ),
                     )
 
                 except Exception as e:
 
-                    self.logger.error(
+                    self.logger.exception(
                         f"{self.name}: failed writing count event: {e}"
                     )
-
-                    traceback.print_exc()
 
         self.last_count = count
 
@@ -3664,10 +3737,16 @@ class Pipeline:
 
                 camera_name=self.name,
 
-                count=self.counter.total_count,
+                count=(
+                    self.entry_roi_counter.total_count
+                    if self.entry_roi_counter is not None
+                    else 0
+                ),
 
                 total_count=(
-                    self.counter.total_count
+                    self.entry_roi_counter.total_count
+                    if self.entry_roi_counter is not None
+                    else 0
                 ),
 
                 # ==========================================
