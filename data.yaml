@@ -1,6 +1,0 @@
-names:
-- bag
-nc: 1
-test: /kaggle/working/dataset_resplit/test/images
-train: /kaggle/working/dataset_resplit/train/images
-val: /kaggle/working/dataset_resplit/valid/images

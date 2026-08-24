@@ -65,7 +65,11 @@ from fastapi.staticfiles import StaticFiles
 import socketio
 
 from database.repository import (
+    get_active_jam_events,
     get_condition_c_events as db_get_condition_c_events,
+    get_production_summary,
+    get_recent_jam_events,
+    get_recent_print_events,
     get_recent_production_events,
     load_dashboard_state,
 )
@@ -2022,6 +2026,50 @@ async def production():
 
 
 # ==========================================================
+# PRODUCTION SUMMARY (CANONICAL, SQL-DERIVED)
+#
+# Unlike /production above (which reflects the live in-memory
+# DashboardState published by the running pipeline), this reads
+# directly from dbo.production_events via
+# database.repository.get_production_summary() -- the single
+# source of truth for historical totals. Useful for
+# reconciliation (comparing live vs. persisted totals) and for
+# any consumer that wants SQL-accurate numbers even if the live
+# pipeline/dashboard-state publisher is stale or restarting.
+# ==========================================================
+
+@api.get("/production/summary")
+async def production_summary(
+    camera_id: str | None = None,
+):
+
+    try:
+
+        summary = await asyncio.to_thread(
+            get_production_summary,
+            camera_id,
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not read production summary "
+            "from SQL Server: %s",
+            error,
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error":
+                    "Production summary unavailable.",
+            },
+        )
+
+    return summary
+
+
+# ==========================================================
 # JAM MONITORING API
 #
 # NEW ENDPOINT:
@@ -2056,6 +2104,130 @@ async def jams():
 
         "generated_at":
             utc_now_iso(),
+    }
+
+
+# ==========================================================
+# JAM EVENTS -- ACTIVE (CANONICAL, SQL-DERIVED)
+#
+# Unlike /jams above (which summarizes jam_status strings from
+# the live DashboardState), this reads ACTIVE rows directly
+# from dbo.jam_events. Because Condition A/B/C are independent
+# (see database/repository.py's start_jam_event() docstring), a
+# single camera can legitimately have more than one entry here
+# at once -- e.g. a spacing jam and an occupancy jam together.
+# ==========================================================
+
+@api.get("/jams/active")
+async def jams_active():
+
+    try:
+
+        events = await asyncio.to_thread(
+            get_active_jam_events
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not read active jam events "
+            "from SQL Server: %s",
+            error,
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error":
+                    "Active jam events unavailable.",
+            },
+        )
+
+    return {
+        "active_jams": events,
+        "generated_at": utc_now_iso(),
+    }
+
+
+# ==========================================================
+# JAM EVENTS -- RECENT (CANONICAL, SQL-DERIVED)
+# ==========================================================
+
+@api.get("/jams/recent")
+async def jams_recent(
+    camera_id: str | None = None,
+    limit: int = Query(default=100, le=1000),
+    hours: int = Query(default=24, le=24 * 30),
+):
+
+    try:
+
+        events = await asyncio.to_thread(
+            get_recent_jam_events,
+            camera_id,
+            limit,
+            hours,
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not read recent jam events "
+            "from SQL Server: %s",
+            error,
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error":
+                    "Recent jam events unavailable.",
+            },
+        )
+
+    return {
+        "jams": events,
+        "generated_at": utc_now_iso(),
+    }
+
+
+# ==========================================================
+# PRINT EVENTS -- RECENT (CANONICAL, SQL-DERIVED)
+# ==========================================================
+
+@api.get("/print-events/recent")
+async def print_events_recent(
+    camera_id: str | None = None,
+    limit: int = Query(default=500, le=5000),
+):
+
+    try:
+
+        events = await asyncio.to_thread(
+            get_recent_print_events,
+            camera_id,
+            limit,
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not read recent print events "
+            "from SQL Server: %s",
+            error,
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error":
+                    "Recent print events unavailable.",
+            },
+        )
+
+    return {
+        "print_events": events,
+        "generated_at": utc_now_iso(),
     }
 
 

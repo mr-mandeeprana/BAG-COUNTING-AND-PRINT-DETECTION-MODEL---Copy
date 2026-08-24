@@ -252,6 +252,31 @@ def save_production_event(
     timestamp: str | None = None,
     metadata: dict | None = None,
 ) -> int:
+    """
+    Save one production event row for a camera.
+
+    CRITICAL CONTRACT
+    ------------------
+    Each call inserts exactly one row into production_events.
+    Dashboard/API code SUMs bag_count across all rows to get a
+    canonical total (see get_production_summary() below) -- so
+    this must be called ONCE per confirmed bag, with bag_count
+    set to that bag's own contribution (normally 1 for a
+    per-event row), NOT the camera's running total. Writing the
+    running total on every call would make totals grow by
+    O(n^2) instead of matching the true bag count.
+
+    Callers: CountLogger.log_count() is the single source of
+    truth for this table (see src/pipeline.py's
+    "SQL SERVER PRODUCTION EVENT" section) -- avoid adding a
+    second direct call site.
+
+    Returns:
+        production_event ID in SQL Server
+
+    Raises:
+        SqlWriteFailed: If SQL write fails (queued to failsafe)
+    """
 
     initialize_schema()
 
@@ -842,6 +867,88 @@ def load_dashboard_state() -> dict | None:
         return state
 
 
+def _validate_condition_metadata(metadata: dict | None) -> dict:
+    """
+    Validate that a jam_event `metadata` dict contains the
+    fields expected for its condition_code, before it's written
+    to SQL Server.
+
+    This does not raise on missing detail fields (Condition B/C
+    payloads are built from live detector output that can
+    legitimately be incomplete in edge cases) -- it logs a
+    warning instead, so a slightly incomplete payload doesn't
+    take down the write path. It DOES raise for structurally
+    invalid input (wrong type, invalid condition_code), since
+    those indicate a caller bug rather than incomplete detector
+    output, and writing them would silently produce a broken
+    row.
+
+    Args:
+        metadata: The metadata dict passed to start_jam_event()
+
+    Returns:
+        The metadata dict, unchanged (validated in place).
+
+    Raises:
+        ValueError: If metadata is not a dict, or condition_code
+            is present but not one of 'A', 'B', 'C'.
+    """
+
+    if metadata is None:
+        return {}
+
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            "jam_event metadata must be None or dict, got "
+            f"{type(metadata).__name__}"
+        )
+
+    condition_code = metadata.get("condition_code")
+
+    if condition_code is not None and condition_code not in {"A", "B", "C"}:
+        raise ValueError(
+            "jam_event metadata.condition_code must be 'A', 'B', "
+            f"or 'C', got {condition_code!r}"
+        )
+
+    if condition_code == "B":
+        nested = metadata.get("spacing_result")
+        flat_keys = {
+            k: v for k, v in metadata.items()
+            if k not in ("condition_c_result", "spacing_result", "jam_result")
+        }
+        source = {**nested, **flat_keys} if isinstance(nested, dict) else flat_keys
+
+        has_gap = (
+            source.get("minimum_gap_mm") is not None
+            or source.get("minimum_safe_gap_mm") is not None
+        )
+
+        if not has_gap:
+            logger.warning(
+                "jam_event metadata for Condition B missing gap "
+                "data; expected minimum_gap_mm or "
+                "minimum_safe_gap_mm in metadata"
+            )
+
+    if condition_code == "C":
+        nested = metadata.get("condition_c_result")
+        flat_keys = {
+            k: v for k, v in metadata.items()
+            if k not in ("condition_c_result", "spacing_result", "jam_result")
+        }
+        source = {**nested, **flat_keys} if isinstance(nested, dict) else flat_keys
+
+        if source.get("occupancy_percent") is None:
+            logger.warning(
+                "jam_event metadata for Condition C missing "
+                "occupancy_percent; this will result in NULL "
+                "occupancy_percent in jam_events"
+            )
+
+    return metadata
+
+
 @_resilient_write("start_jam_event")
 def start_jam_event(
     camera_id: str,
@@ -853,6 +960,32 @@ def start_jam_event(
     metadata: dict | None = None,
     condition_name: str | None = None,
 ) -> int:
+    """
+    Start recording a new jam event.
+
+    CRITICAL CONTRACT
+    ------------------
+    This creates ONE row in jam_events with status='ACTIVE'.
+
+    - Do NOT call this multiple times for the same physical jam
+      condition. Call it ONCE per (camera_id, condition_code)
+      when that condition's jam state transitions False -> True.
+    - Condition A (movement), Condition B (spacing), and
+      Condition C (occupancy) are independent physical
+      conditions that can be active concurrently on the same
+      camera -- each gets its own jam_events row and its own
+      start/end pair. Do not collapse them into a single call;
+      that would lose which condition(s) are actually active.
+    - Use end_jam_event() to transition status to
+      RECOVERED/TIMEOUT once that same condition clears.
+
+    Returns:
+        jam_event ID in SQL Server
+
+    Raises:
+        ValueError: If condition_code not in {'A', 'B', 'C'}
+        SqlWriteFailed: If SQL write fails (queued to failsafe)
+    """
 
     initialize_schema()
 
@@ -863,6 +996,10 @@ def start_jam_event(
             f"Invalid condition_code: {condition_code}. "
             f"Expected A, B or C."
         )
+
+    # Validate metadata early, before any DB work, so malformed
+    # detector output fails fast instead of writing a broken row.
+    metadata = _validate_condition_metadata(metadata)
 
     # Falls back to the standard name for the condition code if
     # the caller didn't pass one explicitly, so condition_name
@@ -1001,6 +1138,496 @@ def end_jam_event(
             raise RuntimeError(
                 f"Jam event ID {jam_event_id} was not found."
             )
+
+
+# ==========================================================
+# CANONICAL READ METHODS
+#
+# These are the single source of truth for dashboard/API
+# consumers. server.py should call these instead of running
+# its own SUM()/aggregation queries or reconstructing state
+# from raw event rows, so there's exactly one place that
+# defines what "current state" and "totals" mean.
+# ==========================================================
+
+def get_current_system_state() -> dict | None:
+    """
+    Return the current system state as a single dict.
+
+    Canonical source for model_loaded, inference_manager_running,
+    elasticsearch_connected, dashboard_enabled, and the full
+    last-persisted DashboardState snapshot (via state_json).
+
+    Returns:
+        dict with system status fields, or None if
+        dbo.system_state has never been written to.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                system_status,
+                model_loaded,
+                inference_manager_running,
+                elasticsearch_connected,
+                dashboard_enabled,
+                state_json,
+                updated_at
+            FROM dbo.system_state
+            WHERE id = 1
+            """
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        try:
+            state_dict = json.loads(row[5]) if row[5] else {}
+        except (TypeError, ValueError):
+            state_dict = {}
+
+        return {
+            **state_dict,
+            "system_status": row[0],
+            "model_loaded": bool(row[1]),
+            "inference_manager_running": bool(row[2]),
+            "elasticsearch_connected": bool(row[3]),
+            "dashboard_enabled": bool(row[4]),
+            "updated_at": row[6].isoformat() if row[6] else None,
+        }
+
+
+def get_camera_state(camera_id: str) -> dict | None:
+    """
+    Return normalized camera state (current snapshot, not
+    history) -- single row per camera from dbo.camera_status.
+
+    Returns:
+        dict with camera status, or None if the camera has
+        never reported in.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                camera_id,
+                status,
+                fps,
+                frame_count,
+                last_seen,
+                updated_at,
+                state_json
+            FROM dbo.camera_status
+            WHERE camera_id = ?
+            """,
+            (camera_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        try:
+            state_dict = json.loads(row[6]) if row[6] else {}
+        except (TypeError, ValueError):
+            state_dict = {}
+
+        return {
+            **state_dict,
+            "camera_id": row[0],
+            "status": row[1],
+            "fps": row[2],
+            "frame_count": int(row[3] or 0),
+            "last_seen": row[4].isoformat() if row[4] else None,
+            "updated_at": row[5].isoformat() if row[5] else None,
+        }
+
+
+def get_all_camera_states() -> dict[str, dict]:
+    """
+    Return all cameras' current state in one call.
+
+    Returns:
+        {"camera_1": {...}, "camera_2": {...}, ...}
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                camera_id,
+                status,
+                fps,
+                frame_count,
+                last_seen,
+                updated_at,
+                state_json
+            FROM dbo.camera_status
+            ORDER BY camera_id
+            """
+        )
+
+        result = {}
+
+        for row in cursor.fetchall():
+            try:
+                state_dict = json.loads(row[6]) if row[6] else {}
+            except (TypeError, ValueError):
+                state_dict = {}
+
+            result[row[0]] = {
+                **state_dict,
+                "camera_id": row[0],
+                "status": row[1],
+                "fps": row[2],
+                "frame_count": int(row[3] or 0),
+                "last_seen": row[4].isoformat() if row[4] else None,
+                "updated_at": row[5].isoformat() if row[5] else None,
+            }
+
+        return result
+
+
+def get_production_summary(camera_id: str | None = None) -> dict:
+    """
+    Return production totals from dbo.production_events.
+
+    CRITICAL: This is the ONLY source of truth for counts.
+    Dashboard/API code must not recompute totals by summing
+    raw event rows itself -- call this instead.
+
+    Args:
+        camera_id: If provided, return totals for one camera
+            only. If None, return system-wide totals plus a
+            per-camera breakdown.
+
+    Returns:
+        If camera_id is None:
+            {
+                "total_bags": 1234,
+                "total_printed": 1000,
+                "total_missing": 234,
+                "cameras": {
+                    "camera_1": {"total": ..., "printed": ..., "missing": ...},
+                    ...
+                },
+            }
+
+        If camera_id is given:
+            {"total": 100, "printed": 85, "missing": 15}
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                camera_id,
+                SUM(bag_count),
+                SUM(printed_count),
+                SUM(unprinted_count)
+            FROM dbo.production_events
+            GROUP BY camera_id
+            ORDER BY camera_id
+            """
+        )
+
+        cameras = {}
+        total_bags = 0
+        total_printed = 0
+        total_missing = 0
+
+        for cam_id, bags, printed, missing in cursor.fetchall():
+            bags = int(bags or 0)
+            printed = int(printed or 0)
+            missing = int(missing or 0)
+
+            cameras[cam_id] = {
+                "total": bags,
+                "printed": printed,
+                "missing": missing,
+            }
+
+            total_bags += bags
+            total_printed += printed
+            total_missing += missing
+
+        if camera_id is not None:
+            return cameras.get(camera_id, {
+                "total": 0,
+                "printed": 0,
+                "missing": 0,
+            })
+
+        return {
+            "total_bags": total_bags,
+            "total_printed": total_printed,
+            "total_missing": total_missing,
+            "cameras": cameras,
+        }
+
+
+def get_active_jam_events() -> list[dict]:
+    """
+    Return all currently ACTIVE jam events (status = 'ACTIVE'),
+    across all conditions/cameras.
+
+    Because Condition A/B/C are tracked independently (see
+    start_jam_event()'s docstring), a single camera can have
+    more than one ACTIVE row at once -- e.g. a spacing jam and
+    an occupancy jam concurrently. That's expected, not a bug.
+
+    Returns:
+        List of jam event dicts, most recent first per camera.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                camera_id,
+                start_time,
+                condition_code,
+                condition_name,
+                jam_type,
+                status,
+                track_ids,
+                bag_count,
+                minimum_gap_mm,
+                average_gap_mm,
+                threshold_mm,
+                occupancy_percent,
+                max_allowed_bags,
+                direction,
+                metadata_json,
+                created_at
+            FROM dbo.jam_events
+            WHERE status = 'ACTIVE'
+            ORDER BY camera_id, start_time DESC
+            """
+        )
+
+        events = []
+
+        for row in cursor.fetchall():
+            try:
+                metadata = json.loads(row[15]) if row[15] else {}
+            except (TypeError, ValueError):
+                metadata = {}
+
+            try:
+                track_ids = json.loads(row[7]) if row[7] else []
+            except (TypeError, ValueError):
+                track_ids = []
+
+            events.append({
+                "id": row[0],
+                "camera_id": row[1],
+                "start_time": row[2].isoformat() if row[2] else None,
+                "condition_code": row[3],
+                "condition_name": row[4],
+                "jam_type": row[5],
+                "status": row[6],
+                "track_ids": track_ids,
+                "bag_count": row[8],
+                "minimum_gap_mm": row[9],
+                "average_gap_mm": row[10],
+                "threshold_mm": row[11],
+                "occupancy_percent": row[12],
+                "max_allowed_bags": row[13],
+                "direction": row[14],
+                "created_at": row[16].isoformat() if row[16] else None,
+                "metadata": metadata,
+            })
+
+        return events
+
+
+def get_recent_jam_events(
+    camera_id: str | None = None,
+    limit: int = 100,
+    hours: int = 24,
+) -> list[dict]:
+    """
+    Return recent jam events (completed or active), most recent
+    first.
+
+    Args:
+        camera_id: Optional filter for one camera.
+        limit: Max number of events to return.
+        hours: Only include events created in the last N hours.
+
+    Returns:
+        List of jam event dicts.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT DATEADD(HOUR, ?, GETUTCDATE())", (-hours,))
+        cutoff_time = cursor.fetchone()[0]
+
+        query = """
+            SELECT TOP (?)
+                id,
+                camera_id,
+                start_time,
+                end_time,
+                duration_seconds,
+                condition_code,
+                condition_name,
+                jam_type,
+                status,
+                track_ids,
+                bag_count,
+                minimum_gap_mm,
+                average_gap_mm,
+                threshold_mm,
+                occupancy_percent,
+                metadata_json,
+                created_at
+            FROM dbo.jam_events
+            WHERE created_at >= ?
+        """
+
+        params = [limit, cutoff_time]
+
+        if camera_id:
+            query += " AND camera_id = ?"
+            params.append(camera_id)
+
+        query += " ORDER BY created_at DESC"
+
+        cursor.execute(query, params)
+
+        events = []
+
+        for row in cursor.fetchall():
+            try:
+                metadata = json.loads(row[15]) if row[15] else {}
+            except (TypeError, ValueError):
+                metadata = {}
+
+            try:
+                track_ids = json.loads(row[9]) if row[9] else []
+            except (TypeError, ValueError):
+                track_ids = []
+
+            events.append({
+                "id": row[0],
+                "camera_id": row[1],
+                "start_time": row[2].isoformat() if row[2] else None,
+                "end_time": row[3].isoformat() if row[3] else None,
+                "duration_seconds": row[4],
+                "condition_code": row[5],
+                "condition_name": row[6],
+                "jam_type": row[7],
+                "status": row[8],
+                "track_ids": track_ids,
+                "bag_count": row[10],
+                "minimum_gap_mm": row[11],
+                "average_gap_mm": row[12],
+                "threshold_mm": row[13],
+                "occupancy_percent": row[14],
+                "created_at": row[16].isoformat() if row[16] else None,
+                "metadata": metadata,
+            })
+
+        return events
+
+
+def get_recent_print_events(
+    camera_id: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Return recent print detection events, most recent first.
+
+    Should be ONE record per bag detection (see
+    save_print_event()'s single call site in
+    src/pipeline.py's "SQL SERVER PRINT EVENTS" section).
+
+    Args:
+        camera_id: Optional filter for one camera.
+        limit: Max number of events to return.
+
+    Returns:
+        List of print event dicts.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+        cursor = conn.cursor()
+
+        query = """
+            SELECT TOP (?)
+                id,
+                camera_id,
+                timestamp,
+                track_id,
+                result,
+                confidence,
+                metadata_json
+            FROM dbo.print_events
+        """
+
+        params = [limit]
+
+        if camera_id:
+            query += " WHERE camera_id = ?"
+            params.append(camera_id)
+
+        query += " ORDER BY timestamp DESC"
+
+        cursor.execute(query, params)
+
+        events = []
+
+        for row in cursor.fetchall():
+            try:
+                metadata = json.loads(row[6]) if row[6] else {}
+            except (TypeError, ValueError):
+                metadata = {}
+
+            events.append({
+                "id": row[0],
+                "camera_id": row[1],
+                "timestamp": row[2].isoformat() if row[2] else None,
+                "track_id": row[3],
+                "result": row[4],
+                "confidence": row[5],
+                "metadata": metadata,
+            })
+
+        return events
 
 
 @_resilient_write("save_application_log")
