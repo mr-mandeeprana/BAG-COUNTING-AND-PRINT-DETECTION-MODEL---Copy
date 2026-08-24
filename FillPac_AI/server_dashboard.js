@@ -1,4017 +1,6444 @@
-"""
+/*
 ==========================================================
 FillPac AI
-Production Camera Pipeline
+Dashboard Frontend
 ==========================================================
+*/
 
-Each camera owns:
-- Camera
-- Tracker
-- Counter
-- PrintDetector
-- JamDetector              -> Condition A
-- BagSpacingDetector       -> Condition B
-- Print history
-- Latest annotated frame
-
-YOLO is NOT loaded inside this class.
-
-All camera pipelines use ONE shared InferenceManager.
-
-Counting Principle
-------------------
-The physical bag CENTER crossing the configured counting
-line is the counting trigger.
-
-Track ID is used only for:
-- temporal movement history
-- print-vote association
-- jam movement analysis
-- spacing pair association
-- duplicate protection
-- diagnostics
-
-Track ID itself does NOT trigger a count.
-
-Jam Detection
--------------
-Condition A:
-    Movement-based JamDetector.
-
-Condition B:
-    Calibrated physical edge-to-edge bag spacing.
-
-Final Jam:
-    Condition A OR Condition B
-
-Jam detection NEVER changes the physical-center counting
-logic.
-
-Print Classification
---------------------
-After a physical bag crossing is confirmed:
-
-- Enough observations + print ratio >= threshold
-    -> PRINTED
-
-- Enough observations + print ratio < threshold
-    -> MISSING
-
-- Not enough observations
-    -> UNKNOWN
-
-UNKNOWN does not increase the missing count.
-==========================================================
-"""
-from database.repository import (
-    save_print_event,
-    save_roi_snapshot,
-    start_jam_event,
-    end_jam_event,
-)
-from datetime import datetime, timezone
+"use strict";
 
-import threading
-import time
 
-import cv2
+/* ==========================================================
+   CONFIGURATION
+   ========================================================== */
 
-from src.bag_spacing_detector import BagSpacingDetector
-from src.camera import Camera
-from src.counter import Counter
-from src.entry_roi_counter import EntryROICounter
-from src.jam_detector import JamDetector
-from src.roi_occupancy_detector import ROIOccupancyDetector
-from src.print_detector import PrintDetector
-from src.tracker import Tracker
-from src.visualizer import Visualizer
-
-
-class Pipeline:
-
-    # ======================================================
-    # INITIALIZATION
-    # ======================================================
-
-    def __init__(
-        self,
-        camera_config,
-        tracker_config,
-        display_config,
-        logger,
-        inference_manager,
-        dashboard_state=None,
-        elasticsearch=None,
-        count_logger=None,
-    ):
-
-        # ==================================================
-        # BASIC CONFIGURATION
-        # ==================================================
-
-        self.camera_config = camera_config
-        self.logger = logger
-        self.inference_manager = inference_manager
-        self.dashboard_state = dashboard_state
-        self.elasticsearch = elasticsearch
-        self.count_logger = count_logger
-
-        self.name = camera_config["name"]
-
-        self.camera_id = camera_config.get(
-            "id"
-        )
-
-        self.roi = camera_config["roi"]
-
-        self.window_name = self.name
-
-        if self.inference_manager is None:
-
-            raise ValueError(
-                f"{self.name}: Pipeline requires "
-                "a valid InferenceManager."
-            )
-
-        # ==================================================
-        # CAMERA MODE
-        # ==================================================
-
-        self.camera_mode = camera_config.get(
-            "mode",
-            "video",
-        )
-
-        # ==================================================
-        # RUNTIME STATE
-        # ==================================================
-
-        self.connected = False
-
-        self.previous_time = (
-            time.perf_counter()
-        )
-
-        self.last_count = 0
-        self.last_print_status = None
-
-        # Separate ROI-entry count
-        self.entry_roi_count = 0
-
-        self.printed_count = 0
-        self.missing_count = 0
-
-        self.frame_index = 0
-        self.processed_frame_count = 0
-
-        self.last_error = None
-
-        # ==================================================
-        # DASHBOARD UPDATE CONTROL
-        # ==================================================
-
-        self.last_dashboard_publish_time = 0.0
-
-        self.dashboard_publish_interval = max(
-            float(
-                camera_config.get(
-                    "dashboard_publish_interval",
-                    0.5,
-                )
-            ),
-            0.0,
-        )
-
-        # ==================================================
-        # INFERENCE CONFIGURATION
-        # ==================================================
-
-        self.inference_timeout = max(
-            float(
-                camera_config.get(
-                    "inference_timeout",
-                    5.0,
-                )
-            ),
-            0.1,
-        )
-
-        # ==================================================
-        # CONFIGURATION
-        # ==================================================
-
-        counting_config = (
-            camera_config.get(
-                "counting",
-                {},
-            )
-            or {}
-        )
-
-        # ==================================================
-        # ENTRY ROI COUNTING CONFIGURATION
-        # ==================================================
-
-        entry_roi_counting_config = (
-            camera_config.get(
-                "entry_roi_counting",
-                {},
-            )
-            or {}
-        )
-
-        print_config = (
-            camera_config.get(
-                "print_detection",
-                {},
-            )
-            or {}
-        )
-
-        jam_config = (
-            camera_config.get(
-                "jam_detection",
-                {},
-            )
-            or {}
-        )
-
-        spacing_config = (
-            camera_config.get(
-                "bag_spacing",
-                {},
-            )
-            or {}
-        )
-
-        condition_c_config = (
-            camera_config.get(
-                "condition_c",
-                {},
-            )
-            or {}
-        )
-
-        # ==================================================
-        # DISPLAY CONFIGURATION
-        # ==================================================
-
-        self.display_config = dict(
-            display_config or {}
-        )
-
-        self.display_config.update(
-            camera_config.get(
-                "display",
-                {},
-            )
-            or {}
-        )
-
-        # ==================================================
-        # CAMERA
-        # ==================================================
-
-        self.camera = Camera(
-            name=self.name,
-            source=camera_config.get(
-                "source"
-            ),
-            mode=self.camera_mode,
-            buffer_size=camera_config.get(
-                "buffer_size",
-                1,
-            ),
-            reconnect_attempts=camera_config.get(
-                "reconnect_attempts",
-                5,
-            ),
-            reconnect_delay=camera_config.get(
-                "reconnect_delay",
-                2.0,
-            ),
-            logger=self.logger,
-        )
-
-        # ==================================================
-        # TRACKER
-        # ==================================================
-
-        self.tracker = Tracker(
-            tracker_config=tracker_config,
-        )
-
-        # ==================================================
-        # COUNTER
-        # ==================================================
-
-        counting_roi = camera_config.get(
-            "roi"
-        )
-
-        if not isinstance(counting_roi, dict):
-            raise ValueError(
-                f"{self.name}: counting ROI must be a "
-                f"dictionary with x1,y1,x2,y2. "
-                f"Got: {counting_roi}"
-            )
-
-        required_roi_keys = {
-            "x1",
-            "y1",
-            "x2",
-            "y2",
-        }
-
-        missing_keys = (
-            required_roi_keys
-            - set(counting_roi.keys())
-        )
-
-        if missing_keys:
-            raise ValueError(
-                f"{self.name}: counting ROI is missing "
-                f"{sorted(missing_keys)}"
-            )
-
-        self.counter = Counter(
-
-            roi=counting_roi,
-
-            direction=counting_config.get(
-                "direction",
-                "down",
-            ),
-
-            duplicate_distance=counting_config.get(
-                "duplicate_distance",
-                40,
-            ),
-
-            duplicate_time=counting_config.get(
-                "duplicate_time",
-                0.8,
-            ),
-
-            max_history=counting_config.get(
-                "max_history",
-                200,
-            ),
-
-            line_tolerance=counting_config.get(
-                "line_tolerance",
-                20,
-            ),
-
-            late_start_margin=counting_config.get(
-                "late_start_margin",
-                40,
-            ),
-
-            min_track_frames=counting_config.get(
-                "min_track_frames",
-                4,
-            ),
-
-            stale_track_frames=counting_config.get(
-                "stale_track_frames",
-                120,
-            ),
-
-            minimum_cross_distance=counting_config.get(
-                "minimum_cross_distance",
-                counting_config.get(
-                    "min_cross_distance",
-                    0,
-                ),
-            ),
-        )
-
-        # ==================================================
-        # SEPARATE ENTRY ROI BAG COUNTER
-        # ==================================================
-
-        self.entry_roi_counting_enabled = bool(
-            entry_roi_counting_config.get(
-                "enabled",
-                False,
-            )
-        )
-
-        entry_roi = (
-            entry_roi_counting_config.get(
-                "roi",
-                {},
-            )
-            or {}
-        )
-
-        if self.entry_roi_counting_enabled:
-
-            self.entry_roi_counter = EntryROICounter(
-                roi=entry_roi,
-
-                min_track_frames=entry_roi_counting_config.get(
-                    "min_track_frames",
-                    4,
-                ),
-
-                duplicate_distance=entry_roi_counting_config.get(
-                    "duplicate_distance",
-                    50,
-                ),
-
-                max_history=entry_roi_counting_config.get(
-                    "max_history",
-                    300,
-                ),
-            )
-
-        else:
-
-            self.entry_roi_counter = None
-
-        # ==================================================
-        # PRINT DETECTION
-        # ==================================================
-
-        self.print_detection_enabled = bool(
-            print_config.get(
-                "enabled",
-                False,
-            )
-        )
-
-        self.print_detector = PrintDetector(
-            confidence_threshold=print_config.get(
-                "confidence_threshold",
-                print_config.get(
-                    "confidence",
-                    0.4,
-                ),
-            ),
-            iou_threshold=print_config.get(
-                "iou_threshold",
-                0.0,
-            ),
-            min_overlap_ratio=print_config.get(
-                "min_overlap_ratio",
-                0.3,
-            ),
-            min_print_area=print_config.get(
-                "min_print_area",
-                0.0,
-            ),
-            max_print_area=print_config.get(
-                "max_print_area",
-                0.0,
-            ),
-            min_aspect_ratio=print_config.get(
-                "min_aspect_ratio",
-                0.0,
-            ),
-            max_aspect_ratio=print_config.get(
-                "max_aspect_ratio",
-                0.0,
-            ),
-            max_center_distance=print_config.get(
-                "max_center_distance",
-                0.0,
-            ),
-        )
-
-        # ==================================================
-        # JAM DETECTION - CONDITION A
-        #
-        # Existing movement/time based detector.
-        # ==================================================
-
-        self.jam_detector = JamDetector(
-            config=jam_config,
-        )
-
-        self.jam_detection_enabled = bool(
-            self.jam_detector.enabled
-        )
-
-        self.jam_roi = dict(
-            self.jam_detector.roi
-        )
-
-        self.jam_result = (
-            self.jam_detector._empty_result()
-        )
-
-        # ==================================================
-        # BAG SPACING - CONDITION B
-        #
-        # No timer.
-        #
-        # Physical calibrated edge-to-edge distance:
-        #
-        # gap <= threshold -> JAM
-        # ==================================================
-
-        self.bag_spacing_detector = (
-            BagSpacingDetector(
-                config=spacing_config,
-            )
-        )
-
-        self.bag_spacing_enabled = bool(
-            self.bag_spacing_detector.enabled
-        )
-
-        self.spacing_roi = dict(
-            self.bag_spacing_detector.roi
-        )
-
-        self.spacing_result = (
-            self.bag_spacing_detector._empty_result()
-        )
-
-        # ==================================================
-        # CONDITION C - ROI OCCUPANCY JAM
-        # ==================================================
-
-        self.condition_c_detector = (
-            ROIOccupancyDetector(
-                config=condition_c_config,
-            )
-        )
-
-        self.condition_c_enabled = bool(
-            self.condition_c_detector.enabled
-        )
-
-        self.condition_c_roi = dict(
-            self.condition_c_detector.roi
-        )
-
-        self.condition_c_result = {
-
-            "jam": False,
-
-            "status": "normal",
-
-            "bag_count": 0,
-
-            "track_ids": [],
-
-            "minimum_gap_mm": None,
-
-            "distances": [],
-
-            "image_path": None,
-        }
-
-        self.condition_c_start_time = None
-
-        # ==================================================
-        # FINAL JAM RESULT
-        #
-        # Condition A OR Condition B
-        # ==================================================
-
-        self.final_jam_result = (
-            self._build_final_jam_result()
-        )
-
-        # ==================================================
-        # JAM EVENT LOGGING STATE
-        # ==================================================
-
-        self.previous_jam_detected = False
-        self.previous_jam_types = set()
-
-        self.previous_condition_a_jam = False
-        self.previous_condition_b_jam = False
-        self.previous_condition_c_jam = False
-
-        # SQL Server jam event tracking
-        self.condition_a_sql_jam_id = None
-        self.condition_a_sql_jam_start = None
-
-        self.condition_b_sql_jam_id = None
-        self.condition_b_sql_jam_start = None
-
-        self.condition_c_sql_jam_id = None
-        self.condition_c_sql_jam_start = None
-
-        # ==================================================
-        # VISUALIZER
-        # ==================================================
-
-        self.visualizer = Visualizer()
-
-        # ==================================================
-        # PRINT CLASSIFICATION CONFIG
-        # ==================================================
-
-        self.print_vote_threshold = float(
-            print_config.get(
-                "vote_threshold",
-                print_config.get(
-                    "required_ratio",
-                    0.5,
-                ),
-            )
-        )
-
-        self.print_vote_threshold = min(
-            max(
-                self.print_vote_threshold,
-                0.0,
-            ),
-            1.0,
-        )
-
-        self.min_print_observations = max(
-            int(
-                print_config.get(
-                    "min_observations",
-                    1,
-                )
-            ),
-            1,
-        )
-
-        # Backward-compatible alias — some call sites and tests
-        # refer to this configuration value by this name.
-        self.min_print_votes = self.min_print_observations
-
-        self.print_history_size = max(
-            int(
-                print_config.get(
-                    "history_size",
-                    30,
-                )
-            ),
-            1,
-        )
-
-        self.print_history_ttl_frames = max(
-            int(
-                print_config.get(
-                    "history_ttl_frames",
-                    120,
-                )
-            ),
-            1,
-        )
-
-        # ==================================================
-        # PRINT OBSERVATION FILTERING
-        # ==================================================
-
-        self.min_print_observation_speed = max(
-            float(
-                print_config.get(
-                    "min_observation_speed",
-                    0.0,
-                )
-            ),
-            0.0,
-        )
-
-        self.skip_motion_jump_print_observations = bool(
-            print_config.get(
-                "skip_motion_jump_observations",
-                True,
-            )
-        )
-
-        # ==================================================
-        # PRINT TRACK HISTORY
-        # ==================================================
-
-        self.track_print_votes = {}
-        self.track_print_last_seen = {}
-
-        # ==================================================
-        # FRAME SHARING
-        # ==================================================
-
-        self._frame_lock = threading.Lock()
-
-        self._latest_frame = None
-
-        # ==================================================
-        # RESTORE PREVIOUS COUNTS
-        # ==================================================
-
-        self._restore_persisted_counts()
-
-        # ==================================================
-        # REGISTER CAMERA
-        # ==================================================
-
-        self._register_dashboard_camera()
-
-    # ======================================================
-    # RESTORE PERSISTED COUNTS
-    # ======================================================
-
-    def _restore_persisted_counts(
-        self,
-    ):
-
-        if self.dashboard_state is None:
-            return
-
-        try:
-
-            snapshot = (
-                self.dashboard_state.snapshot()
-            )
-
-            cameras = snapshot.get(
-                "cameras",
-                {},
-            )
-
-            camera_state = cameras.get(
-                self.name,
-                {},
-            )
-
-            restored_count = int(
-                camera_state.get(
-                    "total_count",
-                    camera_state.get(
-                        "count",
-                        0,
-                    ),
-                )
-                or 0
-            )
-
-            restored_printed = int(
-                camera_state.get(
-                    "printed_count",
-                    camera_state.get(
-                        "printed_bags_count",
-                        0,
-                    ),
-                )
-                or 0
-            )
-
-            restored_missing = int(
-                camera_state.get(
-                    "missing_count",
-                    camera_state.get(
-                        "not_printed_bags_count",
-                        0,
-                    ),
-                )
-                or 0
-            )
-
-            if restored_count > 0:
-
-                self.counter.total_count = (
-                    restored_count
-                )
-
-                self.last_count = (
-                    restored_count
-                )
-
-            self.printed_count = max(
-                restored_printed,
-                0,
-            )
-
-            self.missing_count = max(
-                restored_missing,
-                0,
-            )
-
-        except Exception as error:
-
-            self.logger.warning(
-                f"{self.name}: persisted count "
-                f"restore failed: {error}"
-            )
-
-    # ======================================================
-    # REGISTER CAMERA
-    # ======================================================
-
-    def _register_dashboard_camera(
-        self,
-    ):
-
-        if self.dashboard_state is None:
-            return
-
-        try:
-
-            self.dashboard_state.register_camera(
-
-                camera_name=self.name,
-
-                camera_id=self.camera_id,
-
-                enabled=self.camera_config.get(
-                    "enabled",
-                    True,
-                ),
-
-                configured=True,
-
-                mode=self.camera_mode,
-
-                print_detection_enabled=(
-                    self.print_detection_enabled
-                ),
-
-                jam_detection_enabled=(
-                    self.jam_detection_enabled
-                ),
-
-                source_type=self.camera_mode,
-
-                metadata={
-
-                    "roi":
-                        self.roi,
-
-                    "counting_method":
-                        "physical_center",
-
-                    "counting_direction":
-                        self.camera_config
-                        .get(
-                            "counting",
-                            {},
-                        )
-                        .get(
-                            "direction",
-                            "down",
-                        ),
-
-                    # Condition A
-                    "jam_detection_enabled":
-                        self.jam_detection_enabled,
-
-                    "jam_roi":
-                        self.jam_roi,
-
-                    # Condition B
-                    "bag_spacing_enabled":
-                        self.bag_spacing_enabled,
-
-                    "spacing_roi":
-                        self.spacing_roi,
-
-                    "spacing_threshold_mm":
-                        self.bag_spacing_detector
-                        .jam_threshold_mm,
-
-                    "condition_c_enabled":
-                        self.condition_c_enabled,
-
-                    "condition_c_roi":
-                        self.condition_c_roi,
-                },
-            )
-
-            self.dashboard_state.update_camera(
-
-                camera_name=self.name,
-
-                count=self.counter.total_count,
-
-                total_count=(
-                    self.counter.total_count
-                ),
-
-                printed_count=self.printed_count,
-
-                missing_count=self.missing_count,
-
-                print_detection_enabled=(
-                    self.print_detection_enabled
-                ),
-
-                print_status=(
-                    "unknown"
-                    if self.print_detection_enabled
-                    else "disabled"
-                ),
-
-                status="offline",
-
-                fps=0.0,
-
-                frame_count=0,
-
-                # Condition A
-                movement_jam_enabled=(
-                    self.jam_detection_enabled
-                ),
-
-                movement_jam_status=(
-                    "normal"
-                    if self.jam_detection_enabled
-                    else "disabled"
-                ),
-
-                movement_jam_detected=False,
-
-                movement_jam_warning=False,
-
-                movement_jam_track_ids=[],
-
-                # Condition B
-                spacing_detection_enabled=(
-                    self.bag_spacing_enabled
-                ),
-
-                spacing_status=(
-                    "normal"
-                    if self.bag_spacing_enabled
-                    else "disabled"
-                ),
-
-                spacing_jam_detected=False,
-
-                spacing_threshold_mm=(
-                    self.bag_spacing_detector
-                    .jam_threshold_mm
-                ),
-
-                minimum_gap_mm=None,
-
-                spacing_pairs=[],
-
-                spacing_jam_pairs=[],
-
-                spacing_jam_track_ids=[],
-
-                # ==========================================
-                # CONDITION C
-                #
-                # ROI Occupancy Detector
-                #
-                # Publishes:
-                # - ROI Bag Count
-                # - Track IDs
-                # - Minimum Gap
-                # - Distances
-                # - ROI Image
-                # - ROI Coordinates
-                # - Max Allowed Bags / Occupancy %
-                # - Jam Timestamp / Duration
-                # ==========================================
-                condition_c_enabled=(
-                    self.condition_c_enabled
-                ),
-
-                condition_c_status=(
-                    "normal"
-                    if self.condition_c_enabled
-                    else "disabled"
-                ),
-
-                condition_c_detected=False,
-
-                condition_c_bag_count=0,
-
-                condition_c_track_ids=[],
-
-                condition_c_minimum_gap_mm=None,
-
-                condition_c_distances=[],
-
-                condition_c_image_path=None,
-
-                condition_c_roi=(
-                    self.condition_c_roi
-                ),
-
-                condition_c_max_allowed_bags=(
-                    self.condition_c_detector
-                    .max_allowed_bags
-                ),
-
-                condition_c_roi_occupancy=0,
-
-                condition_c_timestamp=None,
-
-                condition_c_duration=0,
-
-                # Final combined jam
-                jam_detection_enabled=bool(
-                    self.jam_detection_enabled
-                    or
-                    self.bag_spacing_enabled
-                    or
-                    self.condition_c_enabled
-                ),
-
-                jam_status="normal",
-
-                jam_detected=False,
-
-                jam_warning=False,
-
-                jam_types=[],
-
-                active_jam_count=0,
-
-                active_jam_track_ids=[],
-            )
-
-        except Exception as error:
-
-            self.logger.warning(
-                f"{self.name}: dashboard camera "
-                f"registration failed: {error}"
-            )
-
-    # ======================================================
-    # PROCESS FRAME
-    # ======================================================
-
-    def process(
-        self,
-    ):
-
-        try:
-
-            # ==============================================
-            # CONNECT CAMERA
-            # ==============================================
-
-            if not self.connected:
-
-                self.connected = (
-                    self.camera.connect()
-                )
-
-                if not self.connected:
-
-                    self._publish_runtime_status(
-                        fps=0.0,
-                        print_status="offline",
-                        runtime_status="offline",
-                        force=True,
-                    )
-
-                    return False
-
-                self.previous_time = (
-                    time.perf_counter()
-                )
-
-                self.last_error = None
-
-                self._publish_runtime_status(
-                    fps=0.0,
-                    print_status=(
-                        "unknown"
-                        if self.print_detection_enabled
-                        else "disabled"
-                    ),
-                    runtime_status="online",
-                    force=True,
-                )
-
-            # ==============================================
-            # READ FRAME
-            # ==============================================
-
-            frame = self.read_frame()
-
-            if frame is None:
-
-                self.release()
-
-                self._publish_runtime_status(
-                    fps=0.0,
-                    print_status="offline",
-                    runtime_status="offline",
-                    force=True,
-                )
-
-                return False
-
-            self.frame_index += 1
-
-            # ==============================================
-            # CPU OPTIMIZATION
-            # ==============================================
-
-            if self.frame_index % 2 != 0:
-                return True
-
-            self.processed_frame_count += 1
-
-            # ==============================================
-            # YOLO
-            # ==============================================
-
-            detections = self.detect(
-                frame
-            )
-
-            # ==============================================
-            # TRACKER FRAME SIZE
-            # ==============================================
-
-            height, width = (
-                frame.shape[:2]
-            )
-
-            self.tracker.set_frame_size(
-                width=width,
-                height=height,
-            )
-
-            # ==============================================
-            # TRACK BAGS
-            # ==============================================
-
-            tracks = self.track(
-                detections
-            )
-
-            # ==============================================
-            # PRINT DETECTION
-            # ==============================================
-
-            print_results = (
-                self.print_detection(
-                    tracks,
-                    detections,
-                )
-            )
-
-            self.record_print_observations(
-                print_results,
-                tracks,
-            )
-
-            # ==============================================
-            # CONDITION A - MOVEMENT JAM
-            # ==============================================
-
-            self.jam_result = (
-                self.jam_detector.update(
-                    tracks,
-                    timestamp=time.perf_counter(),
-                )
-            )
-
-            # ==============================================
-            # CONDITION B - BAG SPACING JAM
-            #
-            # No timer.
-            # Uses current live tracks.
-            # ==============================================
-
-            self.spacing_result = (
-                self.bag_spacing_detector.update(
-                    tracks
-                )
-            )
-
-            # ==============================================
-            # CONDITION C
-            # ==============================================
-
-            try:
-
-                self.condition_c_result = (
-                    self.condition_c_detector.process(
-                        frame=frame,
-                        tracks=tracks,
-                        spacing_result=self.spacing_result,
-                        camera_name=self.name,
-                    )
-                )
-
-            except Exception as error:
-
-                import traceback
-
-                self.logger.error(
-                    f"{self.name}: Condition C failed: {error}"
-                )
-
-                traceback.print_exc()
-
-                self.condition_c_result = {
-
-                    "jam": False,
-
-                    "status": "normal",
-
-                    "bag_count": 0,
-
-                    "track_ids": [],
-
-                    "minimum_gap_mm": None,
-
-                    "distances": [],
-
-                    "image_path": None,
+const API_BASE = "http://127.0.0.1:8000";
+
+const REFRESH_INTERVAL_MS = 5000;
+
+const CAMERA_COUNT = 4;
+
+
+/* ==========================================================
+   APPLICATION STATE
+   ========================================================== */
+
+const appState = {
+
+    currentPage: "dashboard",
+
+    dashboardState: null,
+
+    cameras: {},
+
+    socket: null,
+
+    socketConnected: false,
+
+    lastStateUpdate: null,
+
+    refreshTimer: null,
+
+    events: [],
+
+    analytics: null,
+
+    production: null,
+
+    cameraConfig: null
+};
+
+
+/* ==========================================================
+   PAGE INFORMATION
+   ========================================================== */
+
+const PAGE_INFO = {
+
+    dashboard: {
+        title: "Dashboard",
+        subtitle: "Real-time FillPac AI production overview"
+    },
+
+    "live-monitor": {
+        title: "Live Monitor",
+        subtitle: "Real-time camera streams and AI inspection"
+    },
+
+    production: {
+        title: "Production",
+        subtitle: "Production counts and print inspection performance"
+    },
+
+    analytics: {
+        title: "Analytics",
+        subtitle: "Production analytics and camera performance"
+    },
+
+    events: {
+        title: "Events",
+        subtitle: "Search and export persisted production events"
+    },
+
+    "jam-monitor": {
+        title: "Jam Monitoring",
+        subtitle: "Real-time conveyor motion and bag jam detection"
+    },
+
+    cameras: {
+        title: "Cameras",
+        subtitle: "Camera configuration and runtime status"
+    },
+
+    settings: {
+        title: "Settings",
+        subtitle: "FillPac AI dashboard settings"
+    }
+};
+
+
+/* ==========================================================
+   JAM STATES
+   ========================================================== */
+
+const JAM_STATES = [
+    "normal",
+    "slow",
+    "warning",
+    "jam",
+    "recovering",
+    "disabled",
+    "unknown"
+];
+
+
+/* ==========================================================
+   DOM HELPERS
+   ========================================================== */
+
+function byId(id) {
+
+    return document.getElementById(id);
+}
+
+
+function setText(id, value) {
+
+    const element = byId(id);
+
+    if (!element) {
+        return;
+    }
+
+    element.textContent =
+        value ?? "--";
+}
+
+
+function safeNumber(
+    value,
+    fallback = 0
+) {
+
+    const number = Number(value);
+
+    return Number.isFinite(number)
+        ? number
+        : fallback;
+}
+
+
+function formatInteger(value) {
+
+    return Math.round(
+        safeNumber(value, 0)
+    ).toLocaleString();
+}
+
+
+function formatDecimal(
+    value,
+    digits = 1
+) {
+
+    return safeNumber(
+        value,
+        0
+    ).toFixed(digits);
+}
+
+
+function formatPercent(value) {
+
+    return `${formatDecimal(value, 1)}%`;
+}
+
+
+function formatRoiBagDetail(bags) {
+
+    const list =
+        Array.isArray(bags)
+            ? bags
+            : [];
+
+    if (list.length === 0) {
+        return "--";
+    }
+
+    return list
+        .map(
+            bag => {
+
+                const trackId =
+                    bag?.track_id
+                    ??
+                    "?";
+
+                const center =
+                    Array.isArray(bag?.center)
+                        ? bag.center
+                        : null;
+
+                if (!center) {
+                    return `${trackId}`;
                 }
 
-            if self.condition_c_result.get("jam", False):
+                const x =
+                    Math.round(
+                        safeNumber(center[0], 0)
+                    );
 
-                if self.condition_c_start_time is None:
+                const y =
+                    Math.round(
+                        safeNumber(center[1], 0)
+                    );
 
-                    self.condition_c_start_time = (
-                        time.perf_counter()
-                    )
+                return `${trackId} @ (${x}, ${y})`;
+            }
+        )
+        .join(", ");
+}
 
-            else:
 
-                self.condition_c_start_time = None
+function formatUptime(totalSeconds) {
 
-            # ==============================================
-            # FINAL JAM
-            #
-            # A OR B OR C
-            # ==============================================
-
-            self.final_jam_result = (
-                self._build_final_jam_result()
+    const seconds =
+        Math.max(
+            0,
+            Math.floor(
+                safeNumber(totalSeconds, 0)
             )
+        );
 
-            # ==============================================
-            # PERSIST JAM EVENTS
-            # ==============================================
+    const hours =
+        Math.floor(seconds / 3600);
 
-            self._log_jam_events()
+    const minutes =
+        Math.floor((seconds % 3600) / 60);
 
-            # ==============================================
-            # FILTER COUNTING TRACKS
-            # ==============================================
+    const secs =
+        seconds % 60;
 
-            countable_tracks = (
-                self.countable_tracks(
-                    tracks
+    const pad =
+        value => String(value).padStart(2, "0");
+
+    return `${pad(hours)}:${pad(minutes)}:${pad(secs)}`;
+}
+
+
+function escapeHtml(value) {
+
+    return String(
+        value ?? ""
+    )
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+/* ==========================================================
+   DATE / TIME HELPERS
+   ========================================================== */
+
+function parseDate(value) {
+
+    if (!value) {
+        return null;
+    }
+
+    const date = new Date(value);
+
+    if (
+        Number.isNaN(
+            date.getTime()
+        )
+    ) {
+        return null;
+    }
+
+    return date;
+}
+
+
+function formatDateTime(value) {
+
+    const date = parseDate(value);
+
+    if (!date) {
+        return "--";
+    }
+
+    return date.toLocaleString();
+}
+
+
+function formatTime(value) {
+
+    const date = parseDate(value);
+
+    if (!date) {
+        return "--";
+    }
+
+    return date.toLocaleTimeString();
+}
+
+
+/* ==========================================================
+   CHART REGISTRY
+
+   Chart.js is loaded globally (see index.html). Every chart on
+   the dashboard is created once, lazily, the first time it has
+   data to show, then updated in place on every subsequent
+   refresh instead of being destroyed/recreated.
+   ========================================================== */
+
+const chartInstances = {};
+
+const CHART_COLORS = {
+    blue: "#1976d2",
+    blueSoft: "rgba(25, 118, 210, 0.15)",
+    success: "#16a34a",
+    successSoft: "rgba(22, 163, 74, 0.15)",
+    danger: "#dc2626",
+    dangerSoft: "rgba(220, 38, 38, 0.15)",
+    warning: "#f59e0b",
+    grid: "rgba(0, 63, 70, 0.08)",
+    text: "#005864"
+};
+
+
+function getOrCreateChart(
+    canvasId,
+    buildConfig
+) {
+
+    const canvas =
+        byId(canvasId);
+
+    if (!canvas) {
+        return null;
+    }
+
+    if (
+        typeof Chart === "undefined"
+    ) {
+        return null;
+    }
+
+    if (chartInstances[canvasId]) {
+        return chartInstances[canvasId];
+    }
+
+    const config =
+        buildConfig();
+
+    chartInstances[canvasId] =
+        new Chart(
+            canvas,
+            config
+        );
+
+    return chartInstances[canvasId];
+}
+
+
+function baseChartOptions(extra = {}) {
+
+    return {
+
+        responsive: true,
+
+        maintainAspectRatio: false,
+
+        plugins: {
+
+            legend: {
+                labels: {
+                    color: CHART_COLORS.text
+                }
+            }
+        },
+
+        scales: {
+
+            x: {
+                ticks: { color: CHART_COLORS.text },
+                grid: { color: CHART_COLORS.grid }
+            },
+
+            y: {
+                beginAtZero: true,
+                ticks: { color: CHART_COLORS.text },
+                grid: { color: CHART_COLORS.grid }
+            }
+        },
+
+        ...extra
+    };
+}
+
+
+/* ----------------------------------------------------------
+   DASHBOARD: PRODUCTION TREND (line chart, hourly totals)
+   ---------------------------------------------------------- */
+
+function updateProductionTrendChart(hourly) {
+
+    const rows =
+        Array.isArray(hourly)
+            ? hourly
+            : [];
+
+    const labels =
+        rows.map(row => row.hour);
+
+    const totals =
+        rows.map(
+            row => safeNumber(row.total, 0)
+        );
+
+    const chart =
+        getOrCreateChart(
+            "productionChart",
+            () => ({
+                type: "line",
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: "Bags produced",
+                            data: totals,
+                            borderColor: CHART_COLORS.blue,
+                            backgroundColor: CHART_COLORS.blueSoft,
+                            fill: true,
+                            tension: 0.35,
+                            pointRadius: 2
+                        }
+                    ]
+                },
+                options: baseChartOptions({
+                    scales: {
+                        x: {
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { display: false }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { color: CHART_COLORS.grid }
+                        }
+                    }
+                })
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = totals;
+    chart.update();
+}
+
+
+/* ----------------------------------------------------------
+   DASHBOARD: PRINT INSPECTION (donut, printed vs missing)
+   ---------------------------------------------------------- */
+
+function updatePrintInspectionChart(printed, missing) {
+
+    const chart =
+        getOrCreateChart(
+            "printChart",
+            () => ({
+                type: "doughnut",
+                data: {
+                    labels: ["Printed", "Not Printed"],
+                    datasets: [
+                        {
+                            data: [printed, missing],
+                            backgroundColor: [
+                                CHART_COLORS.success,
+                                CHART_COLORS.danger
+                            ],
+                            borderWidth: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: "65%",
+                    plugins: {
+                        legend: {
+                            position: "bottom",
+                            labels: { color: CHART_COLORS.text }
+                        }
+                    }
+                }
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.datasets[0].data = [printed, missing];
+    chart.update();
+}
+
+
+/* ----------------------------------------------------------
+   ANALYTICS: HOURLY PRODUCTION (bar)
+   ---------------------------------------------------------- */
+
+function updateAnalyticsHourlyChart(hourly) {
+
+    const rows =
+        Array.isArray(hourly)
+            ? hourly
+            : [];
+
+    const labels =
+        rows.map(row => row.hour);
+
+    const totals =
+        rows.map(
+            row => safeNumber(row.total, 0)
+        );
+
+    const printed =
+        rows.map(
+            row => safeNumber(row.printed, 0)
+        );
+
+    const missing =
+        rows.map(
+            row => safeNumber(row.missing, 0)
+        );
+
+    const chart =
+        getOrCreateChart(
+            "analyticsHourlyChart",
+            () => ({
+                type: "bar",
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: "Printed",
+                            data: printed,
+                            backgroundColor: CHART_COLORS.success,
+                            stack: "stack0"
+                        },
+                        {
+                            label: "Missing",
+                            data: missing,
+                            backgroundColor: CHART_COLORS.danger,
+                            stack: "stack0"
+                        }
+                    ]
+                },
+                options: baseChartOptions({
+                    scales: {
+                        x: {
+                            stacked: true,
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { display: false }
+                        },
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { color: CHART_COLORS.grid }
+                        }
+                    }
+                })
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = printed;
+    chart.data.datasets[1].data = missing;
+    chart.update();
+
+    void totals;
+}
+
+
+/* ----------------------------------------------------------
+   ANALYTICS: CAMERA COMPARISON (bar)
+   ---------------------------------------------------------- */
+
+function updateAnalyticsCameraChart(byCamera) {
+
+    const rows =
+        Array.isArray(byCamera)
+            ? byCamera
+            : [];
+
+    const labels =
+        rows.map(row => row.camera);
+
+    const totals =
+        rows.map(
+            row => safeNumber(row.total, 0)
+        );
+
+    const chart =
+        getOrCreateChart(
+            "analyticsCameraChart",
+            () => ({
+                type: "bar",
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: "Events",
+                            data: totals,
+                            backgroundColor: CHART_COLORS.blue
+                        }
+                    ]
+                },
+                options: baseChartOptions({
+                    plugins: {
+                        legend: { display: false }
+                    }
+                })
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = totals;
+    chart.update();
+}
+
+
+/* ----------------------------------------------------------
+   ANALYTICS: PRINT INSPECTION ANALYTICS (donut, overall)
+   ---------------------------------------------------------- */
+
+function updateAnalyticsPrintChart(printed, missing) {
+
+    const chart =
+        getOrCreateChart(
+            "analyticsPrintChart",
+            () => ({
+                type: "doughnut",
+                data: {
+                    labels: ["Printed", "Missing"],
+                    datasets: [
+                        {
+                            data: [printed, missing],
+                            backgroundColor: [
+                                CHART_COLORS.success,
+                                CHART_COLORS.danger
+                            ],
+                            borderWidth: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: "65%",
+                    plugins: {
+                        legend: {
+                            position: "bottom",
+                            labels: { color: CHART_COLORS.text }
+                        }
+                    }
+                }
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.datasets[0].data = [printed, missing];
+    chart.update();
+}
+
+
+/* ----------------------------------------------------------
+   ANALYTICS: SHIFT PRODUCTION (bar)
+   ---------------------------------------------------------- */
+
+function updateAnalyticsShiftChart(byShift) {
+
+    const rows =
+        Array.isArray(byShift)
+            ? byShift
+            : [];
+
+    const labelMap = {
+        "shift-a": "Shift A",
+        "shift-b": "Shift B",
+        "shift-c": "Shift C",
+        "unknown": "Unknown"
+    };
+
+    const labels =
+        rows.map(
+            row => labelMap[row.shift] || row.shift
+        );
+
+    const printed =
+        rows.map(
+            row => safeNumber(row.printed, 0)
+        );
+
+    const missing =
+        rows.map(
+            row => safeNumber(row.missing, 0)
+        );
+
+    const chart =
+        getOrCreateChart(
+            "analyticsShiftChart",
+            () => ({
+                type: "bar",
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: "Printed",
+                            data: printed,
+                            backgroundColor: CHART_COLORS.success,
+                            stack: "stack0"
+                        },
+                        {
+                            label: "Missing",
+                            data: missing,
+                            backgroundColor: CHART_COLORS.danger,
+                            stack: "stack0"
+                        }
+                    ]
+                },
+                options: baseChartOptions({
+                    scales: {
+                        x: {
+                            stacked: true,
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { display: false }
+                        },
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            ticks: { color: CHART_COLORS.text },
+                            grid: { color: CHART_COLORS.grid }
+                        }
+                    }
+                })
+            })
+        );
+
+    if (!chart) {
+        return;
+    }
+
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = printed;
+    chart.data.datasets[1].data = missing;
+    chart.update();
+}
+
+
+/* ==========================================================
+   API
+   ========================================================== */
+
+async function apiFetch(
+    path,
+    options = {}
+) {
+
+    const response =
+        await fetch(
+            `${API_BASE}${path}`,
+            {
+                cache: "no-store",
+                ...options
+            }
+        );
+
+    if (!response.ok) {
+
+        throw new Error(
+            `HTTP ${response.status}: ${path}`
+        );
+    }
+
+    const contentType =
+        response.headers.get(
+            "content-type"
+        ) || "";
+
+    if (
+        contentType.includes(
+            "application/json"
+        )
+    ) {
+
+        return await response.json();
+    }
+
+    return await response.text();
+}
+
+
+/* ==========================================================
+   NAVIGATION
+   ========================================================== */
+
+function initializeNavigation() {
+
+    const items =
+        document.querySelectorAll(
+            ".sidebar-item[data-page]"
+        );
+
+    items.forEach(
+        item => {
+
+            item.addEventListener(
+                "click",
+                async () => {
+
+                    const page =
+                        item.dataset.page;
+
+                    if (!page) {
+                        return;
+                    }
+
+                    await showPage(page);
+                }
+            );
+        }
+    );
+}
+
+
+async function showPage(page) {
+
+    // ------------------------------------------------------
+    // Validate page
+    // ------------------------------------------------------
+
+    if (!PAGE_INFO[page]) {
+
+        console.warn(
+            "Unknown dashboard page:",
+            page
+        );
+
+        return;
+    }
+
+
+    // ------------------------------------------------------
+    // Find requested page
+    // ------------------------------------------------------
+
+    const target =
+        byId(`page-${page}`);
+
+
+    if (!target) {
+
+        console.error(
+            `Dashboard page not found: page-${page}`
+        );
+
+        return;
+    }
+
+
+    // ------------------------------------------------------
+    // Hide all pages
+    // ------------------------------------------------------
+
+    document
+        .querySelectorAll(
+            ".dashboard-page"
+        )
+        .forEach(
+            element => {
+
+                element.classList.remove(
+                    "active-page"
+                );
+            }
+        );
+
+
+    // ------------------------------------------------------
+    // Show selected page
+    // ------------------------------------------------------
+
+    target.classList.add(
+        "active-page"
+    );
+
+
+    // ------------------------------------------------------
+    // Update sidebar active button
+    // ------------------------------------------------------
+
+    document
+        .querySelectorAll(
+            ".sidebar-item[data-page]"
+        )
+        .forEach(
+            item => {
+
+                item.classList.toggle(
+                    "active",
+                    item.dataset.page === page
+                );
+            }
+        );
+
+
+    // ------------------------------------------------------
+    // Store selected page
+    // ------------------------------------------------------
+
+    appState.currentPage =
+        page;
+
+
+    // ------------------------------------------------------
+    // Update page heading
+    // ------------------------------------------------------
+
+    updatePageHeader(
+        page
+    );
+
+
+    // ------------------------------------------------------
+    // Load page data
+    // ------------------------------------------------------
+
+    try {
+
+        await loadCurrentPage();
+
+    }
+
+    catch (error) {
+
+        console.error(
+            `Failed loading page "${page}":`,
+            error
+        );
+    }
+}
+
+
+function updatePageHeader(page) {
+
+    const info =
+        PAGE_INFO[page]
+        ||
+        PAGE_INFO.dashboard;
+
+
+    setText(
+        "pageTitle",
+        info.title
+    );
+
+
+    setText(
+        "pageSubtitle",
+        info.subtitle
+    );
+}
+
+
+/* ==========================================================
+   CURRENT PAGE LOADER
+   ========================================================== */
+
+async function loadCurrentPage() {
+
+    try {
+
+        switch (
+            appState.currentPage
+        ) {
+
+            case "dashboard":
+
+                await loadDashboardState();
+
+                await loadAnalytics();
+
+                break;
+
+
+            case "live-monitor":
+
+                await loadDashboardState();
+
+                break;
+
+
+            case "production":
+
+                await loadProduction();
+
+                break;
+
+
+            case "analytics":
+
+                await loadAnalytics();
+
+                break;
+
+
+            case "events":
+
+                await loadEvents();
+
+                break;
+
+
+            case "jam-monitor":
+
+                /*
+                Fetch fresh state before rendering the
+                dedicated jam monitoring page.
+                */
+
+                await loadDashboardState();
+
+                renderJamMonitoring(
+                    appState
+                        .dashboardState
+                        ?.cameras
+                    || {}
+                );
+
+                break;
+
+
+            case "cameras":
+
+                await loadDashboardState();
+
+                await loadCameraConfig();
+
+                break;
+
+
+            case "settings":
+
+                await loadDashboardState();
+
+                await loadSettings();
+
+                break;
+
+
+            default:
+
+                await loadDashboardState();
+
+                break;
+        }
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Page load failed:",
+            error
+        );
+    }
+}
+
+
+/* ==========================================================
+   DASHBOARD STATE
+   ========================================================== */
+
+async function loadDashboardState() {
+
+    try {
+
+        const state =
+            await apiFetch(
+                "/state"
+            );
+
+
+        renderDashboardState(
+            state
+        );
+
+
+        return state;
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading dashboard state:",
+            error
+        );
+
+
+        updateSystemStatus(
+            "offline"
+        );
+
+
+        throw error;
+    }
+}
+
+
+/* ==========================================================
+   RENDER DASHBOARD STATE
+   ========================================================== */
+
+function renderDashboardState(state) {
+
+    if (
+        !state
+        ||
+        typeof state !== "object"
+    ) {
+        return;
+    }
+
+
+    appState.dashboardState =
+        state;
+
+
+    appState.cameras =
+        state.cameras || {};
+
+
+    appState.lastStateUpdate =
+        new Date();
+
+
+    /* ------------------------------------------------------
+       SYSTEM
+       ------------------------------------------------------ */
+
+    updateSystemStatus(
+        state.system_status
+        || "offline"
+    );
+
+
+    setText(
+        "systemUptime",
+        formatUptime(
+            state.uptime_seconds
+        )
+    );
+
+
+    /* ------------------------------------------------------
+       MAIN COUNTS
+       ------------------------------------------------------ */
+
+    setText(
+        "totalBags",
+        formatInteger(
+            state.total_count
+        )
+    );
+
+
+    setText(
+        "printedBags",
+        formatInteger(
+            state.total_printed_count
+            ??
+            state.total_printed_bags_count
+            ??
+            0
+        )
+    );
+
+
+    setText(
+        "missingBags",
+        formatInteger(
+            state.total_missing_count
+            ??
+            state.total_not_printed_bags_count
+            ??
+            0
+        )
+    );
+
+
+    updatePrintInspectionChart(
+        safeNumber(
+            state.total_printed_count
+            ??
+            state.total_printed_bags_count
+            ??
+            0
+        ),
+        safeNumber(
+            state.total_missing_count
+            ??
+            state.total_not_printed_bags_count
+            ??
+            0
+        )
+    );
+
+
+    /* ------------------------------------------------------
+       CAMERA CARDS
+       ------------------------------------------------------ */
+
+    renderCameraCards(
+        state.cameras || {}
+    );
+
+
+    /* ------------------------------------------------------
+       JAM MONITORING
+       ------------------------------------------------------ */
+
+    renderJamMonitoring(
+        state.cameras || {}
+    );
+
+
+    /* ------------------------------------------------------
+       DASHBOARD HEALTH
+       ------------------------------------------------------ */
+
+    renderDashboardHealthSummary(
+        state
+    );
+
+
+    /* ------------------------------------------------------
+       SERVICE HEALTH
+       ------------------------------------------------------ */
+
+    renderServiceHealth(
+        state.service_status || {}
+    );
+}
+
+
+/* ==========================================================
+   SYSTEM STATUS
+   ========================================================== */
+
+function updateSystemStatus(status) {
+
+    const normalized =
+        String(
+            status || "offline"
+        )
+            .trim()
+            .toLowerCase();
+
+
+    const statusElement =
+        byId("systemStatus");
+
+
+    if (statusElement) {
+
+        statusElement.className =
+            `system-status ${normalized}`;
+    }
+
+
+    const statusText =
+        byId("systemStatusText");
+
+
+    if (statusText) {
+
+        statusText.textContent =
+            normalized.toUpperCase();
+    }
+
+
+    const dot =
+        byId("systemStatusDot");
+
+
+    if (dot) {
+
+        dot.className =
+            `status-dot ${normalized}`;
+    }
+}
+
+
+/* ==========================================================
+   SERVICE HEALTH
+   ========================================================== */
+
+function renderServiceHealth(
+    serviceStatus
+) {
+
+    const modelLoaded =
+        Boolean(
+            serviceStatus
+                ?.model_loaded
+        );
+
+
+    const inferenceRunning =
+        Boolean(
+            serviceStatus
+                ?.inference_manager_running
+        );
+
+
+    const elasticsearch =
+        Boolean(
+            serviceStatus
+                ?.elasticsearch_connected
+        );
+
+
+    setText(
+        "healthModel",
+        modelLoaded
+            ? "Loaded"
+            : "Not Loaded"
+    );
+
+
+    setText(
+        "healthInference",
+        inferenceRunning
+            ? "Running"
+            : "Stopped"
+    );
+
+
+    setText(
+        "healthElasticsearch",
+        elasticsearch
+            ? "Connected"
+            : "Disconnected"
+    );
+}
+
+
+/* ==========================================================
+   CAMERA LOOKUP
+   ========================================================== */
+
+function findCameraByIndex(
+    cameras,
+    index
+) {
+
+    const entries =
+        Object.entries(
+            cameras || {}
+        );
+
+
+    const wanted =
+        `camera${index}`
+            .replaceAll(" ", "")
+            .replaceAll("_", "")
+            .toLowerCase();
+
+
+    const direct =
+        entries.find(
+            ([key, camera]) => {
+
+                const values = [
+                    key,
+                    camera?.camera_id,
+                    camera?.camera_name,
+                    camera?.name
+                ];
+
+
+                return values.some(
+                    value => {
+
+                        const normalized =
+                            String(
+                                value || ""
+                            )
+                                .replaceAll(
+                                    " ",
+                                    ""
+                                )
+                                .replaceAll(
+                                    "_",
+                                    ""
+                                )
+                                .toLowerCase();
+
+
+                        return (
+                            normalized
+                            ===
+                            wanted
+                        );
+                    }
+                );
+            }
+        );
+
+
+    if (direct) {
+
+        return direct[1];
+    }
+
+
+    /*
+    Fallback to insertion order if backend camera
+    keys do not exactly match Camera1/Camera2/etc.
+    */
+
+    return (
+        entries[
+            index - 1
+        ]?.[1]
+        ||
+        null
+    );
+}
+
+
+/* ==========================================================
+   CAMERA CARDS
+   ========================================================== */
+
+function renderCameraCards(cameras) {
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        renderCameraCard(
+            index,
+            camera
+        );
+    }
+}
+
+
+function renderCameraCard(
+    index,
+    camera
+) {
+
+    if (!camera) {
+
+        setText(
+            `camera${index}Count`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}Printed`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}Missing`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}RoiCount`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}RoiActive`,
+            "0"
+        );
+
+
+        setText(
+            `camera${index}RoiTracks`,
+            "--"
+        );
+
+
+        setText(
+            `camera${index}Fps`,
+            "0.0"
+        );
+
+
+        setText(
+            `camera${index}Status`,
+            "OFFLINE"
+        );
+
+
+        return;
+    }
+
+
+    const count =
+        camera.count
+        ??
+        camera.total_count
+        ??
+        0;
+
+
+    const entryRoiCount =
+        camera.entry_roi_count
+        ??
+        0;
+
+
+    const entryRoiActiveCount =
+        camera.entry_roi_active_count
+        ??
+        0;
+
+
+    const entryRoiActiveBags =
+        camera.entry_roi_active_bags
+        ??
+        [];
+
+
+    const printed =
+        camera.printed_count
+        ??
+        camera.printed_bags_count
+        ??
+        0;
+
+
+    const missing =
+        camera.missing_count
+        ??
+        camera.not_printed_bags_count
+        ??
+        0;
+
+
+    setText(
+        `camera${index}Count`,
+        formatInteger(count)
+    );
+
+
+    setText(
+        `camera${index}RoiCount`,
+        formatInteger(entryRoiCount)
+    );
+
+
+    setText(
+        `camera${index}RoiActive`,
+        formatInteger(entryRoiActiveCount)
+    );
+
+
+    setText(
+        `camera${index}RoiTracks`,
+        formatRoiBagDetail(entryRoiActiveBags)
+    );
+
+
+    setText(
+        `camera${index}Printed`,
+        formatInteger(printed)
+    );
+
+
+    setText(
+        `camera${index}Missing`,
+        formatInteger(missing)
+    );
+
+
+    setText(
+        `camera${index}Fps`,
+        formatDecimal(
+            camera.fps,
+            1
+        )
+    );
+
+
+    setText(
+        `camera${index}Status`,
+        String(
+            camera.status
+            || "offline"
+        ).toUpperCase()
+    );
+}
+
+
+/* ==========================================================
+   JAM STATUS NORMALIZATION
+   ========================================================== */
+
+function normalizeJamStatus(camera) {
+
+    if (
+        !camera
+        ||
+        typeof camera
+        !== "object"
+    ) {
+
+        return "unknown";
+    }
+
+
+    const enabled =
+        camera.jam_detection_enabled;
+
+
+    if (
+        enabled === false
+        ||
+        enabled === 0
+        ||
+        enabled === "false"
+    ) {
+
+        return "disabled";
+    }
+
+
+    /*
+    Explicit confirmed jam takes highest priority.
+    */
+
+    if (
+        camera.jam_detected
+        === true
+    ) {
+
+        return "jam";
+    }
+
+
+    /*
+    Explicit warning takes priority over textual status.
+    */
+
+    if (
+        camera.jam_warning
+        === true
+    ) {
+
+        return "warning";
+    }
+
+
+    const raw =
+        String(
+            camera.jam_status
+            || "normal"
+        )
+            .trim()
+            .toLowerCase()
+            .replaceAll(
+                "_",
+                "-"
+            );
+
+
+    if (
+        raw === "jam"
+        ||
+        raw === "jammed"
+    ) {
+
+        return "jam";
+    }
+
+
+    if (
+        raw === "warning"
+    ) {
+
+        return "warning";
+    }
+
+
+    if (
+        raw === "slow"
+    ) {
+
+        return "slow";
+    }
+
+
+    if (
+        raw === "recovering"
+        ||
+        raw === "recovery"
+    ) {
+
+        return "recovering";
+    }
+
+
+    if (
+        raw === "disabled"
+    ) {
+
+        return "disabled";
+    }
+
+
+    if (
+        raw === "normal"
+    ) {
+
+        return "normal";
+    }
+
+
+    return "unknown";
+}
+
+
+/* ==========================================================
+   JAM BADGE
+   ========================================================== */
+
+function setJamBadge(
+    element,
+    status
+) {
+
+    if (!element) {
+        return;
+    }
+
+
+    const normalized =
+        JAM_STATES.includes(
+            status
+        )
+            ? status
+            : "unknown";
+
+
+    JAM_STATES.forEach(
+        state => {
+
+            element.classList.remove(
+                state
+            );
+        }
+    );
+
+
+    element.classList.add(
+        normalized
+    );
+
+
+    element.textContent =
+        normalized.toUpperCase();
+}
+
+
+/* ==========================================================
+   JAM MONITORING
+   ========================================================== */
+
+function renderJamMonitoring(cameras) {
+
+    let normalCount = 0;
+
+    let slowCount = 0;
+
+    let warningCount = 0;
+
+    let activeJamCount = 0;
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        const enabled =
+            Boolean(
+                camera
+                    ?.jam_detection_enabled
+            );
+
+
+        const status =
+            camera
+                ? normalizeJamStatus(
+                    camera
                 )
+                : "disabled";
+
+
+        const cameraJamCount =
+            Math.max(
+                0,
+                Math.round(
+                    safeNumber(
+                        camera
+                            ?.active_jam_count,
+                        0
+                    )
+                )
+            );
+
+
+        const trackIds =
+            Array.isArray(
+                camera
+                    ?.condition_c_track_ids
             )
+                ? camera
+                    .condition_c_track_ids
+                : (
+                    Array.isArray(
+                        camera
+                            ?.active_jam_track_ids
+                    )
+                        ? camera
+                            .active_jam_track_ids
+                        : []
+                );
 
-            # ==============================================
-            # EXISTING PHYSICAL-CENTER LINE COUNTING
-            # ==============================================
 
-            count = self.count(
-                countable_tracks
-            )
+        /* --------------------------------------------------
+           CONDITION C (ROI OCCUPANCY) FIELDS
+           -------------------------------------------------- */
 
-            # ==============================================
-            # NEW ENTRY ROI COUNTING
-            #
-            # OUTSIDE → INSIDE ROI = +1
-            # ==============================================
+        const roiBagCount =
+            safeNumber(
+                camera
+                    ?.condition_c_bag_count,
+                0
+            );
+
+        const roiGap =
+            camera
+                ?.condition_c_minimum_gap_mm;
+
+        const roiDistances =
+            camera
+                ?.condition_c_distances
+            || [];
+
+        const roiImage =
+            camera
+                ?.condition_c_image_url
+            ||
+            camera
+                ?.condition_c_image_path;
+
+        const roiStatus =
+            camera
+                ?.condition_c_status
+            ||
+            (
+                camera
+                    ?.condition_c_detected
+                    ? "jam"
+                    : "normal"
+            );
+
+
+        /* --------------------------------------------------
+           SYSTEM JAM COUNTERS
+           -------------------------------------------------- */
+
+        if (enabled) {
 
             if (
-                self.entry_roi_counter is not None
-            ):
+                status === "normal"
+            ) {
 
-                self.entry_roi_count = (
-                    self.entry_roi_counter.update(
-                        countable_tracks
-                    )
+                normalCount += 1;
+            }
+
+
+            else if (
+                status === "slow"
+            ) {
+
+                slowCount += 1;
+            }
+
+
+            else if (
+                status === "warning"
+            ) {
+
+                warningCount += 1;
+            }
+
+
+            else if (
+                status === "jam"
+            ) {
+
+                activeJamCount +=
+                    cameraJamCount > 0
+                        ? cameraJamCount
+                        : 1;
+            }
+        }
+
+
+        /* --------------------------------------------------
+           DASHBOARD CAMERA JAM BADGE
+           -------------------------------------------------- */
+
+        const summaryBadge =
+            byId(
+                `camera${index}JamStatus`
+            );
+
+
+        setJamBadge(
+            summaryBadge,
+            status
+        );
+
+
+        const dashboardCard =
+            byId(
+                `camera-card-${index}`
+            )
+            ||
+            summaryBadge
+                ?.closest(
+                    ".camera-card"
+                );
+
+
+        if (dashboardCard) {
+
+            dashboardCard
+                .classList
+                .toggle(
+                    "jam-active",
+                    status === "jam"
+                );
+        }
+
+
+        /* --------------------------------------------------
+           DEDICATED JAM PAGE
+           -------------------------------------------------- */
+
+        const jamBadge =
+            byId(
+                `jamCamera${index}Status`
+            );
+
+
+        setJamBadge(
+            jamBadge,
+            status
+        );
+
+
+        setText(
+            `jamCamera${index}Count`,
+            formatInteger(
+                cameraJamCount
+            )
+        );
+
+
+        setText(
+            `jamCamera${index}RoiBags`,
+            formatInteger(
+                roiBagCount
+            )
+        );
+
+
+        setText(
+            `jamCamera${index}MinimumGap`,
+            roiGap == null
+                ? "--"
+                : `${formatDecimal(roiGap, 1)} mm`
+        );
+
+
+        const distanceElement =
+            byId(
+                `jamCamera${index}Distances`
+            );
+
+        if (distanceElement) {
+
+            distanceElement.innerHTML =
+                roiDistances.length
+                    ? roiDistances
+                        .map(
+                            d => `${formatDecimal(d?.distance_mm, 1)} mm`
+                        )
+                        .join("<br>")
+                    : "--";
+        }
+
+
+        const roiImageElement =
+            byId(
+                `jamCamera${index}Image`
+            );
+
+        if (roiImageElement) {
+
+            roiImageElement.src =
+                roiImage
+                    ? `${roiImage}?t=${Date.now()}`
+                    : "";
+        }
+
+
+        setText(
+            `jamCamera${index}ConditionC`,
+            roiStatus.toUpperCase()
+        );
+
+
+        setText(
+            `camera${index}ConditionC`,
+            roiStatus.toUpperCase()
+        );
+
+
+        setText(
+            `jamCamera${index}Tracks`,
+            trackIds.length > 0
+                ? trackIds.join(", ")
+                : "--"
+        );
+
+
+        setText(
+            `jamCamera${index}Enabled`,
+            enabled
+                ? "Enabled"
+                : "Disabled"
+        );
+
+
+        const jamCard =
+            byId(
+                `jam-camera-card-${index}`
+            );
+
+
+        if (jamCard) {
+
+            JAM_STATES.forEach(
+                state => {
+
+                    jamCard
+                        .classList
+                        .remove(
+                            state
+                        );
+                }
+            );
+
+
+            jamCard
+                .classList
+                .add(
+                    status
+                );
+        }
+    }
+
+
+    /* ------------------------------------------------------
+       JAM KPI CARDS
+       ------------------------------------------------------ */
+
+    setText(
+        "jamNormalCameras",
+        formatInteger(
+            normalCount
+        )
+    );
+
+
+    setText(
+        "jamSlowCameras",
+        formatInteger(
+            slowCount
+        )
+    );
+
+
+    setText(
+        "jamWarningCameras",
+        formatInteger(
+            warningCount
+        )
+    );
+
+
+    setText(
+        "jamActiveCount",
+        formatInteger(
+            activeJamCount
+        )
+    );
+}/* ==========================================================
+   PRODUCTION
+   ========================================================== */
+
+async function loadProduction() {
+
+    try {
+
+        const data =
+            await apiFetch(
+                "/production"
+            );
+
+        appState.production =
+            data;
+
+        renderProduction(
+            data
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading production:",
+            error
+        );
+    }
+}
+
+
+function renderProduction(data) {
+
+    if (
+        !data
+        ||
+        typeof data !== "object"
+    ) {
+        return;
+    }
+
+
+    const total =
+        safeNumber(
+            data.total_bags
+            ??
+            0
+        );
+
+
+    const printed =
+        safeNumber(
+            data.printed_bags
+            ??
+            0
+        );
+
+
+    const missing =
+        safeNumber(
+            data.not_printed_bags
+            ??
+            0
+        );
+
+
+    const quality =
+        safeNumber(
+            data.print_quality
+            ??
+            0
+        );
+
+
+    const ratePerHour =
+        safeNumber(
+            data.production_rate_per_hour
+            ??
+            0
+        );
+
+
+    setText(
+        "productionTotal",
+        formatInteger(total)
+    );
+
+
+    setText(
+        "productionPrinted",
+        formatInteger(printed)
+    );
+
+
+    setText(
+        "productionMissing",
+        formatInteger(missing)
+    );
+
+
+    setText(
+        "productionQuality",
+        formatPercent(quality)
+    );
+
+
+    setText(
+        "productionRate",
+        formatInteger(ratePerHour)
+    );
+
+
+    renderProductionCameras(
+        data.cameras
+        ||
+        appState
+            .dashboardState
+            ?.cameras
+        ||
+        {}
+    );
+}
+
+
+/* ==========================================================
+   PRODUCTION CAMERA TABLE
+   ========================================================== */
+
+function renderProductionCameras(cameras) {
+
+    const body =
+        byId(
+            "productionCameraTable"
+        );
+
+
+    if (!body) {
+        return;
+    }
+
+
+    const rows = [];
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        if (!camera) {
+            continue;
+        }
+
+
+        const count =
+            safeNumber(
+                camera.count
+                ??
+                camera.total_count
+                ??
+                0
+            );
+
+
+        const printed =
+            safeNumber(
+                camera.printed_count
+                ??
+                camera.printed_bags_count
+                ??
+                0
+            );
+
+
+        const missing =
+            safeNumber(
+                camera.missing_count
+                ??
+                camera.not_printed_bags_count
+                ??
+                0
+            );
+
+
+        const printRate =
+            count > 0
+                ? (printed / count) * 100
+                : 0;
+
+
+        const jamStatus =
+            normalizeJamStatus(
+                camera
+            );
+
+
+        rows.push(
+            `
+            <tr>
+
+                <td>
+                    Camera ${index}
+                </td>
+
+                <td>
+                    ${formatInteger(count)}
+                </td>
+
+                <td>
+                    ${formatInteger(printed)}
+                </td>
+
+                <td>
+                    ${formatInteger(missing)}
+                </td>
+
+                <td>
+                    ${formatPercent(printRate)}
+                </td>
+
+                <td>
+                    <span class="jam-status ${jamStatus}">
+                        ${jamStatus.toUpperCase()}
+                    </span>
+                </td>
+
+            </tr>
+            `
+        );
+    }
+
+
+    body.innerHTML =
+        rows.length > 0
+            ? rows.join("")
+            : `
+                <tr>
+                    <td colspan="6">
+                        No production data available.
+                    </td>
+                </tr>
+              `;
+}
+
+
+/* ==========================================================
+   ANALYTICS
+   ========================================================== */
+
+async function loadAnalytics() {
+
+    try {
+
+        const data =
+            await apiFetch(
+                "/analytics"
+            );
+
+
+        appState.analytics =
+            data;
+
+
+        renderAnalytics(
+            data
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading analytics:",
+            error
+        );
+    }
+}
+
+
+function renderAnalytics(data) {
+
+    if (
+        !data
+        ||
+        typeof data !== "object"
+    ) {
+        return;
+    }
+
+
+    const total =
+        safeNumber(
+            data.total_events
+            ??
+            0
+        );
+
+
+    const printed =
+        safeNumber(
+            data.printed_events
+            ??
+            0
+        );
+
+
+    const missing =
+        safeNumber(
+            data.missing_events
+            ??
+            0
+        );
+
+
+    const quality =
+        safeNumber(
+            data.print_quality
+            ??
+            0
+        );
+
+
+    setText(
+        "analyticsTotalEvents",
+        formatInteger(total)
+    );
+
+
+    setText(
+        "analyticsPrinted",
+        formatInteger(printed)
+    );
+
+
+    setText(
+        "analyticsMissing",
+        formatInteger(missing)
+    );
+
+
+    setText(
+        "analyticsQuality",
+        formatPercent(quality)
+    );
+
+
+    renderAnalyticsCameraTable(
+        data.by_camera
+        ||
+        []
+    );
+
+
+    /* ------------------------------------------------------
+       CHARTS
+
+       Shared between the Dashboard page (Production Trend)
+       and the Analytics page (Hourly / Camera / Print / Shift).
+       byId() guards inside each updater mean this is a no-op
+       for canvases that aren't on the current page.
+       ------------------------------------------------------ */
+
+    updateProductionTrendChart(
+        data.hourly || []
+    );
+
+    updateAnalyticsHourlyChart(
+        data.hourly || []
+    );
+
+    updateAnalyticsCameraChart(
+        data.by_camera || []
+    );
+
+    updateAnalyticsPrintChart(
+        printed,
+        missing
+    );
+
+    updateAnalyticsShiftChart(
+        data.by_shift || []
+    );
+}
+
+
+/* ==========================================================
+   ANALYTICS CAMERA TABLE
+   ========================================================== */
+
+function renderAnalyticsCameraTable(cameras) {
+
+    const body =
+        byId(
+            "analyticsCameraTableBody"
+        );
+
+
+    if (!body) {
+        return;
+    }
+
+
+    const rows = [];
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        if (!camera) {
+            continue;
+        }
+
+
+        const count =
+            safeNumber(
+                camera.count
+                ??
+                camera.total_count
+                ??
+                0
+            );
+
+
+        const printed =
+            safeNumber(
+                camera.printed_count
+                ??
+                camera.printed_bags_count
+                ??
+                0
+            );
+
+
+        const missing =
+            safeNumber(
+                camera.missing_count
+                ??
+                camera.not_printed_bags_count
+                ??
+                0
+            );
+
+
+        const printRate =
+            count > 0
+                ? (printed / count) * 100
+                : 0;
+
+
+        const jamStatus =
+            normalizeJamStatus(
+                camera
+            );
+
+
+        rows.push(
+            `
+            <tr>
+
+                <td>
+                    Camera ${index}
+                </td>
+
+                <td>
+                    ${formatInteger(count)}
+                </td>
+
+                <td>
+                    ${formatInteger(printed)}
+                </td>
+
+                <td>
+                    ${formatInteger(missing)}
+                </td>
+
+                <td>
+                    ${formatPercent(printRate)}
+                </td>
+
+                <td>
+                    ${formatDecimal(
+                        camera.fps,
+                        1
+                    )}
+                </td>
+
+                <td>
+                    <span class="jam-status ${jamStatus}">
+                        ${jamStatus.toUpperCase()}
+                    </span>
+                </td>
+
+            </tr>
+            `
+        );
+    }
+
+
+    body.innerHTML =
+        rows.length > 0
+            ? rows.join("")
+            : `
+                <tr>
+                    <td colspan="7">
+                        No analytics data available.
+                    </td>
+                </tr>
+              `;
+}
+
+
+/* ==========================================================
+   EVENTS
+   ========================================================== */
+
+async function loadEvents() {
+
+    try {
+
+        const query =
+            buildEventQuery();
+
+
+        const path =
+            query
+                ? `/events?${query}`
+                : "/events";
+
+
+        const data =
+            await apiFetch(
+                path
+            );
+
+
+        const events =
+            Array.isArray(data)
+                ? data
+                : (
+                    data?.events
+                    ??
+                    data?.items
+                    ??
+                    []
+                );
+
+
+        appState.events =
+            events;
+
+
+        renderEvents(
+            events
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading events:",
+            error
+        );
+    }
+}
+
+
+/* ==========================================================
+   EVENT QUERY
+   ========================================================== */
+
+function isWildcardFilterValue(value) {
+
+    return (
+        !value
+        ||
+        value.trim() === ""
+        ||
+        value.trim().toLowerCase() === "all"
+    );
+}
+
+
+function buildEventQuery() {
+
+    const params =
+        new URLSearchParams();
+
+
+    const camera =
+        byId(
+            "cameraFilter"
+        )?.value;
+
+
+    const eventType =
+        byId(
+            "printFilter"
+        )?.value;
+
+
+    const shift =
+        byId(
+            "shiftFilter"
+        )?.value;
+
+
+    const dateFrom =
+        byId(
+            "startDate"
+        )?.value;
+
+
+    const dateTo =
+        byId(
+            "endDate"
+        )?.value;
+
+
+    const limit =
+        byId(
+            "recordLimit"
+        )?.value;
+
+
+    if (!isWildcardFilterValue(camera)) {
+
+        params.set(
+            "camera",
+            camera
+        );
+    }
+
+
+    if (!isWildcardFilterValue(eventType)) {
+
+        params.set(
+            "print_status",
+            eventType
+        );
+    }
+
+
+    if (!isWildcardFilterValue(shift)) {
+
+        params.set(
+            "shift",
+            shift
+        );
+    }
+
+
+    if (dateFrom) {
+
+        params.set(
+            "start",
+            dateFrom
+        );
+    }
+
+
+    if (dateTo) {
+
+        params.set(
+            "end",
+            dateTo
+        );
+    }
+
+
+    if (limit) {
+
+        params.set(
+            "limit",
+            limit
+        );
+    }
+
+
+    return params.toString();
+}
+
+
+/* ==========================================================
+   EVENT TABLE
+   ========================================================== */
+
+function renderEvents(events) {
+
+    const body =
+        byId(
+            "eventsTableBody"
+        );
+
+
+    if (!body) {
+        return;
+    }
+
+
+    setText(
+        "eventRecordCount",
+        formatInteger(
+            Array.isArray(events)
+                ? events.length
+                : 0
+        )
+    );
+
+
+    if (
+        !Array.isArray(events)
+        ||
+        events.length === 0
+    ) {
+
+        body.innerHTML =
+            `
+            <tr>
+                <td colspan="8">
+                    No events found.
+                </td>
+            </tr>
+            `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        events
+            .map(
+                event => {
+
+                    const camera =
+                        event.camera_name
+                        ??
+                        event.camera
+                        ??
+                        event.camera_id
+                        ??
+                        "--";
+
+
+                    const eventType =
+                        event.event_type
+                        ??
+                        event.type
+                        ??
+                        event.event
+                        ??
+                        "--";
+
+
+                    const totalCount =
+                        event.total_count
+                        ??
+                        event.count
+                        ??
+                        "--";
+
+
+                    const printed =
+                        event.printed
+                        ??
+                        event.print_present;
+
+
+                    const printStatus =
+                        printed === true
+                            ? "PRINTED"
+                            : (
+                                printed === false
+                                    ? "MISSING"
+                                    : "--"
+                            );
+
+
+                    const timestamp =
+                        event.timestamp
+                        ??
+                        event.created_at
+                        ??
+                        event["@timestamp"]
+                        ??
+                        null;
+
+
+                    const trackId =
+                        event.track_id
+                        ??
+                        event.bag_track_id
+                        ??
+                        "--";
+
+
+                    return `
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(
+                                formatDateTime(
+                                    timestamp
+                                )
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(camera)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(eventType)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(totalCount)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(printStatus)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(trackId)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                event.event_id
+                                ??
+                                event.id
+                                ??
+                                "--"
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                event.status
+                                ??
+                                "OK"
+                            )}
+                        </td>
+
+                    </tr>
+                    `;
+                }
+            )
+            .join("");
+}
+
+
+/* ==========================================================
+   EVENT FILTER CONTROLS
+   ========================================================== */
+
+function initializeEventControls() {
+
+    const searchButton =
+        byId(
+            "applyFilters"
+        );
+
+
+    if (searchButton) {
+
+        searchButton.addEventListener(
+            "click",
+            async () => {
+
+                await loadEvents();
+            }
+        );
+    }
+
+
+    const resetButton =
+        byId(
+            "resetFilters"
+        );
+
+
+    if (resetButton) {
+
+        resetButton.addEventListener(
+            "click",
+            async () => {
+
+                [
+                    "cameraFilter",
+                    "printFilter",
+                    "shiftFilter"
+                ]
+                    .forEach(
+                        id => {
+
+                            const element =
+                                byId(id);
+
+
+                            if (element) {
+
+                                element.value =
+                                    "all";
+                            }
+                        }
+                    );
+
+
+                [
+                    "startDate",
+                    "endDate"
+                ]
+                    .forEach(
+                        id => {
+
+                            const element =
+                                byId(id);
+
+
+                            if (element) {
+
+                                element.value =
+                                    "";
+                            }
+                        }
+                    );
+
+
+                const recordLimitElement =
+                    byId("recordLimit");
+
+
+                if (recordLimitElement) {
+
+                    recordLimitElement.value =
+                        "100";
+                }
+
+
+                await loadEvents();
+            }
+        );
+    }
+
+
+    const exportButton =
+        byId(
+            "exportButton"
+        );
+
+
+    if (exportButton) {
+
+        exportButton.addEventListener(
+            "click",
+            () => {
+
+                exportEventsCsv(
+                    appState.events
+                );
+            }
+        );
+    }
+}
+
+
+/* ==========================================================
+   EVENT CSV EXPORT
+   ========================================================== */
+
+function exportEventsCsv(events) {
+
+    if (
+        !Array.isArray(events)
+        ||
+        events.length === 0
+    ) {
+
+        alert(
+            "No events available to export."
+        );
+
+        return;
+    }
+
+
+    const headers = [
+        "Timestamp",
+        "Camera",
+        "Event Type",
+        "Total Count",
+        "Printed",
+        "Track ID",
+        "Event ID"
+    ];
+
+
+    const rows =
+        events.map(
+            event => [
+
+                event.timestamp
+                ??
+                event.created_at
+                ??
+                event["@timestamp"]
+                ??
+                "",
+
+                event.camera_name
+                ??
+                event.camera
+                ??
+                event.camera_id
+                ??
+                "",
+
+                event.event_type
+                ??
+                event.type
+                ??
+                event.event
+                ??
+                "",
+
+                event.total_count
+                ??
+                event.count
+                ??
+                "",
+
+                event.printed
+                ??
+                event.print_present
+                ??
+                "",
+
+                event.track_id
+                ??
+                "",
+
+                event.event_id
+                ??
+                event.id
+                ??
+                ""
+            ]
+        );
+
+
+    const csv =
+        [
+            headers,
+            ...rows
+        ]
+            .map(
+                row =>
+
+                    row
+                        .map(
+                            value => {
+
+                                const text =
+                                    String(
+                                        value ?? ""
+                                    )
+                                        .replaceAll(
+                                            '"',
+                                            '""'
+                                        );
+
+
+                                return `"${text}"`;
+                            }
+                        )
+                        .join(",")
+            )
+            .join("\n");
+
+
+    const blob =
+        new Blob(
+            [csv],
+            {
+                type:
+                    "text/csv;charset=utf-8"
+            }
+        );
+
+
+    const url =
+        URL.createObjectURL(
+            blob
+        );
+
+
+    const anchor =
+        document.createElement(
+            "a"
+        );
+
+
+    anchor.href =
+        url;
+
+
+    anchor.download =
+        `fillpac-events-${Date.now()}.csv`;
+
+
+    document.body.appendChild(
+        anchor
+    );
+
+
+    anchor.click();
+
+
+    anchor.remove();
+
+
+    URL.revokeObjectURL(
+        url
+    );
+}
+
+
+/* ==========================================================
+   LIVE CAMERA STREAMS
+   ========================================================== */
+
+function initializeLiveStreams() {
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const feedContainer =
+            byId(
+                `liveCamera${index}Feed`
+            );
+
+
+        if (!feedContainer) {
+            continue;
+        }
+
+
+        const cameraName =
+            `Camera ${index}`;
+
+
+        const image =
+            document.createElement(
+                "img"
+            );
+
+
+        image.className =
+            "camera-feed-stream";
+
+
+        image.alt =
+            `${cameraName} live feed`;
+
+
+        image.addEventListener(
+            "error",
+            () => {
+
+                feedContainer.classList
+                    .remove(
+                        "has-stream"
+                    );
+
+                feedContainer.innerHTML =
+                    `
+                    <i class="fa-solid fa-video-slash"></i>
+                    <span>
+                        Live video stream not connected
+                    </span>
+                    `;
+            }
+        );
+
+
+        image.addEventListener(
+            "load",
+            () => {
+
+                feedContainer.classList.add(
+                    "has-stream"
+                );
+            }
+        );
+
+
+        image.src =
+            `${API_BASE}/live/${encodeURIComponent(
+                cameraName
+            )}`;
+
+
+        feedContainer.innerHTML = "";
+
+        feedContainer.appendChild(
+            image
+        );
+    }
+}
+
+
+/* ==========================================================
+   CAMERA CONFIGURATION
+   ========================================================== */
+
+async function loadCameraConfig() {
+
+    try {
+
+        const data =
+            await apiFetch(
+                "/cameras"
+            );
+
+
+        appState.cameraConfig =
+            data;
+
+
+        renderCameraManagement(
+            data
+        );
+
+
+        return data;
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading camera configuration:",
+            error
+        );
+
+        return null;
+    }
+}
+
+
+/* ==========================================================
+   SETTINGS PAGE
+   ========================================================== */
+
+async function loadSettings() {
+
+    try {
+
+        const data =
+            await apiFetch(
+                "/config"
+            );
+
+        renderSettings(
+            data
+        );
+
+        return data;
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Failed loading settings:",
+            error
+        );
+
+        return null;
+    }
+}
+
+
+function prettifySettingLabel(key) {
+
+    return String(key)
+        .replaceAll("_", " ")
+        .replace(
+            /\b\w/g,
+            character =>
+                character.toUpperCase()
+        );
+}
+
+
+function renderSettingsGroup(
+    containerId,
+    data
+) {
+
+    const container =
+        byId(containerId);
+
+    if (!container) {
+        return;
+    }
+
+    const entries =
+        Object.entries(
+            data || {}
+        );
+
+    if (entries.length === 0) {
+
+        container.innerHTML =
+            `
+            <div class="setting-row">
+                <span>Status</span>
+                <strong>No configuration found</strong>
+            </div>
+            `;
+
+        return;
+    }
+
+    container.innerHTML =
+        entries
+            .map(
+                ([key, value]) => {
+
+                    const displayValue =
+                        typeof value === "object"
+                        && value !== null
+                            ? JSON.stringify(value)
+                            : String(
+                                value
+                                ??
+                                "--"
+                            );
+
+                    return `
+                    <div class="setting-row">
+                        <span>${escapeHtml(
+                            prettifySettingLabel(key)
+                        )}</span>
+                        <strong>${escapeHtml(
+                            displayValue
+                        )}</strong>
+                    </div>
+                    `;
+                }
+            )
+            .join("");
+}
+
+
+function renderSettings(data) {
+
+    if (
+        !data
+        ||
+        typeof data !== "object"
+    ) {
+        return;
+    }
+
+    setText(
+        "settingProjectRoot",
+        data.project_root
+        ??
+        "--"
+    );
+
+    setText(
+        "settingConfigFile",
+        data.config_file
+        ??
+        "--"
+    );
+
+    setText(
+        "settingEventsFile",
+        data.events_file
+        ??
+        "--"
+    );
+
+    if (data.available === false) {
+
+        const message =
+            data.error
+            ??
+            "Configuration unavailable.";
+
+        [
+            "modelSettings",
+            "countingSettings",
+            "dashboardSettings"
+        ].forEach(
+            id => {
+
+                const container =
+                    byId(id);
+
+                if (container) {
+
+                    container.innerHTML =
+                        `
+                        <div class="setting-row">
+                            <span>Status</span>
+                            <strong>${escapeHtml(message)}</strong>
+                        </div>
+                        `;
+                }
+            }
+        );
+
+        return;
+    }
+
+    renderSettingsGroup(
+        "modelSettings",
+        data.model
+    );
+
+    renderSettingsGroup(
+        "countingSettings",
+        data.counting
+    );
+
+    renderSettingsGroup(
+        "dashboardSettings",
+        data.dashboard
+    );
+}
+
+
+/* ==========================================================
+   CAMERA MANAGEMENT
+   ========================================================== */
+
+function renderCameraManagement(data) {
+
+    const grid =
+        byId(
+            "cameraManagementGrid"
+        );
+
+
+    if (!grid) {
+        return;
+    }
+
+
+    const cameras =
+        data?.cameras
+        ??
+        data
+        ??
+        {};
+
+
+    const cards = [];
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        const status =
+            String(
+                camera?.status
+                ??
+                "offline"
+            ).toLowerCase();
+
+
+        const mode =
+            camera?.mode
+            ??
+            camera?.source_type
+            ??
+            "--";
+
+
+        const fps =
+            formatDecimal(
+                camera?.fps,
+                1
+            );
+
+
+        const jamStatus =
+            normalizeJamStatus(
+                camera ?? {}
+            );
+
+
+        const printDetection =
+            camera?.print_detection_enabled
+                ? "Enabled"
+                : "Disabled";
+
+
+        cards.push(
+            `
+            <article class="management-camera-card ${status}">
+
+                <div class="management-camera-header">
+
+                    <div class="management-camera-title">
+
+                        <div class="camera-management-icon">
+                            <i class="fa-solid fa-camera"></i>
+                        </div>
+
+                        <div>
+                            <h3>${escapeHtml(
+                                camera?.name
+                                ??
+                                `Camera ${index}`
+                            )}</h3>
+                            <p>${escapeHtml(
+                                status.toUpperCase()
+                            )}</p>
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="management-camera-details">
+
+                    <div class="management-detail">
+                        <span>Mode</span>
+                        <strong>${escapeHtml(
+                            String(mode)
+                        )}</strong>
+                    </div>
+
+                    <div class="management-detail">
+                        <span>FPS</span>
+                        <strong>${fps}</strong>
+                    </div>
+
+                    <div class="management-detail">
+                        <span>Jam Status</span>
+                        <strong>${escapeHtml(
+                            jamStatus.toUpperCase()
+                        )}</strong>
+                    </div>
+
+                    <div class="management-detail">
+                        <span>Print Detection</span>
+                        <strong>${printDetection}</strong>
+                    </div>
+
+                </div>
+
+            </article>
+            `
+        );
+    }
+
+
+    grid.innerHTML =
+        cards.length > 0
+            ? cards.join("")
+            : `
+                <article class="management-camera-card offline">
+                    <div>
+                        <h3>No cameras configured</h3>
+                        <p>Waiting for backend</p>
+                    </div>
+                </article>
+              `;
+}
+
+
+/* ==========================================================
+   CAMERA CONTROLS
+   ========================================================== */
+
+function initializeCameraControls() {
+
+    const refreshButton =
+        byId(
+            "refreshCamerasButton"
+        );
+
+
+    if (!refreshButton) {
+        return;
+    }
+
+
+    refreshButton.addEventListener(
+        "click",
+        async () => {
+
+            refreshButton.disabled =
+                true;
+
+
+            try {
+
+                await loadCameraConfig();
+
+                await loadDashboardState();
+
+            }
+
+            catch (error) {
+
+                console.error(
+                    "Camera refresh failed:",
+                    error
+                );
+
+            }
+
+            finally {
+
+                refreshButton.disabled =
+                    false;
+            }
+        }
+    );
+}
+
+
+/* ==========================================================
+   JAM TRACK HELPERS
+   ========================================================== */
+
+function getJamTracks(camera) {
+
+    if (
+        !camera
+        ||
+        typeof camera !== "object"
+    ) {
+
+        return [];
+    }
+
+
+    const tracks =
+        camera.jam_tracks
+        ??
+        camera.tracks
+        ??
+        [];
+
+
+    return Array.isArray(tracks)
+        ? tracks
+        : [];
+}
+
+
+function getJamTrackSpeed(track) {
+
+    if (!track) {
+        return 0;
+    }
+
+
+    return safeNumber(
+        track.speed_px_s
+        ??
+        track.speed
+        ??
+        track.motion_speed
+        ??
+        0,
+        0
+    );
+}
+
+
+function getJamTrackDistance(track) {
+
+    if (!track) {
+        return 0;
+    }
+
+
+    return safeNumber(
+        track.distance_px
+        ??
+        track.movement_distance
+        ??
+        track.distance
+        ??
+        0,
+        0
+    );
+}
+
+
+function getJamTrackStationaryTime(track) {
+
+    if (!track) {
+        return 0;
+    }
+
+
+    return safeNumber(
+        track.stationary_seconds
+        ??
+        track.stationary_time
+        ??
+        track.time_stationary
+        ??
+        0,
+        0
+    );
+}
+
+
+function getJamTrackState(track) {
+
+    if (!track) {
+        return "unknown";
+    }
+
+
+    return String(
+        track.status
+        ??
+        track.state
+        ??
+        "unknown"
+    )
+        .trim()
+        .toLowerCase();
+}
+
+
+function getJamTrackId(track) {
+
+    if (!track) {
+        return "--";
+    }
+
+
+    return (
+        track.track_id
+        ??
+        track.id
+        ??
+        "--"
+    );
+}
+
+
+/* ==========================================================
+   JAM CAMERA SUMMARY
+   ========================================================== */
+
+function getJamCameraSummary(camera) {
+
+    if (!camera) {
+
+        return {
+
+            enabled: false,
+
+            status: "disabled",
+
+            activeCount: 0,
+
+            trackIds: [],
+
+            tracks: []
+        };
+    }
+
+
+    const enabled =
+        Boolean(
+            camera.jam_detection_enabled
+        );
+
+
+    const status =
+        normalizeJamStatus(
+            camera
+        );
+
+
+    const trackIds =
+        Array.isArray(
+            camera.active_jam_track_ids
+        )
+            ? camera.active_jam_track_ids
+            : [];
+
+
+    const activeCount =
+        Math.max(
+            0,
+            Math.round(
+                safeNumber(
+                    camera.active_jam_count,
+                    0
                 )
+            )
+        );
 
-            # ==============================================
-            # ENTRY ROI COUNT EVENTS
-            # ==============================================
+
+    return {
+
+        enabled,
+
+        status,
+
+        activeCount,
+
+        trackIds,
+
+        tracks:
+            getJamTracks(
+                camera
+            )
+    };
+}
+
+
+/* ==========================================================
+   JAM SYSTEM SUMMARY
+   ========================================================== */
+
+function getJamSystemSummary(cameras) {
+
+    const summary = {
+
+        enabledCameras: 0,
+
+        normal: 0,
+
+        slow: 0,
+
+        warning: 0,
+
+        jam: 0,
+
+        recovering: 0,
+
+        disabled: 0,
+
+        activeJams: 0
+    };
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        const cameraSummary =
+            getJamCameraSummary(
+                camera
+            );
+
+
+        if (!cameraSummary.enabled) {
+
+            summary.disabled += 1;
+
+            continue;
+        }
+
+
+        summary.enabledCameras += 1;
+
+
+        if (
+            Object.prototype
+                .hasOwnProperty
+                .call(
+                    summary,
+                    cameraSummary.status
+                )
+        ) {
+
+            summary[
+                cameraSummary.status
+            ] += 1;
+        }
+
+
+        if (
+            cameraSummary.status
+            === "jam"
+        ) {
+
+            summary.activeJams +=
+                cameraSummary.activeCount > 0
+                    ? cameraSummary.activeCount
+                    : 1;
+        }
+    }
+
+
+    return summary;
+}/* ==========================================================
+   SOCKET.IO
+   ========================================================== */
+
+function initializeSocket() {
+
+    if (
+        typeof io !== "function"
+    ) {
+
+        console.warn(
+            "Socket.IO client is not available. REST refresh will remain active."
+        );
+
+        return;
+    }
+
+
+    try {
+
+        const API_BASE =
+    "http://127.0.0.1:8000";
+
+appState.socket =
+    io(
+        API_BASE,
+        {
+            transports: [
+                "websocket",
+                "polling"
+            ],
+
+            reconnection: true,
+
+            reconnectionAttempts:
+                Infinity,
+
+            reconnectionDelay:
+                1000,
+
+            reconnectionDelayMax:
+                5000,
+
+            timeout:
+                10000
+        }
+    );
+
+
+        /* --------------------------------------------------
+           CONNECT
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "connect",
+            () => {
+
+                appState.socketConnected =
+                    true;
+
+
+                console.log(
+                    "FillPac Dashboard Socket.IO connected."
+                );
+
+
+                updateSocketIndicator(
+                    true
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           DISCONNECT
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "disconnect",
+            () => {
+
+                appState.socketConnected =
+                    false;
+
+
+                console.warn(
+                    "FillPac Dashboard Socket.IO disconnected."
+                );
+
+
+                updateSocketIndicator(
+                    false
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           FULL STATE
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "state",
+            state => {
+
+                renderDashboardState(
+                    state
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           STATE UPDATE
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "state_update",
+            state => {
+
+                renderDashboardState(
+                    state
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           DASHBOARD STATE
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "dashboard_state",
+            state => {
+
+                renderDashboardState(
+                    state
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           CAMERA UPDATE
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "camera_update",
+            payload => {
+
+                handleCameraSocketUpdate(
+                    payload
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           JAM UPDATE
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "jam_update",
+            payload => {
+
+                handleJamSocketUpdate(
+                    payload
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           COUNT EVENT
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "count_event",
+            payload => {
+
+                handleCountEvent(
+                    payload
+                );
+            }
+        );
+
+
+        /* --------------------------------------------------
+           PRODUCTION EVENT
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "production_event",
+            payload => {
+
+                handleProductionEvent(
+                    payload
+                );
+            }
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Socket.IO initialization failed:",
+            error
+        );
+    }
+}
+
+
+/* ==========================================================
+   SOCKET INDICATOR
+   ========================================================== */
+
+function updateSocketIndicator(
+    connected
+) {
+
+    const indicator =
+        byId(
+            "socketStatus"
+        );
+
+
+    if (!indicator) {
+        return;
+    }
+
+
+    indicator.textContent =
+        connected
+            ? "LIVE"
+            : "OFFLINE";
+
+
+    indicator.classList.toggle(
+        "online",
+        connected
+    );
+
+
+    indicator.classList.toggle(
+        "offline",
+        !connected
+    );
+}
+
+
+/* ==========================================================
+   ENSURE DASHBOARD STATE
+   ========================================================== */
+
+function ensureDashboardState() {
+
+    if (
+        !appState.dashboardState
+        ||
+        typeof appState.dashboardState
+        !== "object"
+    ) {
+
+        appState.dashboardState = {
+            cameras: {}
+        };
+    }
+
+
+    if (
+        !appState.dashboardState.cameras
+        ||
+        typeof appState.dashboardState.cameras
+        !== "object"
+    ) {
+
+        appState.dashboardState.cameras =
+            {};
+    }
+
+
+    return appState.dashboardState;
+}
+
+
+/* ==========================================================
+   CAMERA SOCKET UPDATE
+   ========================================================== */
+
+function handleCameraSocketUpdate(
+    payload
+) {
+
+    if (
+        !payload
+        ||
+        typeof payload !== "object"
+    ) {
+        return;
+    }
+
+
+    const cameraName =
+        payload.camera_name
+        ??
+        payload.name
+        ??
+        payload.camera
+        ??
+        payload.camera_id;
+
+
+    if (!cameraName) {
+
+        console.warn(
+            "Camera socket update without camera identifier:",
+            payload
+        );
+
+        return;
+    }
+
+
+    const state =
+        ensureDashboardState();
+
+
+    const existing =
+        state.cameras[
+            cameraName
+        ]
+        || {};
+
+
+    state.cameras[
+        cameraName
+    ] = {
+
+        ...existing,
+
+        ...payload
+    };
+
+
+    renderDashboardState(
+        state
+    );
+}
+
+
+/* ==========================================================
+   JAM SOCKET UPDATE
+   ========================================================== */
+
+function handleJamSocketUpdate(
+    payload
+) {
+
+    if (
+        !payload
+        ||
+        typeof payload !== "object"
+    ) {
+        return;
+    }
+
+
+    const cameraName =
+        payload.camera_name
+        ??
+        payload.name
+        ??
+        payload.camera
+        ??
+        payload.camera_id;
+
+
+    if (!cameraName) {
+
+        console.warn(
+            "Jam update without camera identifier:",
+            payload
+        );
+
+        return;
+    }
+
+
+    const state =
+        ensureDashboardState();
+
+
+    const existing =
+        state.cameras[
+            cameraName
+        ]
+        || {};
+
+
+    state.cameras[
+        cameraName
+    ] = {
+
+        ...existing,
+
+        jam_detection_enabled:
+            payload.jam_detection_enabled
+            ??
+            existing.jam_detection_enabled,
+
+        jam_status:
+            payload.jam_status
+            ??
+            payload.status
+            ??
+            existing.jam_status,
+
+        jam_detected:
+            payload.jam_detected
+            ??
+            existing.jam_detected,
+
+        jam_warning:
+            payload.jam_warning
+            ??
+            payload.warning
+            ??
+            existing.jam_warning,
+
+        active_jam_count:
+            payload.active_jam_count
+            ??
+            existing.active_jam_count
+            ??
+            0,
+
+        active_jam_track_ids:
+            payload.active_jam_track_ids
+            ??
+            existing.active_jam_track_ids
+            ??
+            [],
+
+        jam_tracks:
+            payload.jam_tracks
+            ??
+            payload.tracks
+            ??
+            existing.jam_tracks
+            ??
+            [],
+
+        condition_c_detected:
+            payload.condition_c_detected
+            ??
+            existing.condition_c_detected,
+
+        condition_c_status:
+            payload.condition_c_status
+            ??
+            existing.condition_c_status,
+
+        condition_c_bag_count:
+            payload.condition_c_bag_count
+            ??
+            existing.condition_c_bag_count,
+
+        condition_c_track_ids:
+            payload.condition_c_track_ids
+            ??
+            existing.condition_c_track_ids,
+
+        condition_c_minimum_gap_mm:
+            payload.condition_c_minimum_gap_mm
+            ??
+            existing.condition_c_minimum_gap_mm,
+
+        condition_c_distances:
+            payload.condition_c_distances
+            ??
+            existing.condition_c_distances,
+
+        condition_c_image_url:
+            payload.condition_c_image_url
+            ??
+            existing.condition_c_image_url,
+
+        condition_c_image_path:
+            payload.condition_c_image_path
+            ??
+            existing.condition_c_image_path
+    };
+
+
+    /*
+    Update only the jam UI immediately.
+
+    The normal periodic /state refresh remains the
+    authoritative source for the complete dashboard.
+    */
+
+    renderJamMonitoring(
+        state.cameras
+    );
+
+
+    renderDashboardHealthSummary(
+        state
+    );
+}
+
+
+/* ==========================================================
+   COUNT EVENT
+   ========================================================== */
+
+function handleCountEvent(
+    payload
+) {
+
+    if (
+        !payload
+        ||
+        typeof payload !== "object"
+    ) {
+        return;
+    }
+
+
+    /*
+    Backend remains the source of truth for counts.
+
+    Do not increment counters in JavaScript because
+    doing so could create duplicate counts when REST
+    synchronization occurs.
+    */
+
+    loadDashboardState()
+        .catch(
+            error => {
+
+                console.error(
+                    "Count-event state refresh failed:",
+                    error
+                );
+            }
+        );
+
+
+    if (
+        appState.currentPage
+        === "events"
+    ) {
+
+        loadEvents()
+            .catch(
+                error => {
+
+                    console.error(
+                        "Count-event event refresh failed:",
+                        error
+                    );
+                }
+            );
+    }
+}
+
+
+/* ==========================================================
+   PRODUCTION EVENT
+   ========================================================== */
+
+function handleProductionEvent(
+    payload
+) {
+
+    if (
+        !payload
+        ||
+        typeof payload !== "object"
+    ) {
+        return;
+    }
+
+
+    if (
+        appState.currentPage
+        === "events"
+    ) {
+
+        loadEvents()
+            .catch(
+                error => {
+
+                    console.error(
+                        "Production event refresh failed:",
+                        error
+                    );
+                }
+            );
+    }
+
+
+    if (
+        appState.currentPage
+        === "production"
+    ) {
+
+        loadProduction()
+            .catch(
+                error => {
+
+                    console.error(
+                        "Production page refresh failed:",
+                        error
+                    );
+                }
+            );
+    }
+}
+
+
+/* ==========================================================
+   JAM DIAGNOSTICS
+   ========================================================== */
+
+function logJamDiagnostics() {
+
+    const cameras =
+        appState
+            .dashboardState
+            ?.cameras
+        || {};
+
+
+    const summary =
+        getJamSystemSummary(
+            cameras
+        );
+
+
+    console.group(
+        "FillPac AI - Jam Detection"
+    );
+
+
+    console.log(
+        "System Summary:",
+        summary
+    );
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        const cameraSummary =
+            getJamCameraSummary(
+                camera
+            );
+
+
+        console.log(
+            `Camera ${index}:`,
+            cameraSummary
+        );
+
+
+        if (
+            cameraSummary.tracks.length > 0
+        ) {
+
+            console.table(
+                cameraSummary.tracks.map(
+                    track => ({
+
+                        trackId:
+                            getJamTrackId(
+                                track
+                            ),
+
+                        state:
+                            getJamTrackState(
+                                track
+                            ),
+
+                        speedPxS:
+                            getJamTrackSpeed(
+                                track
+                            ),
+
+                        distancePx:
+                            getJamTrackDistance(
+                                track
+                            ),
+
+                        stationarySeconds:
+                            getJamTrackStationaryTime(
+                                track
+                            )
+                    })
+                )
+            );
+        }
+    }
+
+
+    console.groupEnd();
+}
+
+
+/* ==========================================================
+   REFRESH LOOP
+   ========================================================== */
+
+function startRefreshLoop() {
+
+    if (
+        appState.refreshTimer
+    ) {
+
+        clearInterval(
+            appState.refreshTimer
+        );
+    }
+
+
+    appState.refreshTimer =
+        setInterval(
+            async () => {
+
+                try {
+
+                    /*
+                    --------------------------------------------------
+                    Always refresh /state.
+
+                    Socket.IO gives low-latency updates while this
+                    REST poll protects against missed socket events.
+                    --------------------------------------------------
+                    */
+
+                    await loadDashboardState();
+
+
+                    /* ----------------------------------------------
+                       PRODUCTION
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "production"
+                    ) {
+
+                        await loadProduction();
+                    }
+
+
+                    /* ----------------------------------------------
+                       ANALYTICS
+
+                       Also runs on the Dashboard page, since the
+                       Production Trend chart there is fed by the
+                       same /analytics payload.
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "analytics"
+                        ||
+                        appState.currentPage
+                        === "dashboard"
+                    ) {
+
+                        await loadAnalytics();
+                    }
+
+
+                    /* ----------------------------------------------
+                       EVENTS
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "events"
+                    ) {
+
+                        await loadEvents();
+                    }
+
+
+                    /* ----------------------------------------------
+                       CAMERAS
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "cameras"
+                    ) {
+
+                        await loadCameraConfig();
+                    }
+
+
+                    /* ----------------------------------------------
+                       JAM MONITOR
+
+                       /state already refreshed the values.
+                       Re-render explicitly for clarity.
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "jam-monitor"
+                    ) {
+
+                        renderJamMonitoring(
+                            appState
+                                .dashboardState
+                                ?.cameras
+                            || {}
+                        );
+                    }
+
+                }
+
+                catch (error) {
+
+                    console.error(
+                        "Dashboard refresh cycle failed:",
+                        error
+                    );
+                }
+
+            },
+            REFRESH_INTERVAL_MS
+        );
+}
+
+
+/* ==========================================================
+   STOP REFRESH LOOP
+   ========================================================== */
+
+function stopRefreshLoop() {
+
+    if (
+        !appState.refreshTimer
+    ) {
+        return;
+    }
+
+
+    clearInterval(
+        appState.refreshTimer
+    );
+
+
+    appState.refreshTimer =
+        null;
+}
+
+
+/* ==========================================================
+   MANUAL REFRESH
+   ========================================================== */
+
+function initializeRefreshButton() {
+
+    const button =
+        byId(
+            "refreshButton"
+        )
+        ||
+        byId(
+            "dashboardRefreshButton"
+        );
+
+
+    if (!button) {
+        return;
+    }
+
+
+    button.addEventListener(
+        "click",
+        async () => {
+
+            button.disabled =
+                true;
+
+
+            try {
+
+                await loadDashboardState();
+
+
+                /*
+                Load page-specific information only when
+                necessary. Dashboard state has already been
+                refreshed above.
+                */
+
+                if (
+                    appState.currentPage
+                    === "production"
+                ) {
+
+                    await loadProduction();
+                }
+
+
+                else if (
+                    appState.currentPage
+                    === "analytics"
+                ) {
+
+                    await loadAnalytics();
+                }
+
+
+                else if (
+                    appState.currentPage
+                    === "events"
+                ) {
+
+                    await loadEvents();
+                }
+
+
+                else if (
+                    appState.currentPage
+                    === "cameras"
+                ) {
+
+                    await loadCameraConfig();
+                }
+
+            }
+
+            catch (error) {
+
+                console.error(
+                    "Manual dashboard refresh failed:",
+                    error
+                );
+
+            }
+
+            finally {
+
+                button.disabled =
+                    false;
+            }
+        }
+    );
+}
+
+
+/* ==========================================================
+   NETWORK STATUS
+   ========================================================== */
+
+function initializeNetworkListeners() {
+
+    window.addEventListener(
+        "online",
+        () => {
+
+            console.log(
+                "Browser network connection restored."
+            );
+
+
+            loadDashboardState()
+                .catch(
+                    error => {
+
+                        console.error(
+                            "Network recovery refresh failed:",
+                            error
+                        );
+                    }
+                );
+        }
+    );
+
+
+    window.addEventListener(
+        "offline",
+        () => {
+
+            console.warn(
+                "Browser network connection lost."
+            );
+
+
+            updateSystemStatus(
+                "offline"
+            );
+        }
+    );
+}
+
+
+/* ==========================================================
+   PAGE VISIBILITY
+   ========================================================== */
+
+function initializeVisibilityListener() {
+
+    document.addEventListener(
+        "visibilitychange",
+        () => {
 
             if (
-                self.entry_roi_counter is not None
-                and self.entry_roi_counter.last_counted_bags
-            ):
+                document.visibilityState
+                !== "visible"
+            ) {
+                return;
+            }
 
-                for roi_bag in (
-                    self.entry_roi_counter.last_counted_bags
-                ):
 
-                    track_id = roi_bag.get("track_id")
-                    center = roi_bag.get("center")
+            /*
+            Browser tabs may throttle timers while hidden.
+            Refresh immediately when the operator returns.
+            */
 
-                    print(
-                        f"[ENTRY ROI COUNT +1] "
-                        f"Track ID={track_id} "
-                        f"Center={center} "
-                        f"TOTAL={self.entry_roi_count}"
-                    )
+            loadDashboardState()
+                .catch(
+                    error => {
 
-                    # ------------------------------------------
-                    # PERSIST ROI EVENT
-                    # ------------------------------------------
-                    if self.count_logger is not None:
+                        console.error(
+                            "Visibility refresh failed:",
+                            error
+                        );
+                    }
+                );
+        }
+    );
+}
 
-                        try:
 
-                            self.count_logger.log_event(
-                                event_type="roi_entry",
-                                camera_name=self.name,
-                                track_id=track_id,
-                                center=center,
-                                roi=self.entry_roi_counter.roi,
-                                roi_count=self.entry_roi_count,
-                            )
+/* ==========================================================
+   KEYBOARD SHORTCUT
+   ========================================================== */
 
-                        except Exception as error:
+function initializeKeyboardShortcuts() {
 
-                            self.logger.warning(
-                                f"{self.name}: "
-                                f"failed to log ROI entry event: "
-                                f"{error}"
-                            )
+    document.addEventListener(
+        "keydown",
+        async event => {
 
-            entry_roi_count = (
-                self.entry_roi_counter.total_count
-                if self.entry_roi_counter is not None
-                else 0
+            const target =
+                event.target;
+
+
+            const typing =
+                target
+                &&
+                (
+                    target.tagName === "INPUT"
+                    ||
+                    target.tagName === "TEXTAREA"
+                    ||
+                    target.tagName === "SELECT"
+                );
+
+
+            if (typing) {
+                return;
+            }
+
+
+            /*
+            Press R to manually refresh dashboard data.
+            */
+
+            if (
+                event.key
+                    .toLowerCase()
+                === "r"
+            ) {
+
+                event.preventDefault();
+
+
+                try {
+
+                    await loadDashboardState();
+
+
+                    if (
+                        appState.currentPage
+                        === "production"
+                    ) {
+
+                        await loadProduction();
+                    }
+
+
+                    else if (
+                        appState.currentPage
+                        === "analytics"
+                    ) {
+
+                        await loadAnalytics();
+                    }
+
+
+                    else if (
+                        appState.currentPage
+                        === "events"
+                    ) {
+
+                        await loadEvents();
+                    }
+
+
+                    else if (
+                        appState.currentPage
+                        === "cameras"
+                    ) {
+
+                        await loadCameraConfig();
+                    }
+
+                }
+
+                catch (error) {
+
+                    console.error(
+                        "Keyboard refresh failed:",
+                        error
+                    );
+                }
+            }
+        }
+    );
+}
+
+
+/* ==========================================================
+   CLOCK
+   ========================================================== */
+
+function updateClock() {
+
+    const now =
+        new Date();
+
+
+    setText(
+        "currentTime",
+        now.toLocaleTimeString()
+    );
+
+
+    setText(
+        "currentDate",
+        now.toLocaleDateString()
+    );
+}
+
+
+function initializeClock() {
+
+    updateClock();
+
+
+    setInterval(
+        updateClock,
+        1000
+    );
+}
+
+
+/* ==========================================================
+   LAST STATE UPDATE
+   ========================================================== */
+
+function updateLastRefreshIndicator() {
+
+    const element =
+        byId(
+            "lastUpdated"
+        );
+
+
+    if (!element) {
+        return;
+    }
+
+
+    if (
+        !appState.lastStateUpdate
+    ) {
+
+        element.textContent =
+            "Waiting for data";
+
+        return;
+    }
+
+
+    const elapsed =
+        Math.max(
+            0,
+            (
+                Date.now()
+                -
+                appState
+                    .lastStateUpdate
+                    .getTime()
             )
+            /
+            1000
+        );
 
-            # ==============================================
-            # FPS
-            # ==============================================
 
-            fps = self.calculate_fps()
+    if (
+        elapsed < 2
+    ) {
 
-            # ==============================================
-            # VISUALIZATION
-            # ==============================================
+        element.textContent =
+            "Updated now";
+    }
 
-            self.draw(
-                frame,
-                tracks,
-                detections,
-                print_results,
-                count,
-                fps,
-                entry_roi_count,
+
+    else if (
+        elapsed < 60
+    ) {
+
+        element.textContent =
+            `Updated ${Math.round(
+                elapsed
+            )}s ago`;
+    }
+
+
+    else {
+
+        element.textContent =
+            `Updated ${Math.round(
+                elapsed / 60
+            )}m ago`;
+    }
+}
+
+
+function initializeLastUpdateIndicator() {
+
+    updateLastRefreshIndicator();
+
+
+    setInterval(
+        updateLastRefreshIndicator,
+        1000
+    );
+}
+
+
+/* ==========================================================
+   STATE AGE
+   ========================================================== */
+
+function getStateAgeSeconds(state) {
+
+    if (!state) {
+        return null;
+    }
+
+
+    const timestamp =
+        state.updated_at
+        ??
+        state.timestamp
+        ??
+        state.last_update;
+
+
+    if (!timestamp) {
+        return null;
+    }
+
+
+    const updated =
+        parseDate(
+            timestamp
+        );
+
+
+    if (!updated) {
+        return null;
+    }
+
+
+    return Math.max(
+        0,
+        (
+            Date.now()
+            -
+            updated.getTime()
+        )
+        /
+        1000
+    );
+}
+
+
+/* ==========================================================
+   STATE FRESHNESS
+   ========================================================== */
+
+function monitorStateFreshness() {
+
+    const state =
+        appState.dashboardState;
+
+
+    if (!state) {
+        return;
+    }
+
+
+    const age =
+        getStateAgeSeconds(
+            state
+        );
+
+
+    const stale =
+        state.state_stale === true
+        ||
+        (
+            age !== null
+            &&
+            age > 15
+        );
+
+
+    const element =
+        byId(
+            "dataFreshness"
+        );
+
+
+    if (!element) {
+        return;
+    }
+
+
+    element.textContent =
+        stale
+            ? "STALE"
+            : "LIVE";
+
+
+    element.classList.toggle(
+        "stale",
+        stale
+    );
+
+
+    element.classList.toggle(
+        "live",
+        !stale
+    );
+}
+
+
+function initializeFreshnessMonitor() {
+
+    monitorStateFreshness();
+
+
+    setInterval(
+        monitorStateFreshness,
+        2000
+    );
+}/* ==========================================================
+   DASHBOARD HEALTH SUMMARY
+   ========================================================== */
+
+function cameraIsOnline(camera) {
+
+    if (!camera) {
+        return false;
+    }
+
+
+    const status =
+        String(
+            camera.status
+            ??
+            camera.camera_status
+            ??
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return (
+        status === "online"
+        ||
+        status === "running"
+        ||
+        status === "active"
+    );
+}
+
+
+function countOnlineCameras(cameras) {
+
+    let count = 0;
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(
+                cameras,
+                index
+            );
+
+
+        if (
+            cameraIsOnline(
+                camera
             )
+        ) {
 
-            self._set_latest_frame(
-                frame
-            )
+            count += 1;
+        }
+    }
 
-            # ==============================================
-            # EVENTS
-            # ==============================================
 
-            self._publish_events(
-                count,
-                fps,
-                print_results,
-            )
+    return count;
+}
 
-            self.last_error = None
 
-            return True
+function renderDashboardHealthSummary(state) {
 
-        except TimeoutError as error:
+    if (!state) {
+        return;
+    }
 
-            self.last_error = str(
-                error
-            )
 
-            self.logger.warning(
-                f"{self.name} inference timeout: "
-                f"{error}"
-            )
+    const cameras =
+        state.cameras
+        || {};
 
-            self._publish_runtime_status(
-                fps=0.0,
-                print_status="inference_timeout",
-                runtime_status="online",
-                force=True,
-            )
 
-            return True
+    const onlineCameras =
+        countOnlineCameras(
+            cameras
+        );
 
-        except Exception as error:
 
-            self.last_error = str(
-                error
-            )
+    const jamSummary =
+        getJamSystemSummary(
+            cameras
+        );
 
-            self.logger.error(
-                f"Unhandled exception in pipeline "
-                f"{self.name}: {error}"
-            )
 
-            self.release()
+    setText(
+        "onlineCameras",
+        formatInteger(
+            onlineCameras
+        )
+    );
 
-            self._publish_runtime_status(
-                fps=0.0,
-                print_status="error",
-                runtime_status="error",
-                force=True,
-            )
 
-            return False
+    setText(
+        "dashboardActiveJamCount",
+        formatInteger(
+            jamSummary.activeJams
+        )
+    );
+}
 
-    # ======================================================
-    # CONDITION C RESULT ACCESSOR
-    # ======================================================
 
-    def _condition_c(
-        self,
-    ):
+/* ==========================================================
+   SETTINGS
+   ========================================================== */
+
+function initializeSettings() {
+
+    const autoRefreshToggle =
+        byId(
+            "autoRefreshToggle"
+        );
+
+
+    if (autoRefreshToggle) {
+
+        autoRefreshToggle.addEventListener(
+            "change",
+            event => {
+
+                if (
+                    event.target.checked
+                ) {
+
+                    startRefreshLoop();
+                }
+
+                else {
+
+                    stopRefreshLoop();
+                }
+            }
+        );
+    }
+
+
+    const diagnosticsButton =
+        byId(
+            "jamDiagnosticsButton"
+        );
+
+
+    if (diagnosticsButton) {
+
+        diagnosticsButton.addEventListener(
+            "click",
+            () => {
+
+                logJamDiagnostics();
+            }
+        );
+    }
+}
+
+
+/* ==========================================================
+   CAMERA STREAM REFRESH
+   ========================================================== */
+
+function refreshCameraStreams() {
+
+    const timestamp =
+        Date.now();
+
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const feedContainer =
+            byId(
+                `liveCamera${index}Feed`
+            );
+
+
+        if (!feedContainer) {
+            continue;
+        }
+
+
+        const image =
+            feedContainer.querySelector(
+                "img"
+            );
+
+
+        if (!image) {
+            continue;
+        }
+
+
+        const cameraName =
+            `Camera ${index}`;
+
+
+        image.src =
+            `${API_BASE}/live/${encodeURIComponent(
+                cameraName
+            )}?t=${timestamp}`;
+    }
+}
+
+
+/* ==========================================================
+   LIVE MONITOR CONTROLS
+   ========================================================== */
+
+function initializeLiveMonitorControls() {
+
+    const refreshButton =
+        byId(
+            "refreshStreamsButton"
+        );
+
+
+    if (!refreshButton) {
+        return;
+    }
+
+
+    refreshButton.addEventListener(
+        "click",
+        () => {
+
+            refreshCameraStreams();
+        }
+    );
+}
+
+
+/* ==========================================================
+   JAM PAGE REFRESH
+   ========================================================== */
+
+function refreshJamPage() {
+
+    const cameras =
+        appState
+            .dashboardState
+            ?.cameras
+        || {};
+
+
+    renderJamMonitoring(
+        cameras
+    );
+
+
+    return getJamSystemSummary(
+        cameras
+    );
+}
+
+
+/* ==========================================================
+   INITIAL LOAD
+   ========================================================== */
+
+async function initialLoad() {
+
+    try {
+
+        /*
+        ------------------------------------------------------
+        /state is the primary dashboard source.
+
+        It contains camera runtime state including:
+        - counts
+        - FPS
+        - camera status
+        - jam detection enabled
+        - jam status
+        - jam warning
+        - jam detected
+        - active jam count
+        - active jam track IDs
+        - jam track information
+        ------------------------------------------------------
+        */
+
+        await loadDashboardState();
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Initial dashboard state load failed:",
+            error
+        );
+    }
+
+
+    /*
+    ----------------------------------------------------------
+    PAGE-SPECIFIC DATA
+
+    These calls are intentionally isolated so failure of one
+    endpoint does not prevent the dashboard from starting.
+    ----------------------------------------------------------
+    */
+
+    try {
+
+        if (
+            appState.currentPage
+            === "production"
+        ) {
+
+            await loadProduction();
+        }
+
+
+        else if (
+            appState.currentPage
+            === "analytics"
+            ||
+            appState.currentPage
+            === "dashboard"
+        ) {
+
+            await loadAnalytics();
+        }
+
+
+        else if (
+            appState.currentPage
+            === "events"
+        ) {
+
+            await loadEvents();
+        }
+
+
+        else if (
+            appState.currentPage
+            === "cameras"
+        ) {
+
+            await loadCameraConfig();
+        }
+
+
+        else if (
+            appState.currentPage
+            === "jam-monitor"
+        ) {
+
+            refreshJamPage();
+        }
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Initial page-specific load failed:",
+            error
+        );
+    }
+}
+
+
+/* ==========================================================
+   APPLICATION INITIALIZATION
+   ========================================================== */
+
+async function initializeDashboard() {
+
+    console.log(
+        "=================================================="
+    );
+
+    console.log(
+        "FillPac AI Dashboard"
+    );
+
+    console.log(
+        "Initializing frontend..."
+    );
+
+    console.log(
+        "=================================================="
+    );
+
+
+    /* ------------------------------------------------------
+       NAVIGATION
+       ------------------------------------------------------ */
+
+    initializeNavigation();
+
+
+    /* ------------------------------------------------------
+       CLOCK
+       ------------------------------------------------------ */
+
+    initializeClock();
+
+
+    /* ------------------------------------------------------
+       LAST UPDATE
+       ------------------------------------------------------ */
+
+    initializeLastUpdateIndicator();
+
+
+    /* ------------------------------------------------------
+       NETWORK LISTENERS
+       ------------------------------------------------------ */
+
+    initializeNetworkListeners();
+
+
+    /* ------------------------------------------------------
+       PAGE VISIBILITY
+       ------------------------------------------------------ */
+
+    initializeVisibilityListener();
+
+
+    /* ------------------------------------------------------
+       KEYBOARD SHORTCUTS
+       ------------------------------------------------------ */
+
+    initializeKeyboardShortcuts();
+
+
+    /* ------------------------------------------------------
+       REFRESH BUTTON
+       ------------------------------------------------------ */
+
+    initializeRefreshButton();
+
+
+    /* ------------------------------------------------------
+       EVENT CONTROLS
+       ------------------------------------------------------ */
+
+    initializeEventControls();
+
+
+    /* ------------------------------------------------------
+       CAMERA CONTROLS
+       ------------------------------------------------------ */
+
+    initializeCameraControls();
+
+
+    /* ------------------------------------------------------
+       LIVE STREAMS
+       ------------------------------------------------------ */
+
+    initializeLiveStreams();
+
+
+    initializeLiveMonitorControls();
+
+
+    /* ------------------------------------------------------
+       SETTINGS
+       ------------------------------------------------------ */
+
+    initializeSettings();
+
+
+    /* ------------------------------------------------------
+       SOCKET.IO
+       ------------------------------------------------------ */
+
+    initializeSocket();
+
+
+    /* ------------------------------------------------------
+       STATE FRESHNESS
+       ------------------------------------------------------ */
+
+    initializeFreshnessMonitor();
+
+
+    /* ------------------------------------------------------
+       DETERMINE INITIAL PAGE
+       ------------------------------------------------------ */
+
+    const initialActiveItem =
+        document.querySelector(
+            ".sidebar-item.active[data-page]"
+        );
+
+
+    if (
+        initialActiveItem
+        &&
+        initialActiveItem.dataset.page
+    ) {
+
+        appState.currentPage =
+            initialActiveItem.dataset.page;
+    }
+
+
+    updatePageHeader(
+        appState.currentPage
+    );
+
+
+    /* ------------------------------------------------------
+       INITIAL DATA
+       ------------------------------------------------------ */
+
+    await initialLoad();
+
+
+    /* ------------------------------------------------------
+       PERIODIC REST REFRESH
+       ------------------------------------------------------ */
+
+    startRefreshLoop();
+
+
+    console.log(
+        "=================================================="
+    );
+
+    console.log(
+        "FillPac AI Dashboard initialized successfully."
+    );
+
+    console.log(
+        "Current page:",
+        appState.currentPage
+    );
+
+    console.log(
+        "Refresh interval:",
+        `${REFRESH_INTERVAL_MS} ms`
+    );
+
+    console.log(
+        "=================================================="
+    );
+}
+
+
+/* ==========================================================
+   GLOBAL JAVASCRIPT ERROR HANDLER
+   ========================================================== */
+
+window.addEventListener(
+    "error",
+    event => {
+
+        console.error(
+            "Dashboard JavaScript error:",
+            event.error
+            ??
+            event.message
+        );
+    }
+);
+
+
+/* ==========================================================
+   UNHANDLED PROMISE ERROR
+   ========================================================== */
+
+window.addEventListener(
+    "unhandledrejection",
+    event => {
+
+        console.error(
+            "Unhandled dashboard promise rejection:",
+            event.reason
+        );
+    }
+);
+
+
+/* ==========================================================
+   APPLICATION CLEANUP
+   ========================================================== */
+
+window.addEventListener(
+    "beforeunload",
+    () => {
+
+        /* --------------------------------------------------
+           STOP REST REFRESH
+           -------------------------------------------------- */
+
+        stopRefreshLoop();
+
+
+        /* --------------------------------------------------
+           DISCONNECT SOCKET
+           -------------------------------------------------- */
+
+        if (
+            appState.socket
+        ) {
+
+            try {
+
+                appState.socket.disconnect();
+
+            }
+
+            catch (error) {
+
+                console.warn(
+                    "Socket cleanup failed:",
+                    error
+                );
+            }
+        }
+    }
+);
+
+
+/* ==========================================================
+   DOM READY
+   ========================================================== */
+
+document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+
+        initializeDashboard()
+            .catch(
+                error => {
+
+                    console.error(
+                        "FillPac dashboard initialization failed:",
+                        error
+                    );
+
+
+                    updateSystemStatus(
+                        "offline"
+                    );
+                }
+            );
+    }
+);
+
+
+/* ==========================================================
+   DEBUG / DEVELOPMENT INTERFACE
+   ========================================================== */
+
+/*
+============================================================
+Browser Console Commands
+============================================================
+
+Open:
+
+    F12
+    �?? Console
+
+
+1. Complete dashboard state
+
+    FillPacDashboard.state()
+
+
+2. All camera jam states
+
+    FillPacDashboard.jams()
+
+
+3. Camera 1 jam tracks
+
+    FillPacDashboard.jamTracks(1)
+
+
+4. Camera 2 jam tracks
+
+    FillPacDashboard.jamTracks(2)
+
+
+5. Camera 3 jam tracks
+
+    FillPacDashboard.jamTracks(3)
+
+
+6. Camera 4 jam tracks
+
+    FillPacDashboard.jamTracks(4)
+
+
+7. Force state refresh
+
+    FillPacDashboard.refresh()
+
+
+8. Refresh jam UI
+
+    FillPacDashboard.refreshJams()
+
+
+9. Detailed jam diagnostics
+
+    FillPacDashboard.diagnostics()
+
+============================================================
+*/
+
+
+window.FillPacDashboard = {
+
+    /* ------------------------------------------------------
+       COMPLETE STATE
+       ------------------------------------------------------ */
+
+    state() {
 
         return (
-            self.condition_c_result
-            if isinstance(
-                self.condition_c_result,
-                dict,
-            )
-            else {}
-        )
+            appState.dashboardState
+            ??
+            null
+        );
+    },
 
-    # ======================================================
-    # ENTRY ROI STATE
-    # ======================================================
 
-    def _get_entry_roi_state(self):
-        """
-        Return current bags whose physical center
-        is inside the Entry ROI.
-        """
+    /* ------------------------------------------------------
+       JAM SUMMARY
+       ------------------------------------------------------ */
 
-        if self.entry_roi_counter is None:
-            return {
-                "count": 0,
-                "track_ids": [],
-                "bags": [],
-            }
+    jams() {
 
-        bags = []
+        const cameras =
+            appState
+                .dashboardState
+                ?.cameras
+            || {};
 
-        for track_id, inside in (
-            self.entry_roi_counter.track_inside_roi.items()
-        ):
 
-            if not inside:
-                continue
+        const result = {};
 
-            center = (
-                self.entry_roi_counter.track_centers.get(
-                    track_id
-                )
-            )
-
-            if center is None:
-                continue
-
-            bags.append(
-                {
-                    "track_id": track_id,
-                    "center": [
-                        float(center[0]),
-                        float(center[1]),
-                    ],
-                }
-            )
-
-        return {
-            "count": len(bags),
-            "track_ids": [
-                bag["track_id"]
-                for bag in bags
-            ],
-            "bags": bags,
-        }
-
-    # ======================================================
-    # BUILD FINAL JAM RESULT
-    # ======================================================
-
-    def _build_final_jam_result(
-        self,
-    ):
-
-        movement = (
-            self.jam_result
-            if isinstance(
-                self.jam_result,
-                dict,
-            )
-            else {}
-        )
-
-        spacing = (
-            self.spacing_result
-            if isinstance(
-                self.spacing_result,
-                dict,
-            )
-            else {}
-        )
-
-        condition_c = self._condition_c()
-
-        movement_detected = bool(
-            movement.get(
-                "jam_detected",
-                False,
-            )
-        )
-
-        movement_warning = bool(
-            movement.get(
-                "warning",
-                False,
-            )
-        )
-
-        spacing_detected = bool(
-            spacing.get(
-                "jam_detected",
-                False,
-            )
-        )
-
-        condition_c_detected = bool(
-            condition_c.get(
-                "jam",
-                False,
-            )
-        )
-
-        jam_detected = bool(
-            movement_detected
-            or
-            spacing_detected
-            or
-            condition_c_detected
-        )
-
-        jam_types = []
-
-        if movement_detected:
-
-            jam_types.append(
-                "movement"
-            )
-
-        if spacing_detected:
-
-            jam_types.append(
-                "bag_spacing"
-            )
-
-        if condition_c_detected:
-
-            jam_types.append(
-                "roi_occupancy"
-            )
-
-        movement_ids = (
-            movement.get(
-                "active_jam_track_ids",
-                [],
-            )
-            or []
-        )
-
-        spacing_ids = (
-            spacing.get(
-                "active_jam_track_ids",
-                [],
-            )
-            or []
-        )
-
-        condition_c_ids = (
-            condition_c.get(
-                "track_ids",
-                [],
-            )
-            or []
-        )
-
-        active_ids = sorted(
-            {
-                int(track_id)
-                for track_id
-                in (
-                    list(movement_ids)
-                    +
-                    list(spacing_ids)
-                    +
-                    list(condition_c_ids)
-                )
-                if track_id is not None
-            }
-        )
-
-        if jam_detected:
-
-            status = "jam"
-
-        elif movement_warning:
-
-            status = "warning"
-
-        elif (
-            self.jam_detection_enabled
-            or
-            self.bag_spacing_enabled
-            or
-            self.condition_c_enabled
-        ):
-
-            status = "normal"
-
-        else:
-
-            status = "disabled"
-
-        return {
-
-            "status":
-                status,
-
-            "jam_detected":
-                jam_detected,
-
-            "warning":
-                (
-                    movement_warning
-                    and
-                    not jam_detected
-                ),
-
-            "jam_types":
-                jam_types,
-
-            "movement_jam_detected":
-                movement_detected,
-
-            "spacing_jam_detected":
-                spacing_detected,
-
-            "active_jam_count":
-                len(active_ids),
-
-            "active_jam_track_ids":
-                active_ids,
-
-            "minimum_gap_mm":
-                spacing.get(
-                    "minimum_gap_mm"
-                ),
-
-            "spacing_threshold_mm":
-                spacing.get(
-                    "threshold_mm",
-                    self.bag_spacing_detector
-                    .jam_threshold_mm,
-                ),
-
-            "spacing_jam_pairs":
-                spacing.get(
-                    "jam_pairs",
-                    [],
-                )
-                or [],
-
-            "condition_c_bag_count":
-                condition_c.get(
-                    "bag_count",
-                    0,
-                ),
-
-            "condition_c_track_ids":
-                condition_c.get(
-                    "track_ids",
-                    [],
-                )
-                or [],
-
-            "condition_c_minimum_gap_mm":
-                condition_c.get(
-                    "minimum_gap_mm"
-                ),
-
-            "condition_c_distances":
-                condition_c.get(
-                    "distances",
-                    [],
-                )
-                or [],
-
-            "condition_c_image_path":
-                condition_c.get(
-                    "image_path"
-                ),
-        }
-
-    # ======================================================
-    # JAM EVENT LOGGER
-    # ======================================================
-
-    def _log_jam_events(self):
-
-        if self.count_logger is None:
-            return
-
-        try:
-
-            # ==================================================
-            # CONDITION A - MOVEMENT JAM
-            # ==================================================
-
-            self.logger.warning(
-                f"{self.name}: CONDITION A DEBUG | "
-                f"enabled={self.jam_result.get('enabled')} | "
-                f"status={self.jam_result.get('status')} | "
-                f"jam={self.jam_result.get('jam')} | "
-                f"jam_detected={self.jam_result.get('jam_detected')} | "
-                f"active_tracks={self.jam_result.get('active_jam_track_ids', [])}"
-            )
-
-            condition_a_jam = bool(
-                self.jam_result.get(
-                    "jam",
-                    False,
-                )
-            )
-
-            if condition_a_jam != self.previous_condition_a_jam:
-
-                # --------------------------------------------------
-                # JAM START
-                # --------------------------------------------------
-
-                if condition_a_jam:
-
-                    try:
-
-                        self.condition_a_sql_jam_start = (
-                            datetime.now(timezone.utc)
-                        )
-
-                        self.condition_a_sql_jam_id = (
-                            start_jam_event(
-                                camera_id=self.name,
-                                condition_code="A",
-                                condition_name="MOVEMENT_JAM",
-                                jam_type="movement",
-                                track_ids=(
-                                    self.jam_result.get(
-                                        "active_jam_track_ids",
-                                        [],
-                                    )
-                                ),
-                                reason=(
-                                    self.jam_result.get(
-                                        "reason"
-                                    )
-                                ),
-                                metadata={
-                                    "condition_code": "A",
-                                    "condition_name": "MOVEMENT_JAM",
-                                    "jam_type": "movement",
-                                    "jam_result": self.jam_result,
-                                    "roi": self.jam_roi,
-                                    "track_ids": (
-                                        self.jam_result.get(
-                                            "active_jam_track_ids",
-                                            [],
-                                        )
-                                        or []
-                                    ),
-                                },
-                            )
-                        )
-
-                    except Exception as error:
-
-                        self.condition_a_sql_jam_id = None
-                        self.condition_a_sql_jam_start = None
-
-                        self.logger.warning(
-                            f"{self.name}: failed to start "
-                            f"SQL Condition A jam event: {error}"
-                        )
-
-                # --------------------------------------------------
-                # JAM RECOVERY
-                # --------------------------------------------------
-
-                else:
-
-                    if self.condition_a_sql_jam_id is not None:
-
-                        start_time = (
-                            self.condition_a_sql_jam_start
-                        )
-
-                        if start_time is not None:
-
-                            duration_seconds = (
-                                datetime.now(timezone.utc)
-                                - start_time
-                            ).total_seconds()
-
-                        else:
-
-                            duration_seconds = 0.0
-
-                        try:
-
-                            end_jam_event(
-                                jam_event_id=(
-                                    self.condition_a_sql_jam_id
-                                ),
-                                duration_seconds=(
-                                    duration_seconds
-                                ),
-                                status="RECOVERED",
-                            )
-
-                        except Exception as error:
-
-                            self.logger.warning(
-                                f"{self.name}: failed to end "
-                                f"SQL Condition A jam event: {error}"
-                            )
-
-                    self.condition_a_sql_jam_id = None
-                    self.condition_a_sql_jam_start = None
-
-                # --------------------------------------------------
-                # EXISTING COUNT LOGGER
-                # --------------------------------------------------
-
-                try:
-
-                    self.count_logger.log_event(
-                        event_type=(
-                            "jam_condition_a"
-                            if condition_a_jam
-                            else "jam_condition_a_recovered"
-                        ),
-                        camera_name=self.name,
-                        status=(
-                            "jam"
-                            if condition_a_jam
-                            else "normal"
-                        ),
-                        jam_result=self.jam_result,
-                        roi=self.jam_roi,
-                    )
-
-                except Exception as error:
-
-                    self.logger.warning(
-                        f"{self.name}: failed CountLogger "
-                        f"Condition A event: {error}"
-                    )
-
-                self.previous_condition_a_jam = (
-                    condition_a_jam
-                )
-
-            # ==================================================
-            # CONDITION B - BAG SPACING JAM
-            # ==================================================
-
-            self.logger.warning(
-                f"{self.name}: CONDITION B DEBUG | "
-                f"enabled={self.spacing_result.get('enabled')} | "
-                f"status={self.spacing_result.get('status')} | "
-                f"jam={self.spacing_result.get('jam')} | "
-                f"jam_detected={self.spacing_result.get('jam_detected')} | "
-                f"minimum_gap_mm={self.spacing_result.get('minimum_gap_mm')} | "
-                f"threshold_mm={self.spacing_result.get('threshold_mm')} | "
-                f"pairs={len(self.spacing_result.get('pairs', []))} | "
-                f"jam_pairs={len(self.spacing_result.get('jam_pairs', []))} | "
-                f"track_ids={self.spacing_result.get('active_jam_track_ids', [])}"
-            )
-
-            condition_b_jam = bool(
-                self.spacing_result.get(
-                    "jam_detected",
-                    False,
-                )
-            )
-
-            if condition_b_jam != self.previous_condition_b_jam:
-
-                # --------------------------------------------------
-                # JAM START
-                # --------------------------------------------------
-
-                if condition_b_jam:
-
-                    try:
-
-                        self.condition_b_sql_jam_start = (
-                            datetime.now(timezone.utc)
-                        )
-
-                        self.condition_b_sql_jam_id = (
-                            start_jam_event(
-                                camera_id=self.name,
-                                condition_code="B",
-                                condition_name="BAG_SPACING_JAM",
-                                jam_type="spacing",
-                                track_ids=(
-                                    self.spacing_result.get(
-                                        "active_jam_track_ids",
-                                        [],
-                                    )
-                                ),
-                                reason=(
-                                    self.spacing_result.get(
-                                        "reason"
-                                    )
-                                ),
-                                roi_snapshot_id=None,
-                                metadata={
-                                    "condition_code": "B",
-                                    "condition_name": "BAG_SPACING_JAM",
-                                    "jam_type": "spacing",
-                                    "spacing_result": (
-                                        self.spacing_result
-                                    ),
-                                    "roi": self.spacing_roi,
-                                    "track_ids": (
-                                        self.spacing_result.get(
-                                            "active_jam_track_ids",
-                                            [],
-                                        )
-                                        or []
-                                    ),
-                                },
-                            )
-                        )
-
-                    except Exception as error:
-
-                        self.condition_b_sql_jam_id = None
-                        self.condition_b_sql_jam_start = None
-
-                        self.logger.warning(
-                            f"{self.name}: failed to start "
-                            f"SQL Condition B jam event: {error}"
-                        )
-
-                # --------------------------------------------------
-                # JAM RECOVERY
-                # --------------------------------------------------
-
-                else:
-
-                    if self.condition_b_sql_jam_id is not None:
-
-                        start_time = (
-                            self.condition_b_sql_jam_start
-                        )
-
-                        if start_time is not None:
-
-                            duration_seconds = (
-                                datetime.now(timezone.utc)
-                                - start_time
-                            ).total_seconds()
-
-                        else:
-
-                            duration_seconds = 0.0
-
-                        try:
-
-                            end_jam_event(
-                                jam_event_id=(
-                                    self.condition_b_sql_jam_id
-                                ),
-                                duration_seconds=(
-                                    duration_seconds
-                                ),
-                                status="RECOVERED",
-                            )
-
-                        except Exception as error:
-
-                            self.logger.warning(
-                                f"{self.name}: failed to end "
-                                f"SQL Condition B jam event: {error}"
-                            )
-
-                    self.condition_b_sql_jam_id = None
-                    self.condition_b_sql_jam_start = None
-
-                # --------------------------------------------------
-                # EXISTING COUNT LOGGER
-                # --------------------------------------------------
-
-                try:
-
-                    self.count_logger.log_event(
-                        event_type=(
-                            "jam_condition_b"
-                            if condition_b_jam
-                            else "jam_condition_b_recovered"
-                        ),
-                        camera_name=self.name,
-                        status=(
-                            "jam"
-                            if condition_b_jam
-                            else "normal"
-                        ),
-                        spacing_result=self.spacing_result,
-                        roi=self.spacing_roi,
-                    )
-
-                except Exception as error:
-
-                    self.logger.warning(
-                        f"{self.name}: failed CountLogger "
-                        f"Condition B event: {error}"
-                    )
-
-                self.previous_condition_b_jam = (
-                    condition_b_jam
-                )
-
-            # ==================================================
-            # CONDITION C - ROI OCCUPANCY JAM
-            # ==================================================
-
-            condition_c_result = (
-                self._condition_c()
-            )
-
-            condition_c_jam = bool(
-                condition_c_result.get(
-                    "jam",
-                    False,
-                )
-            )
-
-            if condition_c_jam != self.previous_condition_c_jam:
-
-                # --------------------------------------------------
-                # JAM START
-                # --------------------------------------------------
-
-                if condition_c_jam:
-
-                    try:
-
-                        self.condition_c_sql_jam_start = (
-                            datetime.now(timezone.utc)
-                        )
-
-                        # ------------------------------------------
-                        # Save the ROI snapshot image FIRST so we
-                        # have a snapshot ID to attach to the jam
-                        # event below. Without this, roi_snapshots
-                        # stayed empty and jam_events.roi_snapshot_id
-                        # was always NULL even though the detector
-                        # already wrote the image to disk.
-                        # ------------------------------------------
-
-                        condition_c_snapshot_id = None
-
-                        condition_c_image_path = (
-                            condition_c_result.get("image_path")
-                        )
-
-                        if condition_c_image_path:
-
-                            try:
-
-                                condition_c_snapshot_id = (
-                                    save_roi_snapshot(
-                                        camera_id=self.name,
-                                        event_type="condition_c",
-                                        image_path=str(
-                                            condition_c_image_path
-                                        ),
-                                        metadata={
-                                            "condition_code": "C",
-                                            "condition_name": (
-                                                "ROI_OCCUPANCY_JAM"
-                                            ),
-                                            "jam_type": (
-                                                "roi_occupancy"
-                                            ),
-                                            "condition_c_result": (
-                                                condition_c_result
-                                            ),
-                                            "roi": (
-                                                self.condition_c_roi
-                                            ),
-                                            "track_ids": (
-                                                condition_c_result.get(
-                                                    "track_ids",
-                                                    [],
-                                                )
-                                                or []
-                                            ),
-                                        },
-                                    )
-                                )
-
-                            except Exception as error:
-
-                                condition_c_snapshot_id = None
-
-                                self.logger.warning(
-                                    f"{self.name}: failed to save "
-                                    "Condition C ROI snapshot to "
-                                    f"SQL: {error}"
-                                )
-
-                        self.condition_c_sql_jam_id = (
-                            start_jam_event(
-                                camera_id=self.name,
-                                condition_code="C",
-                                condition_name="ROI_OCCUPANCY_JAM",
-                                jam_type="roi_occupancy",
-                                track_ids=(
-                                    condition_c_result.get(
-                                        "track_ids",
-                                        [],
-                                    )
-                                ),
-                                reason=(
-                                    condition_c_result.get(
-                                        "reason",
-                                        "ROI occupancy exceeded limit",
-                                    )
-                                ),
-                                roi_snapshot_id=(
-                                    condition_c_snapshot_id
-                                ),
-                                metadata={
-                                    "condition_code": "C",
-                                    "condition_name": "ROI_OCCUPANCY_JAM",
-                                    "jam_type": "roi_occupancy",
-                                    "condition_c_result": (
-                                        condition_c_result
-                                    ),
-                                    "roi": (
-                                        self.condition_c_roi
-                                    ),
-                                    "track_ids": (
-                                        condition_c_result.get(
-                                            "track_ids",
-                                            [],
-                                        )
-                                        or []
-                                    ),
-                                },
-                            )
-                        )
-
-                    except Exception as error:
-
-                        self.condition_c_sql_jam_id = None
-                        self.condition_c_sql_jam_start = None
-
-                        self.logger.warning(
-                            f"{self.name}: failed to start "
-                            f"SQL Condition C jam event: {error}"
-                        )
-
-                # --------------------------------------------------
-                # JAM RECOVERY
-                # --------------------------------------------------
-
-                else:
-
-                    if self.condition_c_sql_jam_id is not None:
-
-                        start_time = (
-                            self.condition_c_sql_jam_start
-                        )
-
-                        if start_time is not None:
-
-                            duration_seconds = (
-                                datetime.now(timezone.utc)
-                                - start_time
-                            ).total_seconds()
-
-                        else:
-
-                            duration_seconds = 0.0
-
-                        try:
-
-                            end_jam_event(
-                                jam_event_id=(
-                                    self.condition_c_sql_jam_id
-                                ),
-                                duration_seconds=(
-                                    duration_seconds
-                                ),
-                                status="RECOVERED",
-                            )
-
-                        except Exception as error:
-
-                            self.logger.warning(
-                                f"{self.name}: failed to end "
-                                f"SQL Condition C jam event: {error}"
-                            )
-
-                    self.condition_c_sql_jam_id = None
-                    self.condition_c_sql_jam_start = None
-
-                # --------------------------------------------------
-                # EXISTING COUNT LOGGER
-                # --------------------------------------------------
-
-                try:
-
-                    self.count_logger.log_event(
-                        event_type=(
-                            "jam_condition_c"
-                            if condition_c_jam
-                            else "jam_condition_c_recovered"
-                        ),
-                        camera_name=self.name,
-                        status=(
-                            "jam"
-                            if condition_c_jam
-                            else "normal"
-                        ),
-                        condition_c_result=(
-                            condition_c_result
-                        ),
-                        roi=self.condition_c_roi,
-                    )
-
-                except Exception as error:
-
-                    self.logger.warning(
-                        f"{self.name}: failed CountLogger "
-                        f"Condition C event: {error}"
-                    )
-
-                self.previous_condition_c_jam = (
-                    condition_c_jam
-                )
-
-        except Exception as error:
-
-            self.logger.warning(
-                f"{self.name}: failed to log jam events: "
-                f"{error}"
-            )
-
-    # ======================================================
-    # PIPELINE THREAD
-    # ======================================================
-
-    def run(
-        self,
-        stop_event,
-    ):
-
-        self.logger.info(
-            f"{self.name} pipeline thread started."
-        )
-
-        while not stop_event.is_set():
-
-            active = self.process()
-
-            if not active:
-
-                time.sleep(
-                    0.1
-                )
-
-        self.logger.info(
-            f"{self.name} pipeline thread stopping."
-        )
-
-        self.release()
-
-        self._publish_runtime_status(
-            fps=0.0,
-            print_status="offline",
-            runtime_status="offline",
-            force=True,
-        )
-
-    # ======================================================
-    # READ FRAME
-    # ======================================================
-
-    def read_frame(
-        self,
-    ):
-
-        success, frame = (
-            self.camera.read()
-        )
-
-        if not success:
-
-            self.logger.warning(
-                f"{self.name} frame read failed "
-                "or stream ended."
-            )
-
-            return None
-
-        return frame
-
-    # ======================================================
-    # DETECT
-    # ======================================================
-
-    def detect(
-        self,
-        frame,
-    ):
-
-        return self.inference_manager.infer(
-
-            camera_name=self.name,
-
-            frame=frame,
-
-            timeout=self.inference_timeout,
-        )
-
-    # ======================================================
-    # TRACK
-    # ======================================================
-
-    def track(
-        self,
-        detections,
-    ):
-
-        bag_detections = [
-
-            detection
-
-            for detection in detections
-
-            if detection.get(
-                "class_id"
-            ) == 0
-        ]
-
-        return self.tracker.update(
-            bag_detections
-        )
-
-    # ======================================================
-    # COUNTABLE TRACKS
-    # ======================================================
-
-    @staticmethod
-    def countable_tracks(
-        tracks,
-    ):
-
-        return [
-
-            track
-
-            for track in tracks
-
-            if not track.get(
-                "unstable",
-                False,
-            )
-        ]
-
-    # ======================================================
-    # COUNT
-    # ======================================================
-
-    def count(
-        self,
-        tracks,
-    ):
-
-        return self.counter.update(
-            tracks
-        )
-
-    # ======================================================
-    # PRINT DETECTION
-    # ======================================================
-
-    def print_detection(
-        self,
-        tracks,
-        detections,
-    ):
-
-        if not self.print_detection_enabled:
-
-            return []
-
-        return self.print_detector.update(
-            tracks,
-            detections,
-        )
-
-    # ======================================================
-    # RECORD PRINT OBSERVATIONS
-    # ======================================================
-
-    def record_print_observations(
-        self,
-        print_results,
-        tracks,
-    ):
-
-        if not self.print_detection_enabled:
-            return
-
-        track_lookup = {
-
-            track.get(
-                "track_id"
-            ):
-                track
-
-            for track in tracks
-
-            if track.get(
-                "track_id"
-            ) is not None
-        }
-
-        for result in print_results:
-
-            track_id = result.get(
-                "track_id"
-            )
-
-            if track_id is None:
-                continue
-
-            track = track_lookup.get(
-                track_id,
-                {},
-            )
-
-            if not self._is_valid_print_observation(
-                track
-            ):
-
-                continue
-
-            print_present = result.get(
-                "print_present"
-            )
-
-            if print_present is None:
-                continue
-
-            votes = (
-                self.track_print_votes.setdefault(
-                    track_id,
-                    [],
-                )
-            )
-
-            votes.append(
-                bool(
-                    print_present
-                )
-            )
-
-            if len(votes) > self.print_history_size:
-
-                del votes[
-                    :-self.print_history_size
-                ]
-
-            self.track_print_last_seen[
-                track_id
-            ] = self.frame_index
-
-        self._trim_print_history(
-            active_track_ids=set(
-                track_lookup
-            )
-        )
-
-    # ======================================================
-    # VALID PRINT OBSERVATION
-    # ======================================================
-
-    def _is_valid_print_observation(
-        self,
-        track,
-    ):
-
-        if track.get(
-            "unstable",
-            False,
-        ):
-
-            return False
-
-        if (
-            self.skip_motion_jump_print_observations
-            and
-            track.get(
-                "motion_jump",
-                False,
-            )
-        ):
-
-            return False
-
-        if (
-            float(
-                track.get(
-                    "speed",
-                    0.0,
-                )
-                or 0.0
-            )
-            <
-            self.min_print_observation_speed
-        ):
-
-            return False
-
-        return True
-
-    # ======================================================
-    # TRIM PRINT HISTORY
-    # ======================================================
-
-    def _trim_print_history(
-        self,
-        active_track_ids=None,
-    ):
-
-        active_track_ids = (
-            active_track_ids
-            or set()
-        )
-
-        stale_ids = []
 
         for (
-            track_id,
-            last_seen,
-        ) in self.track_print_last_seen.items():
+            let index = 1;
+            index <= CAMERA_COUNT;
+            index += 1
+        ) {
+
+            const camera =
+                findCameraByIndex(
+                    cameras,
+                    index
+                );
 
-            age = (
-                self.frame_index
-                -
-                last_seen
-            )
-
-            if (
-                track_id not in active_track_ids
-                and
-                age > self.print_history_ttl_frames
-            ):
-
-                stale_ids.append(
-                    track_id
-                )
-
-        for track_id in stale_ids:
-
-            self.track_print_votes.pop(
-                track_id,
-                None,
-            )
-
-            self.track_print_last_seen.pop(
-                track_id,
-                None,
-            )
-
-    # ======================================================
-    # CLASSIFY PRINT HISTORY
-    # ======================================================
-
-    def _classify_print_history(
-        self,
-        track_id,
-    ):
-
-        if not self.print_detection_enabled:
-
-            return None
-
-        votes = (
-            self.track_print_votes.get(
-                track_id,
-                [],
-            )
-        )
-
-        observation_count = len(
-            votes
-        )
-
-        min_print_votes = getattr(
-            self,
-            "min_print_votes",
-            getattr(
-                self,
-                "min_print_observations",
-                1,
-            ),
-        )
-
-        if observation_count < int(min_print_votes):
-
-            return None
-
-        positive_count = sum(
-            1
-            for vote in votes
-            if vote
-        )
-
-        ratio = (
-            positive_count
-            /
-            max(
-                observation_count,
-                1,
-            )
-        )
-
-        return (
-            ratio
-            >=
-            self.print_vote_threshold
-        )
-
-    # ======================================================
-    # FINALIZE PRINT STATUS
-    # ======================================================
-
-    def _finalize_print_status(
-        self,
-        track_id,
-    ):
-        """
-        Finalize print classification for one track.
-
-        Unlike _classify_print_history(), this does not wait
-        for a minimum observation count: it is called once a
-        track's physical bag crossing has already been
-        confirmed, so no further observations will arrive.
-        Whatever votes have been accumulated are classified
-        immediately using the configured vote threshold, and
-        the track's temporary print history is then removed.
-
-        Returns
-        -------
-        bool | None
-            True  -> printed
-            False -> missing / not printed
-            None  -> no observations recorded, or disabled
-        """
-
-        if not self.print_detection_enabled:
-            return None
-
-        votes = self.track_print_votes.get(
-            track_id,
-            [],
-        )
-
-        if not votes:
-            self.track_print_last_seen.pop(
-                track_id,
-                None,
-            )
-            return None
-
-        positive_count = sum(
-            1
-            for vote in votes
-            if vote
-        )
-
-        ratio = (
-            positive_count
-            /
-            max(
-                len(votes),
-                1,
-            )
-        )
-
-        result = (
-            ratio
-            >=
-            self.print_vote_threshold
-        )
-
-        self.track_print_votes.pop(
-            track_id,
-            None,
-        )
-
-        self.track_print_last_seen.pop(
-            track_id,
-            None,
-        )
-
-        return result
-
-    # ======================================================
-    # DRAW
-    # ======================================================
-
-    def draw(
-        self,
-        frame,
-        tracks,
-        detections,
-        print_results,
-        count,
-        fps,
-        entry_roi_count=0,
-    ):
-
-        self.visualizer.visualize(
-
-            frame=frame,
-
-            camera_name=self.name,
-
-            count=count,
-
-            entry_roi_count=entry_roi_count,
-
-            printed_count=self.printed_count,
-
-            missing_count=self.missing_count,
-
-            fps=fps,
-
-            roi=self.roi,
-
-            bag_tracks=tracks,
-
-            all_detections=detections,
-
-            print_results=print_results,
-
-            display_config=self.display_config,
-
-            counted_bags=(
-                self.counter.last_counted_bags
-            ),
-
-            # Condition A
-            jam_result=self.jam_result,
-
-            jam_roi=self.jam_roi,
-
-            # Condition B
-            spacing_result=self.spacing_result,
-
-            spacing_roi=self.spacing_roi,
-
-            # Final A OR B
-            final_jam_result=(
-                self.final_jam_result
-            ),
-
-            condition_c_result=(
-                self.condition_c_result
-            ),
-
-            condition_c_roi=(
-                self.condition_c_roi
-            ),
-        )
-
-    # ======================================================
-    # DISPLAY
-    # ======================================================
-
-    def publish(
-        self,
-    ):
-
-        frame = self.get_latest_frame()
-
-        if frame is None:
-            return
-
-        cv2.imshow(
-            self.window_name,
-            frame,
-        )
-
-    # ======================================================
-    # FRAME STORAGE
-    # ======================================================
-
-    def _set_latest_frame(
-        self,
-        frame,
-    ):
-
-        with self._frame_lock:
-
-            self._latest_frame = (
-
-                frame.copy()
-
-                if frame is not None
-
-                else None
-            )
-
-    def get_latest_frame(
-        self,
-    ):
-
-        with self._frame_lock:
-
-            return (
-
-                self._latest_frame.copy()
-
-                if self._latest_frame is not None
-
-                else None
-            )
-
-    def _get_latest_frame(
-        self,
-    ):
-
-        return self.get_latest_frame()
-
-    # ======================================================
-    # FPS
-    # ======================================================
-
-    def calculate_fps(
-        self,
-    ):
-
-        current_time = (
-            time.perf_counter()
-        )
-
-        elapsed = max(
-            current_time
-            -
-            self.previous_time,
-            1e-6,
-        )
-
-        self.previous_time = (
-            current_time
-        )
-
-        return (
-            1.0
-            /
-            elapsed
-        )
-
-    # ======================================================
-    # RELEASE
-    # ======================================================
-
-    def release(
-        self,
-    ):
-
-        try:
-
-            self.camera.release()
-
-        except Exception:
-
-            self.logger.warning(
-                f"{self.name}: camera release failed."
-            )
-
-        self.connected = False
-
-        # ----------------------------------------------
-        # Reset Condition A
-        # ----------------------------------------------
-
-        try:
-
-            self.jam_detector.reset()
-
-            self.jam_result = (
-                self.jam_detector._empty_result()
-            )
-
-        except Exception:
-
-            self.logger.warning(
-                f"{self.name}: JamDetector reset failed."
-            )
-
-        # ----------------------------------------------
-        # Reset Condition B result
-        #
-        # BagSpacingDetector has no temporal jam state.
-        # ----------------------------------------------
-
-        try:
-
-            self.spacing_result = (
-                self.bag_spacing_detector
-                ._empty_result()
-            )
-
-        except Exception:
-
-            self.logger.warning(
-                f"{self.name}: BagSpacingDetector "
-                "reset failed."
-            )
-
-        # ----------------------------------------------
-        # Reset Condition C result
-        #
-        # ROIOccupancyDetector has no temporal jam state.
-        # ----------------------------------------------
-
-        try:
-
-            self.condition_c_result = {
-
-                "jam": False,
-
-                "status": "normal",
-
-                "bag_count": 0,
-
-                "track_ids": [],
-
-                "minimum_gap_mm": None,
-
-                "distances": [],
-
-                "image_path": None,
-            }
-
-            self.condition_c_start_time = None
-
-        except Exception:
-
-            self.logger.warning(
-                f"{self.name}: ROIOccupancyDetector "
-                "reset failed."
-            )
-
-        try:
-
-            self.final_jam_result = (
-                self._build_final_jam_result()
-            )
-
-        except Exception:
-
-            self.final_jam_result = {
-                "status": "disabled",
-                "jam_detected": False,
-                "warning": False,
-                "jam_types": [],
-                "active_jam_count": 0,
-                "active_jam_track_ids": [],
-            }
-
-        with self._frame_lock:
-
-            self._latest_frame = None
-
-    # ======================================================
-    # PUBLISH EVENTS
-    # ======================================================
-
-    def _publish_events(
-        self,
-        count,
-        fps,
-        print_results,
-    ):
-
-        counted_results = (
-            self._update_print_totals()
-        )
-
-        live_print_status = (
-            self._summarize_print_status(
-                print_results
-            )
-        )
-
-        counted_print_status = (
-
-            self._summarize_counted_print_status(
-                counted_results
-            )
-
-            if counted_results
-
-            else None
-        )
-
-        # ==================================================
-        # DASHBOARD
-        # ==================================================
-
-        self._publish_runtime_status(
-
-            fps=fps,
-
-            print_status=live_print_status,
-
-            runtime_status="online",
-
-            frame_processed=True,
-
-            count_event=bool(
-                counted_results
-            ),
-
-            entry_roi_count=(
-                self.entry_roi_counter.total_count
-                if self.entry_roi_counter is not None
-                else 0
-            ),
-        )
-
-        # ==================================================
-        # ELASTICSEARCH CAMERA EVENT
-        # ==================================================
-
-        if self.elasticsearch is not None:
-
-            try:
-
-                self.elasticsearch.create_camera_event(
-                    self.name,
-                    fps,
-                    "online",
-                )
-
-            except Exception:
-
-                self.logger.warning(
-                    f"{self.name}: failed publishing "
-                    "camera event to Elasticsearch."
-                )
-
-        # ==================================================
-        # ELASTICSEARCH PRINT EVENT
-        # ==================================================
-
-        if (
-            self.elasticsearch is not None
-            and
-            counted_print_status
-            in {
-                "printed",
-                "missing",
-            }
-            and
-            counted_print_status
-            != self.last_print_status
-        ):
-
-            try:
-
-                self.elasticsearch.create_print_event(
-
-                    self.name,
-
-                    counted_print_status
-                    == "printed",
-                )
-
-            except Exception:
-
-                self.logger.warning(
-                    f"{self.name}: failed publishing "
-                    "print event to Elasticsearch."
-                )
-
-            # ==================================================
-            # SQL SERVER PRINT EVENT
-            # ==================================================
-
-            try:
-
-                save_print_event(
-                    camera_id=self.name,
-                    result=counted_print_status,
-                    timestamp=None,
-                    metadata={
-                        "print_present": (
-                            counted_print_status == "printed"
-                        ),
-                    },
-                )
-
-            except Exception as e:
-
-                self.logger.error(
-                    f"{self.name}: failed saving "
-                    f"print event to SQL Server: {e}"
-                )
-
-        # ==================================================
-        # COUNT EVENTS
-        # ==================================================
-
-        for counted_bag in counted_results:
-
-            if self.elasticsearch is not None:
-
-                try:
-
-                    self.elasticsearch.create_count_event(
-
-                        self.name,
-
-                        counted_bag.get(
-                            "total_count",
-                            self.counter.total_count,
-                        ),
-
-                        counted_bag.get(
-                            "center"
-                        ),
-                    )
-
-                except Exception:
-
-                    self.logger.warning(
-                        f"{self.name}: failed publishing "
-                        "count event to Elasticsearch."
-                    )
-
-            # ==================================================
-            # SQL SERVER PRODUCTION EVENT
-            #
-            # Written once, via count_logger.log_count(), which
-            # is the single source of truth for dbo.production_
-            # events (one row per confirmed bag, bag_count=1).
-            #
-            # A duplicate direct save_production_event() call
-            # used to live here as well -- it wrote a SECOND row
-            # per bag with bag_count=self.counter.total_count
-            # (the camera's running total, not a per-event count
-            # of 1), which both double-counted events and put the
-            # wrong value in bag_count. Removed in favor of the
-            # single call below.
-            # ==================================================
-
-            if self.count_logger is not None:
-
-                try:
-
-                    self.count_logger.log_count(
-
-                        camera_name=self.name,
-
-                        total_count=count,
-
-                        track_id=counted_bag.get(
-                            "track_id"
-                        ),
-
-                        center=counted_bag.get(
-                            "center"
-                        ),
-
-                        print_present=counted_bag.get(
-                            "print_present"
-                        ),
-
-                        printed_count=counted_bag.get(
-                            "printed_count"
-                        ),
-
-                        missing_count=counted_bag.get(
-                            "missing_count"
-                        ),
-
-                        print_detection_enabled=(
-                            self.print_detection_enabled
-                        ),
-
-                        # Extra diagnostic fields -- preserved in
-                        # metadata_json (same fields the removed
-                        # direct save_production_event() call used
-                        # to pass as top-level columns).
-                        line_count=self.counter.total_count,
-
-                        frame_roi_count=(
-                            self.entry_roi_counter.total_count
-                            if self.entry_roi_counter is not None
-                            else 0
-                        ),
-
-                        bags_inside_roi=(
-                            len(
-                                getattr(
-                                    self.entry_roi_counter,
-                                    "active_track_ids",
-                                    []
-                                )
-                            )
-                            if self.entry_roi_counter is not None
-                            else 0
-                        ),
-                    )
-
-                except Exception as e:
-
-                    self.logger.exception(
-                        f"{self.name}: failed writing count event: {e}"
-                    )
-
-        self.last_count = count
-
-        if counted_print_status is not None:
-
-            self.last_print_status = (
-                counted_print_status
-            )
-
-    # ======================================================
-    # UPDATE PRINT TOTALS
-    # ======================================================
-
-    def _update_print_totals(
-        self,
-    ):
-
-        counted_results = []
-
-        counted_bags = (
-            self.counter.last_counted_bags
-            or []
-        )
-
-        for counted_bag in counted_bags:
-
-            track_id = counted_bag.get(
-                "track_id"
-            )
-
-            print_present = None
-
-            if self.print_detection_enabled:
-
-                print_present = (
-                    self._classify_print_history(
-                        track_id
-                    )
-                )
-
-                if print_present is True:
-
-                    self.printed_count += 1
-
-                elif print_present is False:
-
-                    self.missing_count += 1
-
-            result = dict(
-                counted_bag
-            )
 
             result[
-                "print_present"
-            ] = print_present
+                `Camera ${index}`
+            ] =
+                getJamCameraSummary(
+                    camera
+                );
+        }
 
-            result[
-                "printed_count"
-            ] = self.printed_count
 
-            result[
-                "missing_count"
-            ] = self.missing_count
-
-            counted_results.append(
+        console.table(
+            Object.entries(
                 result
             )
+                .map(
+                    (
+                        [
+                            camera,
+                            value
+                        ]
+                    ) => ({
 
-            if track_id is not None:
+                        camera,
 
-                self.track_print_votes.pop(
-                    track_id,
-                    None,
+                        enabled:
+                            value.enabled,
+
+                        status:
+                            value.status,
+
+                        activeJams:
+                            value.activeCount,
+
+                        trackIds:
+                            value.trackIds.join(
+                                ", "
+                            )
+                    })
                 )
+        );
 
-                self.track_print_last_seen.pop(
-                    track_id,
-                    None,
+
+        return result;
+    },
+
+
+    /* ------------------------------------------------------
+       INDIVIDUAL CAMERA JAM TRACKS
+       ------------------------------------------------------ */
+
+    jamTracks(
+        cameraIndex = 1
+    ) {
+
+        const index =
+            Math.min(
+                CAMERA_COUNT,
+                Math.max(
+                    1,
+                    Math.round(
+                        safeNumber(
+                            cameraIndex,
+                            1
+                        )
+                    )
                 )
+            );
 
-        return counted_results
 
-    # ======================================================
-    # SUMMARIZE LIVE PRINT STATUS
-    # ======================================================
+        const camera =
+            findCameraByIndex(
 
-    def _summarize_print_status(
-        self,
-        print_results,
-    ):
+                appState
+                    .dashboardState
+                    ?.cameras
+                || {},
 
-        if not self.print_detection_enabled:
+                index
+            );
 
-            return "disabled"
 
-        if not print_results:
+        const tracks =
+            getJamTracks(
+                camera
+            );
 
-            return "unknown"
 
-        statuses = []
+        console.table(
+            tracks.map(
+                track => ({
 
-        for result in print_results:
+                    trackId:
+                        getJamTrackId(
+                            track
+                        ),
 
-            value = result.get(
-                "print_present"
+                    status:
+                        getJamTrackState(
+                            track
+                        ),
+
+                    speedPxS:
+                        getJamTrackSpeed(
+                            track
+                        ),
+
+                    distancePx:
+                        getJamTrackDistance(
+                            track
+                        ),
+
+                    stationarySeconds:
+                        getJamTrackStationaryTime(
+                            track
+                        )
+                })
             )
+        );
 
-            if value is True:
 
-                statuses.append(
-                    "printed"
-                )
+        return tracks;
+    },
 
-            elif value is False:
 
-                statuses.append(
-                    "missing"
-                )
+    /* ------------------------------------------------------
+       FORCE BACKEND REFRESH
+       ------------------------------------------------------ */
 
-        if not statuses:
+    async refresh() {
 
-            return "unknown"
+        return await loadDashboardState();
+    },
 
-        if "missing" in statuses:
 
-            return "missing"
+    /* ------------------------------------------------------
+       FORCE JAM UI REFRESH
+       ------------------------------------------------------ */
 
-        return "printed"
+    refreshJams() {
 
-    # ======================================================
-    # SUMMARIZE COUNTED PRINT STATUS
-    # ======================================================
+        return refreshJamPage();
+    },
 
-    @staticmethod
-    def _summarize_counted_print_status(
-        counted_results,
-    ):
 
-        if not counted_results:
-            return None
+    /* ------------------------------------------------------
+       JAM DIAGNOSTICS
+       ------------------------------------------------------ */
 
-        statuses = []
+    diagnostics() {
 
-        for result in counted_results:
+        logJamDiagnostics();
+    },
 
-            value = result.get(
-                "print_present"
-            )
 
-            if value is True:
+    /* ------------------------------------------------------
+       JAM SYSTEM SUMMARY
+       ------------------------------------------------------ */
 
-                statuses.append(
-                    "printed"
-                )
+    jamSummary() {
 
-            elif value is False:
+        return getJamSystemSummary(
 
-                statuses.append(
-                    "missing"
-                )
+            appState
+                .dashboardState
+                ?.cameras
+            || {}
+        );
+    }
+};
 
-            else:
 
-                statuses.append(
-                    "unknown"
-                )
-
-        if "missing" in statuses:
-
-            return "missing"
-
-        if "printed" in statuses:
-
-            return "printed"
-
-        return "unknown"
-
-    # ======================================================
-    # PUBLISH RUNTIME STATUS
-    # ======================================================
-
-    def _publish_runtime_status(
-        self,
-        fps,
-        print_status,
-        runtime_status=None,
-        force=False,
-        frame_processed=False,
-        count_event=False,
-        entry_roi_count=None,
-    ):
-
-        if self.dashboard_state is None:
-            return
-
-        current_time = (
-            time.monotonic()
-        )
-
-        if (
-            not force
-            and
-            not count_event
-            and
-            (
-                current_time
-                -
-                self.last_dashboard_publish_time
-            )
-            <
-            self.dashboard_publish_interval
-        ):
-
-            return
-
-        self.last_dashboard_publish_time = (
-            current_time
-        )
-
-        now_iso = (
-            datetime.now(
-                timezone.utc
-            )
-            .isoformat()
-        )
-
-        runtime_status = (
-            runtime_status
-            or
-            (
-                "online"
-                if self.connected
-                else "offline"
-            )
-        )
-
-        # ==================================================
-        # CONDITION A
-        # ==================================================
-
-        movement = (
-            self.jam_result
-            if isinstance(
-                self.jam_result,
-                dict,
-            )
-            else {}
-        )
-
-        movement_status = (
-            movement.get(
-                "status",
-                "normal",
-            )
-            if self.jam_detection_enabled
-            else "disabled"
-        )
-
-        movement_detected = bool(
-            movement.get(
-                "jam_detected",
-                False,
-            )
-        )
-
-        movement_warning = bool(
-            movement.get(
-                "warning",
-                False,
-            )
-        )
-
-        movement_ids = (
-            movement.get(
-                "active_jam_track_ids",
-                [],
-            )
-            or []
-        )
-
-        movement_tracks = (
-            movement.get(
-                "tracks",
-                [],
-            )
-            or []
-        )
-
-        # ==================================================
-        # CONDITION B
-        # ==================================================
-
-        spacing = (
-            self.spacing_result
-            if isinstance(
-                self.spacing_result,
-                dict,
-            )
-            else {}
-        )
-
-        spacing_status = (
-            spacing.get(
-                "status",
-                "normal",
-            )
-            if self.bag_spacing_enabled
-            else "disabled"
-        )
-
-        spacing_detected = bool(
-            spacing.get(
-                "jam_detected",
-                False,
-            )
-        )
-
-        spacing_pairs = (
-            spacing.get(
-                "pairs",
-                [],
-            )
-            or []
-        )
-
-        spacing_jam_pairs = (
-            spacing.get(
-                "jam_pairs",
-                [],
-            )
-            or []
-        )
-
-        spacing_ids = (
-            spacing.get(
-                "active_jam_track_ids",
-                [],
-            )
-            or []
-        )
-
-        minimum_gap_mm = (
-            spacing.get(
-                "minimum_gap_mm"
-            )
-        )
-
-        spacing_threshold_mm = (
-            spacing.get(
-                "threshold_mm",
-                self.bag_spacing_detector
-                .jam_threshold_mm,
-            )
-        )
-
-        # ==================================================
-        # CONDITION C
-        #
-        # ROI Occupancy Detector
-        #
-        # Publishes:
-        # - ROI Bag Count
-        # - Track IDs
-        # - Minimum Gap
-        # - Distances
-        # - ROI Image
-        # - ROI Coordinates
-        # - Max Allowed Bags / Occupancy %
-        # - Jam Timestamp / Duration
-        # ==================================================
-
-        condition_c = self._condition_c()
-
-        condition_c_status = (
-            condition_c.get(
-                "status",
-                "normal",
-            )
-            if self.condition_c_enabled
-            else "disabled"
-        )
-
-        condition_c_max_allowed_bags = (
-            self.condition_c_detector.max_allowed_bags
-        )
-
-        condition_c_roi_occupancy = (
-            condition_c.get(
-                "bag_count",
-                0,
-            )
-            /
-            condition_c_max_allowed_bags
-            if condition_c_max_allowed_bags
-            else 0
-        )
-
-        condition_c_timestamp = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-            if condition_c.get(
-                "jam",
-                False,
-            )
-            else None
-        )
-
-        condition_c_duration = (
-            round(
-                time.perf_counter()
-                -
-                self.condition_c_start_time,
-                1,
-            )
-            if self.condition_c_start_time is not None
-            else 0
-        )
-
-        # ==================================================
-        # FINAL A OR B
-        # ==================================================
-
-        final_jam = (
-            self.final_jam_result
-            if isinstance(
-                self.final_jam_result,
-                dict,
-            )
-            else {}
-        )
-
-        final_status = (
-            final_jam.get(
-                "status",
-                "normal",
-            )
-        )
-
-        final_detected = bool(
-            final_jam.get(
-                "jam_detected",
-                False,
-            )
-        )
-
-        final_warning = bool(
-            final_jam.get(
-                "warning",
-                False,
-            )
-        )
-
-        final_ids = (
-            final_jam.get(
-                "active_jam_track_ids",
-                [],
-            )
-            or []
-        )
-
-        final_types = (
-            final_jam.get(
-                "jam_types",
-                [],
-            )
-            or []
-        )
-
-        # ==================================================
-        # ENTRY ROI STATE
-        # ==================================================
-
-        entry_roi_state = (
-            self._get_entry_roi_state()
-        )
-
-        try:
-
-            self.dashboard_state.update_camera(
-
-                camera_name=self.name,
-
-                count=self.counter.total_count,
-
-                total_count=(
-                    self.counter.total_count
-                ),
-
-                # ==========================================
-                # ENTRY ROI COUNT
-                # ==========================================
-
-                entry_roi_count=(
-                    entry_roi_count
-                    if entry_roi_count is not None
-                    else (
-                        self.entry_roi_counter.total_count
-                        if self.entry_roi_counter is not None
-                        else 0
-                    )
-                ),
-
-                entry_roi_active_count=(
-                    entry_roi_state["count"]
-                ),
-
-                entry_roi_active_track_ids=(
-                    entry_roi_state["track_ids"]
-                ),
-
-                entry_roi_active_bags=(
-                    entry_roi_state["bags"]
-                ),
-
-                entry_roi=(
-                    self.entry_roi_counter.roi
-                    if self.entry_roi_counter is not None
-                    else None
-                ),
-
-                fps=fps,
-
-                status=runtime_status,
-
-                print_status=print_status,
-
-                printed_count=self.printed_count,
-
-                missing_count=self.missing_count,
-
-                printed_bags_count=(
-                    self.printed_count
-                ),
-
-                not_printed_bags_count=(
-                    self.missing_count
-                ),
-
-                print_detection_enabled=(
-                    self.print_detection_enabled
-                ),
-
-                frame_count=(
-                    self.processed_frame_count
-                ),
-
-                last_frame_at=(
-                    now_iso
-                    if frame_processed
-                    else None
-                ),
-
-                last_count_at=(
-                    now_iso
-                    if count_event
-                    else None
-                ),
-
-                last_error=(
-                    self.last_error
-                    if self.last_error
-                    else ""
-                ),
-
-                # ==========================================
-                # CONDITION A
-                # ==========================================
-
-                movement_jam_enabled=(
-                    self.jam_detection_enabled
-                ),
-
-                movement_jam_status=(
-                    movement_status
-                ),
-
-                movement_jam_detected=(
-                    movement_detected
-                ),
-
-                movement_jam_warning=(
-                    movement_warning
-                ),
-
-                movement_jam_track_ids=(
-                    movement_ids
-                ),
-
-                movement_jam_tracks=(
-                    movement_tracks
-                ),
-
-                # ==========================================
-                # CONDITION B
-                # ==========================================
-
-                spacing_detection_enabled=(
-                    self.bag_spacing_enabled
-                ),
-
-                spacing_status=(
-                    spacing_status
-                ),
-
-                spacing_jam_detected=(
-                    spacing_detected
-                ),
-
-                spacing_threshold_mm=(
-                    spacing_threshold_mm
-                ),
-
-                minimum_gap_mm=(
-                    minimum_gap_mm
-                ),
-
-                spacing_pairs=(
-                    spacing_pairs
-                ),
-
-                spacing_jam_pairs=(
-                    spacing_jam_pairs
-                ),
-
-                spacing_jam_track_ids=(
-                    spacing_ids
-                ),
-
-                # ==========================================
-                # CONDITION C
-                #
-                # ROI Occupancy Detector
-                #
-                # Publishes:
-                # - ROI Bag Count
-                # - Track IDs
-                # - Minimum Gap
-                # - Distances
-                # - ROI Image
-                # - ROI Coordinates
-                # - Max Allowed Bags / Occupancy %
-                # - Jam Timestamp / Duration
-                # ==========================================
-
-                condition_c_enabled=(
-                    self.condition_c_enabled
-                ),
-
-                condition_c_status=(
-                    condition_c_status
-                ),
-
-                condition_c_detected=(
-                    condition_c.get(
-                        "jam",
-                        False,
-                    )
-                ),
-
-                condition_c_bag_count=(
-                    condition_c.get(
-                        "bag_count",
-                        0,
-                    )
-                ),
-
-                condition_c_track_ids=(
-                    condition_c.get(
-                        "track_ids",
-                        [],
-                    )
-                ),
-
-                condition_c_minimum_gap_mm=(
-                    condition_c.get(
-                        "minimum_gap_mm"
-                    )
-                ),
-
-                condition_c_distances=(
-                    condition_c.get(
-                        "distances",
-                        [],
-                    )
-                ),
-
-                condition_c_image_path=(
-                    condition_c.get(
-                        "image_path"
-                    )
-                ),
-
-                condition_c_roi=(
-                    self.condition_c_roi
-                ),
-
-                condition_c_max_allowed_bags=(
-                    condition_c_max_allowed_bags
-                ),
-
-                condition_c_roi_occupancy=(
-                    condition_c_roi_occupancy
-                ),
-
-                condition_c_timestamp=(
-                    condition_c_timestamp
-                ),
-
-                condition_c_duration=(
-                    condition_c_duration
-                ),
-
-                # ==========================================
-                # FINAL JAM
-                #
-                # Keep existing field names so dashboard
-                # code remains backward-compatible.
-                # ==========================================
-
-                jam_detection_enabled=bool(
-                    self.jam_detection_enabled
-                    or
-                    self.bag_spacing_enabled
-                    or
-                    self.condition_c_enabled
-                ),
-
-                jam_status=(
-                    final_status
-                ),
-
-                jam_detected=(
-                    final_detected
-                ),
-
-                jam_warning=(
-                    final_warning
-                ),
-
-                jam_types=(
-                    final_types
-                ),
-
-                active_jam_count=len(
-                    final_ids
-                ),
-
-                active_jam_track_ids=(
-                    final_ids
-                ),
-
-                # Preserve old V1 field for compatibility.
-                jam_tracks=(
-                    movement_tracks
-                ),
-            )
-
-        except Exception as error:
-
-            self.logger.warning(
-                f"{self.name}: dashboard runtime "
-                f"update failed: {error}"
-            )
+/* ==========================================================
+   END OF FILE
+   ========================================================== */

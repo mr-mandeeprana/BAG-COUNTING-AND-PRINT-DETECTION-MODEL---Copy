@@ -248,6 +248,22 @@ bag_spacing:
   ignore_motion_jumps: true
 
   # --------------------------------------------------------
+  # STATE DEBOUNCE (HYSTERESIS)
+  # --------------------------------------------------------
+  #
+  # The gap_mm <= threshold decision above is still evaluated
+  # every frame with no timer, exactly as documented -- these
+  # two settings only control how many CONSECUTIVE frames that
+  # raw decision must hold before the reported jam state (and
+  # therefore the SQL jam_events start/end row) actually flips.
+  # This is what stops a bag gliding right at the threshold from
+  # flooding jam_events with many sub-second start/recover rows.
+  #
+  # At 25 fps, 3 frames = ~120ms of confirmation.
+  jam_confirm_frames: 3
+  recovery_confirm_frames: 3
+
+  # --------------------------------------------------------
   # BAG SPACING ROI
   # --------------------------------------------------------
   #
@@ -362,6 +378,14 @@ condition_c:
 
   ignore_unstable_tracks: true
   ignore_motion_jumps: true
+
+  # STATE DEBOUNCE (HYSTERESIS) -- see bag_spacing above for
+  # why this is needed. bag_count flickering by +/-1 right at
+  # max_allowed_bags used to flood jam_events with sub-second
+  # start/recover rows; this requires N consecutive frames of
+  # agreement before the reported jam state flips.
+  jam_confirm_frames: 3
+  recovery_confirm_frames: 3
 
   # Save evidence
   save_roi_image: true

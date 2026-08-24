@@ -93,6 +93,45 @@ class ROIOccupancyDetector:
             0.0,
         )
 
+        # =================================================
+        # STATE DEBOUNCE (HYSTERESIS)
+        # =================================================
+        #
+        # bag_count is a raw per-frame count of tracks whose
+        # center currently falls inside the ROI. Right at the
+        # occupancy boundary (e.g. a bag entering/leaving the
+        # ROI edge, or a single missed detection), this count
+        # can flicker by +/-1 for a frame or two, which used to
+        # flip `jam` true/false every frame and start+end a
+        # jam_events row in SQL Server for each flicker. These
+        # confirm-frame counts require the over/under-threshold
+        # condition to hold for N consecutive frames before the
+        # reported jam state actually changes. Defaults to 1
+        # (no debounce, previous behavior).
+
+        self.jam_confirm_frames = max(
+            int(
+                self.config.get(
+                    "jam_confirm_frames",
+                    1,
+                )
+            ),
+            1,
+        )
+
+        self.recovery_confirm_frames = max(
+            int(
+                self.config.get(
+                    "recovery_confirm_frames",
+                    self.jam_confirm_frames,
+                )
+            ),
+            1,
+        )
+
+        self._pending_jam_state = None
+        self._pending_jam_streak = 0
+
         self.save_roi_image = bool(
             self.config.get(
                 "save_roi_image",
@@ -151,6 +190,46 @@ class ROIOccupancyDetector:
     # =====================================================
     # PROCESS
     # =====================================================
+
+    def _debounce_jam_state(
+        self,
+        raw_jam,
+    ):
+        """
+        Require `jam_confirm_frames` (entering a jam) or
+        `recovery_confirm_frames` (recovering) consecutive
+        frames of agreement with the raw over/under threshold
+        occupancy count before the reported jam state flips.
+        See the STATE DEBOUNCE comment in __init__.
+        """
+
+        if raw_jam == self.previous_jam:
+
+            self._pending_jam_state = None
+            self._pending_jam_streak = 0
+
+            return self.previous_jam
+
+        if self._pending_jam_state == raw_jam:
+            self._pending_jam_streak += 1
+        else:
+            self._pending_jam_state = raw_jam
+            self._pending_jam_streak = 1
+
+        required_streak = (
+            self.jam_confirm_frames
+            if raw_jam
+            else self.recovery_confirm_frames
+        )
+
+        if self._pending_jam_streak >= required_streak:
+
+            self._pending_jam_state = None
+            self._pending_jam_streak = 0
+
+            return raw_jam
+
+        return self.previous_jam
 
     def process(
         self,
@@ -275,11 +354,13 @@ class ROIOccupancyDetector:
             roi_tracks
         )
 
-        jam = (
+        raw_jam = (
             bag_count
             >
             self.max_allowed_bags
         )
+
+        jam = self._debounce_jam_state(raw_jam)
 
         new_jam = (
             jam

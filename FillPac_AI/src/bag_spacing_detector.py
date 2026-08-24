@@ -213,6 +213,60 @@ class BagSpacingDetector:
         )
 
         # ==================================================
+        # STATE DEBOUNCE (HYSTERESIS)
+        # ==================================================
+        #
+        # The raw per-frame decision (edge_gap_mm <= threshold)
+        # is intentionally instantaneous with no timer, as
+        # documented above. But bags gliding right at the
+        # threshold produce a gap measurement that jitters a
+        # few mm frame-to-frame due to detection/tracking noise,
+        # which was flipping jam_detected true/false on
+        # consecutive frames. Each flip is a state TRANSITION to
+        # the pipeline, which starts/ends a SQL jam_events row --
+        # so undebounced jitter was flooding jam_events with
+        # many near-duplicate, sub-second rows for what is
+        # physically a single jam (or no jam at all).
+        #
+        # This does not change the underlying gap_mm decision
+        # rule -- it only requires that decision to be observed
+        # for N consecutive frames before the *reported*
+        # jam_detected flips, exactly like the existing
+        # unstable_frame_threshold pattern used elsewhere in this
+        # codebase for track quality.
+        #
+        # Defaults to 1 (no debounce, old behavior) so existing
+        # deployments are unaffected unless the new keys are set.
+
+        self.jam_confirm_frames = max(
+            int(
+                config.get(
+                    "jam_confirm_frames",
+                    1,
+                )
+            ),
+            1,
+        )
+
+        self.recovery_confirm_frames = max(
+            int(
+                config.get(
+                    "recovery_confirm_frames",
+                    self.jam_confirm_frames,
+                )
+            ),
+            1,
+        )
+
+        # Debounced/reported jam state (what callers see).
+        self._debounced_jam_detected = False
+
+        # Consecutive frames the RAW decision has matched the
+        # candidate state opposite to the currently reported one.
+        self._pending_jam_state = None
+        self._pending_jam_streak = 0
+
+        # ==================================================
         # SPACING ROI
         # ==================================================
 
@@ -1359,6 +1413,56 @@ class BagSpacingDetector:
     # UPDATE
     # ======================================================
 
+    def _debounce_jam_state(
+        self,
+        raw_jam_detected,
+    ):
+        """
+        Turn the instantaneous per-frame gap decision into a
+        stable, hysteresis-filtered jam_detected flag.
+
+        A candidate state opposite to the currently reported one
+        must be observed for `jam_confirm_frames` (going into a
+        jam) or `recovery_confirm_frames` (coming out of one)
+        consecutive frames before the reported state actually
+        flips. This prevents a gap measurement that jitters
+        around the threshold from producing a burst of
+        start/end jam_events rows in SQL Server for what is
+        physically a single event.
+        """
+
+        if raw_jam_detected == self._debounced_jam_detected:
+
+            # Raw decision agrees with what's already reported --
+            # nothing pending, reset any partial streak.
+            self._pending_jam_state = None
+            self._pending_jam_streak = 0
+
+            return self._debounced_jam_detected
+
+        # Raw decision disagrees with the reported state --
+        # accumulate (or start) a streak toward flipping it.
+
+        if self._pending_jam_state == raw_jam_detected:
+            self._pending_jam_streak += 1
+        else:
+            self._pending_jam_state = raw_jam_detected
+            self._pending_jam_streak = 1
+
+        required_streak = (
+            self.jam_confirm_frames
+            if raw_jam_detected
+            else self.recovery_confirm_frames
+        )
+
+        if self._pending_jam_streak >= required_streak:
+
+            self._debounced_jam_detected = raw_jam_detected
+            self._pending_jam_state = None
+            self._pending_jam_streak = 0
+
+        return self._debounced_jam_detected
+
     def update(
         self,
         tracks,
@@ -1527,8 +1631,12 @@ class BagSpacingDetector:
         # FINAL CONDITION B STATE
         # ==================================================
 
-        jam_detected = bool(
+        raw_jam_detected = bool(
             jam_pairs
+        )
+
+        jam_detected = self._debounce_jam_state(
+            raw_jam_detected
         )
 
         status = (
@@ -1698,11 +1806,16 @@ class BagSpacingDetector:
 
         # Condition B has no temporal timer/history.
         #
-        # Reset only clears the latest result.
+        # Reset clears the latest result and any in-progress
+        # debounce streak/state.
 
         self.last_result = (
             self._empty_result()
         )
+
+        self._debounced_jam_detected = False
+        self._pending_jam_state = None
+        self._pending_jam_streak = 0
 
     # ======================================================
     # EMPTY RESULT

@@ -150,6 +150,96 @@ def _insert_and_get_id(
     return int(row[0])
 
 
+def _first_present(d: dict, *keys):
+    for key in keys:
+        if key in d and d[key] is not None:
+            return d[key]
+    return None
+
+
+def _extract_condition_detail(metadata: dict | None) -> dict:
+    """
+    Pull the normalized Condition B/C fields out of a jam/
+    snapshot `metadata` dict, regardless of whether they live
+    under `spacing_result` (Condition B), `condition_c_result`
+    (Condition C), or at the top level already.
+
+    This is what lets start_jam_event()/save_roi_snapshot()
+    populate real SQL columns (bag_count, minimum_gap_mm,
+    occupancy_percent, ...) from the same metadata dict callers
+    already build today -- no pipeline.py call-site changes
+    required. Returns a dict of column_name -> value; missing
+    fields are simply absent (left NULL by the caller's default
+    handling).
+    """
+
+    if not isinstance(metadata, dict):
+        return {}
+
+    # The nested result dict, if any (Condition B/C shape).
+    nested = (
+        metadata.get("condition_c_result")
+        if isinstance(metadata.get("condition_c_result"), dict)
+        else (
+            metadata.get("spacing_result")
+            if isinstance(metadata.get("spacing_result"), dict)
+            else {}
+        )
+    )
+
+    source = {**nested, **{
+        k: v for k, v in metadata.items()
+        if k not in ("condition_c_result", "spacing_result", "jam_result")
+    }}
+
+    roi = source.get("roi") if isinstance(source.get("roi"), dict) else {}
+
+    pairs = (
+        source.get("distances")
+        or source.get("pairs")
+        or source.get("jam_pairs")
+        or []
+    )
+
+    return {
+        "condition_code": metadata.get("condition_code"),
+        "condition_name": metadata.get("condition_name"),
+        "jam_type": metadata.get("jam_type"),
+        "jam_status": source.get("status"),
+        "jam_detected": bool(
+            _first_present(source, "jam_detected", "jam") or False
+        ),
+        "bag_count": _first_present(source, "bag_count"),
+        "pair_count": (
+            source.get("pair_count")
+            if source.get("pair_count") is not None
+            else (len(pairs) if pairs else None)
+        ),
+        "active_jam_count": source.get("active_jam_count"),
+        "minimum_gap_mm": _first_present(
+            source, "minimum_gap_mm", "minimum_safe_gap_mm"
+        ),
+        "average_gap_mm": source.get("average_gap_mm"),
+        "threshold_mm": _first_present(
+            source, "threshold_mm", "spacing_threshold_mm"
+        ),
+        "minimum_safe_gap_mm": source.get("minimum_safe_gap_mm"),
+        "measurement_margin_mm": source.get("measurement_margin_mm"),
+        "max_allowed_bags": source.get("max_allowed_bags"),
+        "occupancy_percent": source.get("occupancy_percent"),
+        "jam_duration": source.get("jam_duration"),
+        "direction": source.get("direction"),
+        "calibrated": source.get("calibrated"),
+        "track_ids": source.get("track_ids"),
+        "roi_x1": roi.get("x1"),
+        "roi_y1": roi.get("y1"),
+        "roi_x2": roi.get("x2"),
+        "roi_y2": roi.get("y2"),
+        "source_event_id": source.get("event_id"),
+        "pairs": pairs,
+    }
+
+
 @_resilient_write("save_production_event")
 def save_production_event(
     camera_id: str,
@@ -258,9 +348,15 @@ def save_roi_snapshot(
 
     timestamp = timestamp or utc_now()
 
+    # Normalized Condition B/C detail, extracted from the same
+    # metadata dict callers already pass -- see
+    # _extract_condition_detail() above. Falls back to all-NULL
+    # for snapshot types that carry no jam detail.
+    detail = _extract_condition_detail(metadata)
+
     with database_connection() as conn:
 
-        return _insert_and_get_id(
+        snapshot_id = _insert_and_get_id(
             conn,
             """
             INSERT INTO roi_snapshots (
@@ -273,10 +369,29 @@ def save_roi_snapshot(
                 height,
                 sha256,
                 metadata_json,
-                created_at
+                created_at,
+                source_event_id,
+                condition_code,
+                condition_name,
+                jam_type,
+                jam_status,
+                jam_detected,
+                bag_count,
+                minimum_gap_mm,
+                average_gap_mm,
+                threshold_mm,
+                max_allowed_bags,
+                occupancy_percent,
+                jam_duration,
+                track_count,
+                track_ids_json,
+                roi_x1,
+                roi_y1,
+                roi_x2,
+                roi_y2
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 camera_id,
@@ -289,8 +404,135 @@ def save_roi_snapshot(
                 sha256,
                 json_string(metadata),
                 utc_now(),
+                (
+                    str(detail.get("source_event_id"))
+                    if detail.get("source_event_id") is not None
+                    else None
+                ),
+                detail.get("condition_code"),
+                detail.get("condition_name"),
+                detail.get("jam_type"),
+                detail.get("jam_status"),
+                detail.get("jam_detected"),
+                detail.get("bag_count"),
+                detail.get("minimum_gap_mm"),
+                detail.get("average_gap_mm"),
+                detail.get("threshold_mm"),
+                detail.get("max_allowed_bags"),
+                detail.get("occupancy_percent"),
+                detail.get("jam_duration"),
+                (
+                    len(detail["track_ids"])
+                    if detail.get("track_ids") is not None
+                    else None
+                ),
+                json_string(detail.get("track_ids")),
+                detail.get("roi_x1"),
+                detail.get("roi_y1"),
+                detail.get("roi_x2"),
+                detail.get("roi_y2"),
             ),
         )
+
+        # Individual bag-pair measurements, if this snapshot's
+        # metadata carried any (Condition C `distances`).
+        pairs = detail.get("pairs") or []
+
+        if pairs:
+            _insert_pair_measurements(
+                conn,
+                camera_id=camera_id,
+                jam_event_id=None,
+                snapshot_id=snapshot_id,
+                pairs=pairs,
+            )
+
+        return snapshot_id
+
+
+def _insert_pair_measurements(
+    conn,
+    camera_id: str,
+    jam_event_id: int | None,
+    snapshot_id: int | None,
+    pairs: list,
+) -> None:
+    """
+    Bulk-insert individual bag-to-bag spacing measurements into
+    dbo.jam_pair_measurements. Best-effort: a malformed pair is
+    skipped rather than aborting the whole batch, since this
+    child data is diagnostic and shouldn't block the parent
+    jam_event/roi_snapshot write.
+    """
+
+    now = utc_now()
+    rows = []
+
+    for pair in pairs:
+
+        if not isinstance(pair, dict):
+            continue
+
+        front_bbox = pair.get("front_bbox")
+        rear_bbox = pair.get("rear_bbox")
+
+        front_center = pair.get("front_center") or [None, None]
+        rear_center = pair.get("rear_center") or [None, None]
+
+        rows.append((
+            jam_event_id,
+            snapshot_id,
+            camera_id,
+            _first_present(pair, "front_track_id", "track1"),
+            _first_present(pair, "rear_track_id", "track2"),
+            _first_present(pair, "distance_mm", "gap_mm", "edge_gap_mm"),
+            pair.get("distance_px"),
+            pair.get("threshold_mm"),
+            pair.get("minimum_safe_gap_mm"),
+            pair.get("measurement_margin_mm"),
+            bool(_first_present(pair, "jam_detected", "is_jam") or False),
+            pair.get("status"),
+            front_center[0] if len(front_center) > 0 else None,
+            front_center[1] if len(front_center) > 1 else None,
+            rear_center[0] if len(rear_center) > 0 else None,
+            rear_center[1] if len(rear_center) > 1 else None,
+            json_string(front_bbox),
+            json_string(rear_bbox),
+            now,
+        ))
+
+    if not rows:
+        return
+
+    cursor = conn.cursor()
+
+    cursor.executemany(
+        """
+        INSERT INTO dbo.jam_pair_measurements (
+            jam_event_id,
+            snapshot_id,
+            camera_id,
+            front_track_id,
+            rear_track_id,
+            distance_mm,
+            distance_px,
+            threshold_mm,
+            minimum_safe_gap_mm,
+            measurement_margin_mm,
+            jam_detected,
+            status,
+            front_center_x,
+            front_center_y,
+            rear_center_x,
+            rear_center_y,
+            front_bbox_json,
+            rear_bbox_json,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
 
 
 def get_recent_production_events(limit: int = 5000) -> list[dict]:
@@ -636,9 +878,16 @@ def start_jam_event(
         or CONDITION_NAMES.get(condition_code)
     )
 
+    # Normalized Condition A/B/C detail extracted from the same
+    # `metadata` dict callers already build -- see
+    # _extract_condition_detail() above. condition_code/name are
+    # passed explicitly by the caller and take priority over
+    # whatever (if anything) is duplicated inside metadata.
+    detail = _extract_condition_detail(metadata)
+
     with database_connection() as conn:
 
-        return _insert_and_get_id(
+        jam_event_id = _insert_and_get_id(
             conn,
             """
             INSERT INTO dbo.jam_events (
@@ -652,10 +901,27 @@ def start_jam_event(
                 reason,
                 roi_snapshot_id,
                 metadata_json,
-                created_at
+                created_at,
+                bag_count,
+                pair_count,
+                active_jam_count,
+                minimum_gap_mm,
+                average_gap_mm,
+                threshold_mm,
+                minimum_safe_gap_mm,
+                measurement_margin_mm,
+                max_allowed_bags,
+                occupancy_percent,
+                jam_duration,
+                direction,
+                calibrated,
+                roi_x1,
+                roi_y1,
+                roi_x2,
+                roi_y2
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 camera_id,
@@ -669,8 +935,38 @@ def start_jam_event(
                 roi_snapshot_id,
                 json_string(metadata),
                 utc_now(),
+                detail.get("bag_count"),
+                detail.get("pair_count"),
+                detail.get("active_jam_count"),
+                detail.get("minimum_gap_mm"),
+                detail.get("average_gap_mm"),
+                detail.get("threshold_mm"),
+                detail.get("minimum_safe_gap_mm"),
+                detail.get("measurement_margin_mm"),
+                detail.get("max_allowed_bags"),
+                detail.get("occupancy_percent"),
+                detail.get("jam_duration"),
+                detail.get("direction"),
+                detail.get("calibrated"),
+                detail.get("roi_x1"),
+                detail.get("roi_y1"),
+                detail.get("roi_x2"),
+                detail.get("roi_y2"),
             ),
         )
+
+        pairs = detail.get("pairs") or []
+
+        if pairs:
+            _insert_pair_measurements(
+                conn,
+                camera_id=camera_id,
+                jam_event_id=jam_event_id,
+                snapshot_id=roi_snapshot_id,
+                pairs=pairs,
+            )
+
+        return jam_event_id
 
 
 @_resilient_write("end_jam_event")

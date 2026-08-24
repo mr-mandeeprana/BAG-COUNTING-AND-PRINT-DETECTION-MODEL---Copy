@@ -2664,6 +2664,62 @@ class Pipeline:
         )
 
     # ======================================================
+    # PRINT VOTE CONFIDENCE
+    # ======================================================
+
+    def _print_vote_confidence(
+        self,
+        track_id,
+    ):
+        """
+        Fraction of this track's recorded print observations
+        that agree with its own final classification -- i.e.
+        how confident the vote history is in whatever
+        _classify_print_history() decided for this track.
+
+        Returns None when there aren't enough observations yet
+        (mirrors _classify_print_history()'s own None case), so
+        callers can tell "no confidence value" apart from a
+        genuine 0.0.
+        """
+
+        votes = (
+            self.track_print_votes.get(
+                track_id,
+                [],
+            )
+        )
+
+        observation_count = len(votes)
+
+        min_print_votes = getattr(
+            self,
+            "min_print_votes",
+            getattr(
+                self,
+                "min_print_observations",
+                1,
+            ),
+        )
+
+        if observation_count < int(min_print_votes):
+            return None
+
+        positive_count = sum(
+            1 for vote in votes if vote
+        )
+
+        ratio = positive_count / max(
+            observation_count, 1
+        )
+
+        # Confidence in whichever side won the vote.
+        return round(
+            max(ratio, 1.0 - ratio),
+            4,
+        )
+
+    # ======================================================
     # FINALIZE PRINT STATUS
     # ======================================================
 
@@ -3120,20 +3176,56 @@ class Pipeline:
                     "print event to Elasticsearch."
                 )
 
-            # ==================================================
-            # SQL SERVER PRINT EVENT
-            # ==================================================
+        # ==================================================
+        # SQL SERVER PRINT EVENTS
+        # ==================================================
+        #
+        # One row per physically counted bag (from
+        # counted_results), each carrying that bag's own
+        # track_id and vote confidence.
+        #
+        # Previously this wrote at most one row per FRAME, only
+        # when the frame's aggregate print status differed from
+        # the previous frame's -- so track_id/confidence were
+        # never available (there's no single track for an
+        # aggregate), multiple bags counted in the same frame
+        # collapsed into a single ambiguous row, and bags whose
+        # status matched the prior frame were silently dropped
+        # entirely (never written at all). Writing one row per
+        # counted bag instead makes print_events line up 1:1
+        # with production_events and gives every row a real
+        # track_id/confidence.
+
+        for counted_bag in counted_results:
+
+            bag_print_present = counted_bag.get(
+                "print_present"
+            )
+
+            if bag_print_present is None:
+                # Not enough print observations to classify --
+                # nothing meaningful to persist for this bag.
+                continue
+
+            bag_result = (
+                "printed"
+                if bag_print_present
+                else "missing"
+            )
 
             try:
 
                 save_print_event(
                     camera_id=self.name,
-                    result=counted_print_status,
+                    result=bag_result,
+                    track_id=counted_bag.get("track_id"),
+                    confidence=counted_bag.get(
+                        "print_confidence"
+                    ),
                     timestamp=None,
                     metadata={
-                        "print_present": (
-                            counted_print_status == "printed"
-                        ),
+                        "print_present": bag_print_present,
+                        "track_id": counted_bag.get("track_id"),
                     },
                 )
 
@@ -3160,7 +3252,11 @@ class Pipeline:
 
                         counted_bag.get(
                             "total_count",
-                            self.counter.total_count,
+                            (
+                                self.entry_roi_counter.total_count
+                                if self.entry_roi_counter is not None
+                                else self.counter.total_count
+                            ),
                         ),
 
                         counted_bag.get(
@@ -3195,11 +3291,37 @@ class Pipeline:
 
                 try:
 
+                    # --------------------------------------------------
+                    # PRODUCTION COUNT SOURCE OF TRUTH
+                    #
+                    # `count` here is the line/crossing counter
+                    # (self.counter), which used to be written as
+                    # total_count/count in the persisted event --
+                    # i.e. the same value already stored separately
+                    # as line_count below. That made the dashboard's
+                    # live count (which reads entry_roi_counter,
+                    # see _publish_runtime_status()) disagree with
+                    # the historical production_events/count_events
+                    # records for the same camera.
+                    #
+                    # ROI entry counting is now the single source of
+                    # truth for the production/total bag count, to
+                    # match what the live dashboard already shows.
+                    # The line counter is kept as line_count, purely
+                    # as a diagnostic/legacy comparison value.
+                    # --------------------------------------------------
+
+                    production_count = (
+                        self.entry_roi_counter.total_count
+                        if self.entry_roi_counter is not None
+                        else count
+                    )
+
                     self.count_logger.log_count(
 
                         camera_name=self.name,
 
-                        total_count=count,
+                        total_count=production_count,
 
                         track_id=counted_bag.get(
                             "track_id"
@@ -3229,6 +3351,13 @@ class Pipeline:
                         # metadata_json (same fields the removed
                         # direct save_production_event() call used
                         # to pass as top-level columns).
+                        #
+                        # roi_count is explicitly named (in addition
+                        # to total_count/count above) so downstream
+                        # consumers don't have to guess which counter
+                        # total_count came from.
+                        roi_count=production_count,
+
                         line_count=self.counter.total_count,
 
                         frame_roi_count=(
@@ -3285,11 +3414,18 @@ class Pipeline:
             )
 
             print_present = None
+            print_confidence = None
 
             if self.print_detection_enabled:
 
                 print_present = (
                     self._classify_print_history(
+                        track_id
+                    )
+                )
+
+                print_confidence = (
+                    self._print_vote_confidence(
                         track_id
                     )
                 )
@@ -3309,6 +3445,10 @@ class Pipeline:
             result[
                 "print_present"
             ] = print_present
+
+            result[
+                "print_confidence"
+            ] = print_confidence
 
             result[
                 "printed_count"

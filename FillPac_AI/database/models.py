@@ -235,6 +235,242 @@ SCHEMA_STATEMENTS = [
     """,
 
     # ======================================================
+    # JAM EVENTS -- normalized condition B/C detail columns
+    #
+    # Previously the only place these values existed was
+    # inside metadata_json (spacing_result / condition_c_result),
+    # which meant every dashboard/report query had to parse
+    # JSON to read something as simple as bag_count or
+    # minimum_gap_mm. These columns are additive (existing rows
+    # simply have NULL until re-written) and metadata_json is
+    # left in place unchanged for full-fidelity/audit purposes.
+    #
+    # IMPORTANT: each column gets its OWN guarded ALTER
+    # statement here, rather than one ALTER ... ADD col1, col2,
+    # ... bundle guarded by a single "does bag_count exist"
+    # check. Some deployments already had a handful of these
+    # columns (e.g. bag_count) from an earlier manual fix; a
+    # single combined guard skipped the ENTIRE statement in
+    # that case, silently leaving the *other* new columns
+    # (pair_count, roi_x1, etc.) missing even though the code
+    # now inserts into them. One guard per column makes this
+    # idempotent no matter which subset already exists.
+    # ======================================================
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'bag_count')
+    BEGIN ALTER TABLE dbo.jam_events ADD bag_count INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'pair_count')
+    BEGIN ALTER TABLE dbo.jam_events ADD pair_count INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'active_jam_count')
+    BEGIN ALTER TABLE dbo.jam_events ADD active_jam_count INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'minimum_gap_mm')
+    BEGIN ALTER TABLE dbo.jam_events ADD minimum_gap_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'average_gap_mm')
+    BEGIN ALTER TABLE dbo.jam_events ADD average_gap_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'threshold_mm')
+    BEGIN ALTER TABLE dbo.jam_events ADD threshold_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'minimum_safe_gap_mm')
+    BEGIN ALTER TABLE dbo.jam_events ADD minimum_safe_gap_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'measurement_margin_mm')
+    BEGIN ALTER TABLE dbo.jam_events ADD measurement_margin_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'max_allowed_bags')
+    BEGIN ALTER TABLE dbo.jam_events ADD max_allowed_bags INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'occupancy_percent')
+    BEGIN ALTER TABLE dbo.jam_events ADD occupancy_percent DECIMAL(10,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'jam_duration')
+    BEGIN ALTER TABLE dbo.jam_events ADD jam_duration DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'direction')
+    BEGIN ALTER TABLE dbo.jam_events ADD direction NVARCHAR(20) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'calibrated')
+    BEGIN ALTER TABLE dbo.jam_events ADD calibrated BIT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'roi_x1')
+    BEGIN ALTER TABLE dbo.jam_events ADD roi_x1 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'roi_y1')
+    BEGIN ALTER TABLE dbo.jam_events ADD roi_y1 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'roi_x2')
+    BEGIN ALTER TABLE dbo.jam_events ADD roi_x2 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'roi_y2')
+    BEGIN ALTER TABLE dbo.jam_events ADD roi_y2 INT NULL; END
+    """,
+
+    # ======================================================
+    # ROI SNAPSHOTS -- normalized JAM-snapshot detail columns
+    #
+    # Condition C snapshots previously carried this same
+    # information only inside metadata_json
+    # (condition_c_result). Kept in sync with the jam_events
+    # columns above so both tables can be queried the same way.
+    # Same one-guard-per-column reasoning as jam_events above.
+    # ======================================================
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'source_event_id')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD source_event_id NVARCHAR(100) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'condition_code')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD condition_code NVARCHAR(20) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'condition_name')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD condition_name NVARCHAR(100) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'jam_type')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD jam_type NVARCHAR(50) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'jam_status')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD jam_status NVARCHAR(30) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'jam_detected')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD jam_detected BIT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'bag_count')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD bag_count INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'minimum_gap_mm')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD minimum_gap_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'average_gap_mm')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD average_gap_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'threshold_mm')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD threshold_mm DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'max_allowed_bags')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD max_allowed_bags INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'occupancy_percent')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD occupancy_percent DECIMAL(10,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'jam_duration')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD jam_duration DECIMAL(12,3) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'track_count')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD track_count INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'track_ids_json')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD track_ids_json NVARCHAR(MAX) NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'roi_x1')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD roi_x1 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'roi_y1')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD roi_y1 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'roi_x2')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD roi_x2 INT NULL; END
+    """,
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'roi_y2')
+    BEGIN ALTER TABLE dbo.roi_snapshots ADD roi_y2 INT NULL; END
+    """,
+
+    # ======================================================
+    # JAM PAIR MEASUREMENTS
+    #
+    # Individual bag-to-bag spacing measurements (Condition B
+    # `distances`/`pairs`/`jam_pairs`, Condition C `distances`).
+    # These are per-event arrays and do not belong flattened
+    # into jam_events/roi_snapshots columns -- one child row
+    # per measured pair instead.
+    # ======================================================
+
+    """
+    IF OBJECT_ID('dbo.jam_pair_measurements', 'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.jam_pair_measurements (
+            id BIGINT IDENTITY(1,1) PRIMARY KEY,
+            jam_event_id BIGINT NULL,
+            snapshot_id BIGINT NULL,
+            camera_id NVARCHAR(100) NOT NULL,
+            front_track_id BIGINT,
+            rear_track_id BIGINT,
+            distance_mm DECIMAL(12,3),
+            distance_px DECIMAL(12,3),
+            threshold_mm DECIMAL(12,3),
+            minimum_safe_gap_mm DECIMAL(12,3),
+            measurement_margin_mm DECIMAL(12,3),
+            jam_detected BIT,
+            status NVARCHAR(30),
+            front_center_x DECIMAL(12,3),
+            front_center_y DECIMAL(12,3),
+            rear_center_x DECIMAL(12,3),
+            rear_center_y DECIMAL(12,3),
+            front_bbox_json NVARCHAR(MAX),
+            rear_bbox_json NVARCHAR(MAX),
+            created_at DATETIMEOFFSET NOT NULL,
+
+            CONSTRAINT FK_pair_jam_event
+                FOREIGN KEY (jam_event_id)
+                REFERENCES dbo.jam_events(id),
+
+            CONSTRAINT FK_pair_snapshot
+                FOREIGN KEY (snapshot_id)
+                REFERENCES dbo.roi_snapshots(id)
+        );
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.jam_pair_measurements', 'U') IS NOT NULL
+       AND NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = 'idx_pair_jam_event'
+              AND object_id = OBJECT_ID('dbo.jam_pair_measurements')
+       )
+    BEGIN
+        CREATE INDEX idx_pair_jam_event
+        ON dbo.jam_pair_measurements(jam_event_id);
+    END
+    """,
+
+    # ======================================================
     # APPLICATION LOGS
     # ======================================================
 

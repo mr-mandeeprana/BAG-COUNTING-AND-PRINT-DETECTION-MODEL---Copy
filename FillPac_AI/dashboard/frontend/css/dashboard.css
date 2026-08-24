@@ -939,6 +939,46 @@ img {
 
 
 /* ==========================================================
+   PRIMARY (LARGER) KPI CARD -- Total Bags counter
+   ========================================================== */
+
+.kpi-card-primary {
+    min-height: 118px;
+
+    grid-column: span 1;
+
+    background:
+        linear-gradient(
+            135deg,
+            var(--surface) 0%,
+            var(--blue-bg) 180%
+        );
+
+    border-color: var(--accent-blue);
+}
+
+.kpi-card-primary .kpi-icon {
+    width: 54px;
+    height: 54px;
+    flex: 0 0 54px;
+    font-size: 22px;
+}
+
+.kpi-value-large {
+    font-size: 34px;
+    line-height: 1;
+}
+
+.kpi-card-primary .kpi-label {
+    font-size: 9px;
+}
+
+.kpi-card-primary .kpi-description {
+    font-size: 8.5px;
+}
+
+
+/* ==========================================================
    GENERAL SECTION CONTAINER
    ========================================================== */
 

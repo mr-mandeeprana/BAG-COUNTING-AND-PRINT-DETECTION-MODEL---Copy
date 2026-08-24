@@ -851,6 +851,34 @@ function initializeNavigation() {
             );
         }
     );
+
+    // ------------------------------------------------------
+    // Overview jam banner "View Jam Monitor" link
+    // ------------------------------------------------------
+
+    document
+        .querySelectorAll(
+            "[data-page-link]"
+        )
+        .forEach(
+            link => {
+
+                link.addEventListener(
+                    "click",
+                    async () => {
+
+                        const page =
+                            link.dataset.pageLink;
+
+                        if (!page) {
+                            return;
+                        }
+
+                        await showPage(page);
+                    }
+                );
+            }
+        );
 }
 
 
@@ -2170,6 +2198,93 @@ function renderJamMonitoring(cameras) {
             activeJamCount
         )
     );
+
+
+    /* ------------------------------------------------------
+       OVERVIEW JAM BANNER (first/dashboard page)
+
+       Same numbers computed above, just rendered a second
+       place. This mirrors the Jam Monitor KPI cards rather
+       than re-deriving them, so the two views can never show
+       different counts for the same underlying camera data.
+       ------------------------------------------------------ */
+
+    setText(
+        "overviewJamActiveCount",
+        formatInteger(activeJamCount)
+    );
+
+    setText(
+        "overviewJamWarningCameras",
+        formatInteger(warningCount)
+    );
+
+    setText(
+        "overviewJamSlowCameras",
+        formatInteger(slowCount)
+    );
+
+    setText(
+        "overviewJamNormalCameras",
+        formatInteger(normalCount)
+    );
+
+    const banner = byId("overviewJamBanner");
+
+    if (banner) {
+
+        const bannerTitle = byId("overviewJamBannerTitle");
+        const bannerSubtitle = byId("overviewJamBannerSubtitle");
+
+        banner.classList.remove(
+            "status-normal",
+            "status-warning",
+            "status-jam"
+        );
+
+        if (activeJamCount > 0) {
+
+            banner.classList.add("status-jam");
+
+            if (bannerTitle) {
+                bannerTitle.textContent =
+                    activeJamCount === 1
+                        ? "1 Active Jam"
+                        : `${activeJamCount} Active Jams`;
+            }
+
+            if (bannerSubtitle) {
+                bannerSubtitle.textContent =
+                    "Immediate attention required";
+            }
+
+        } else if (warningCount > 0 || slowCount > 0) {
+
+            banner.classList.add("status-warning");
+
+            if (bannerTitle) {
+                bannerTitle.textContent = "Reduced Flow Detected";
+            }
+
+            if (bannerSubtitle) {
+                bannerSubtitle.textContent =
+                    "No confirmed jam yet -- monitor closely";
+            }
+
+        } else {
+
+            banner.classList.add("status-normal");
+
+            if (bannerTitle) {
+                bannerTitle.textContent = "No Active Jams";
+            }
+
+            if (bannerSubtitle) {
+                bannerSubtitle.textContent =
+                    "All conveyors running normally";
+            }
+        }
+    }
 }/* ==========================================================
    PRODUCTION
    ========================================================== */
