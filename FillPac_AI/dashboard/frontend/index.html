@@ -18,6 +18,9 @@
     <title>
         FillPac Vision Intelligence Platform
     </title>
+
+    <link rel="icon" type="image/png" href="assets/beumer-icon.png">
+
 <!-- <link rel="stylesheet" href="assets/fontawesome/all.min.css">
 
 <link rel="stylesheet" href="css/dashboard.css">
@@ -43,6 +46,15 @@
     <link
         rel="stylesheet"
         href="css/dashboard.css"
+    >
+
+    <!-- ==================================================
+         LOGIN / AUTH CSS
+         ================================================== -->
+
+    <link
+        rel="stylesheet"
+        href="css/dashboard_auth.css"
     >
 
 
@@ -87,7 +99,7 @@
                 >
 
                     <img
-                        src="assets/Logo-BEUMER-Group.webp"
+                        src="assets/beumer-logo-color.png"
                         alt="BEUMER Group"
                         class="company-logo-img"
                         onerror="this.style.display='none'"
@@ -2914,6 +2926,15 @@
 
 </div>
 
+
+<!-- ==========================================================
+     LOGIN / AUTH JAVASCRIPT
+     (must load before dashboard.js: it guards page access,
+     redirecting to /login if there is no valid session, before
+     any dashboard data is requested)
+     ========================================================== -->
+
+<script src="js/dashboard_auth_themed.js?v=1"></script>
 
 <!-- ==========================================================
      DASHBOARD JAVASCRIPT

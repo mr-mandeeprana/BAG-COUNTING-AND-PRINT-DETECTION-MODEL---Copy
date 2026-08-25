@@ -53,7 +53,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -62,16 +62,26 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+from pydantic import BaseModel
+
 import socketio
 
 from database.repository import (
+    delete_session as db_delete_session,
     get_active_jam_events,
     get_condition_c_events as db_get_condition_c_events,
     get_production_summary,
     get_recent_jam_events,
     get_recent_print_events,
     get_recent_production_events,
+    get_session_user,
     load_dashboard_state,
+    touch_session,
+    verify_user_credentials,
+)
+from database.repository import (
+    create_session as db_create_session,
+    ensure_default_admin_user,
 )
 
 
@@ -1643,6 +1653,136 @@ async def api_info():
 
 
 # ==========================================================
+# LOGIN PAGE
+# ==========================================================
+
+@api.get("/login")
+async def login_page():
+
+    login_file = (
+        FRONTEND_DIR
+        / "login.html"
+    )
+
+    if login_file.exists():
+
+        return FileResponse(
+            login_file,
+            media_type="text/html",
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail="login.html not found in frontend directory.",
+    )
+
+
+# ==========================================================
+# AUTHENTICATION
+#
+# Backs login_themed.html / dashboard_auth_themed.js, which
+# already call these three endpoints:
+#   POST /api/auth/login
+#   GET  /api/auth/verify
+#   POST /api/auth/logout
+#
+# Sessions are opaque tokens stored in SQL Server
+# (dbo.auth_sessions) -- see database/repository.py and
+# database/auth.py. `Depends(get_current_user)` is added to
+# every data-bearing route below so a valid
+# `Authorization: Bearer <token>` header is required to reach
+# it; the static frontend routes ("/", "/login", static
+# assets) stay open since the SPA itself enforces login
+# client-side before it renders anything useful.
+# ==========================================================
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+async def get_current_user(
+    authorization: str | None = Header(default=None),
+) -> dict:
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        logger.info(
+            "get_current_user: rejected request with no/malformed "
+            "Authorization header (got: %r).",
+            authorization,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or malformed Authorization header.",
+        )
+
+    token = authorization.split(" ", 1)[1].strip()
+
+    # get_session_user() logs the specific reason (not found /
+    # expired / deactivated) at INFO level -- check the server
+    # log right after a 401 to see which one fired.
+    user = get_session_user(token)
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired session. Please log in again.",
+        )
+
+    touch_session(token)
+
+    return user
+
+
+@api.post("/api/auth/login")
+async def auth_login(payload: LoginRequest):
+
+    user = verify_user_credentials(
+        payload.username.strip(),
+        payload.password,
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password.",
+        )
+
+    session = db_create_session(user["id"])
+
+    return {
+        "token": session["token"],
+        "expires_at": session["expires_at"],
+        "user_id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+@api.get("/api/auth/verify")
+async def auth_verify(user: dict = Depends(get_current_user)):
+
+    return {
+        "valid": True,
+        "user_id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+@api.post("/api/auth/logout")
+async def auth_logout(
+    authorization: str | None = Header(default=None),
+):
+
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        db_delete_session(token)
+
+    return {"status": "logged out"}
+
+
+# ==========================================================
 # FRONTEND STATIC ASSETS
 #
 # Matches index.html's relative references:
@@ -1853,7 +1993,7 @@ async def health():
 # ==========================================================
 
 @api.get("/state")
-async def state():
+async def state(_user: dict = Depends(get_current_user)):
 
     return (
         await read_dashboard_state()
@@ -1865,7 +2005,7 @@ async def state():
 # ==========================================================
 
 @api.get("/cameras")
-async def cameras():
+async def cameras(_user: dict = Depends(get_current_user)):
 
     snapshot = (
         await read_dashboard_state()
@@ -1886,6 +2026,7 @@ async def cameras():
 )
 async def camera(
     camera_name: str,
+    _user: dict = Depends(get_current_user),
 ):
 
     snapshot = (
@@ -1921,7 +2062,7 @@ async def camera(
 # ==========================================================
 
 @api.get("/production")
-async def production():
+async def production(_user: dict = Depends(get_current_user)):
 
     snapshot = (
         await read_dashboard_state()
@@ -2041,6 +2182,7 @@ async def production():
 @api.get("/production/summary")
 async def production_summary(
     camera_id: str | None = None,
+    _user: dict = Depends(get_current_user),
 ):
 
     try:
@@ -2078,7 +2220,7 @@ async def production_summary(
 # ==========================================================
 
 @api.get("/jams")
-async def jams():
+async def jams(_user: dict = Depends(get_current_user)):
 
     snapshot = (
         await read_dashboard_state()
@@ -2119,7 +2261,7 @@ async def jams():
 # ==========================================================
 
 @api.get("/jams/active")
-async def jams_active():
+async def jams_active(_user: dict = Depends(get_current_user)):
 
     try:
 
@@ -2158,6 +2300,7 @@ async def jams_recent(
     camera_id: str | None = None,
     limit: int = Query(default=100, le=1000),
     hours: int = Query(default=24, le=24 * 30),
+    _user: dict = Depends(get_current_user),
 ):
 
     try:
@@ -2199,6 +2342,7 @@ async def jams_recent(
 async def print_events_recent(
     camera_id: str | None = None,
     limit: int = Query(default=500, le=5000),
+    _user: dict = Depends(get_current_user),
 ):
 
     try:
@@ -2257,6 +2401,7 @@ async def events(
     end: str | None = Query(
         default=None
     ),
+    _user: dict = Depends(get_current_user),
 ):
 
     all_events = (
@@ -2413,7 +2558,7 @@ async def events(
 # ==========================================================
 
 @api.get("/events/export")
-async def export_events():
+async def export_events(_user: dict = Depends(get_current_user)):
 
     events_data = (
         await read_count_events()
@@ -2507,7 +2652,7 @@ async def export_events():
 # ==========================================================
 
 @api.get("/analytics")
-async def analytics():
+async def analytics(_user: dict = Depends(get_current_user)):
 
     events_data = (
         await read_count_events()
@@ -2950,7 +3095,7 @@ async def analytics():
 # ==========================================================
 
 @api.get("/config")
-async def config():
+async def config(_user: dict = Depends(get_current_user)):
 
     return (
         read_safe_config()
@@ -3271,9 +3416,30 @@ async def connect(
     auth=None,
 ):
 
+    token = (auth or {}).get("token") if isinstance(auth, dict) else None
+
+    user = (
+        await asyncio.to_thread(get_session_user, token)
+        if token
+        else None
+    )
+
+    if user is None:
+        logger.warning(
+            "Rejected Socket.IO connection %s: missing/invalid "
+            "auth token.",
+            sid,
+        )
+        raise socketio.exceptions.ConnectionRefusedError(
+            "Unauthorized"
+        )
+
+    await asyncio.to_thread(touch_session, token)
+
     logger.info(
-        "Dashboard connected: %s",
+        "Dashboard connected: %s (user=%s)",
         sid,
+        user["username"],
     )
 
     snapshot = (
@@ -3419,6 +3585,18 @@ async def startup_event():
         FRONTEND_DIR,
         index_file.exists(),
     )
+
+    # Ensure there is at least one login account so the
+    # dashboard isn't locked out on a fresh SQL Server database.
+    # No-ops once any user exists.
+    try:
+        await asyncio.to_thread(ensure_default_admin_user)
+    except Exception:
+        logger.exception(
+            "Could not ensure a default admin user exists "
+            "(SQL Server may be unreachable at startup -- "
+            "login will not work until this succeeds)."
+        )
 
     api.state.dashboard_watcher = (
         asyncio.create_task(

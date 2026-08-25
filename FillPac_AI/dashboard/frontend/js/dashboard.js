@@ -12,7 +12,7 @@ Dashboard Frontend
    CONFIGURATION
    ========================================================== */
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = window.location.origin;
 
 const REFRESH_INTERVAL_MS = 5000;
 
@@ -782,19 +782,65 @@ function updateAnalyticsShiftChart(byShift) {
    API
    ========================================================== */
 
+// Set the moment we get a 401 and decide to redirect. Every
+// in-flight interval/handler (state refresh, production refresh,
+// visibility-change refresh, etc.) checks this before hitting the
+// network again, so a rejected session logs ONE 401 and then waits
+// for navigation instead of hammering the API (and the console)
+// every REFRESH_INTERVAL_MS until the browser finally unloads the
+// page -- which is what was happening before.
+let authRedirectInProgress = false;
+
 async function apiFetch(
     path,
     options = {}
 ) {
+
+    if (authRedirectInProgress) {
+        throw new Error(`Skipped ${path}: session invalid, redirecting to login`);
+    }
+
+    const token =
+        localStorage.getItem("fillpac_auth_token") ||
+        sessionStorage.getItem("fillpac_auth_token");
+
+    const headers = {
+        ...(options.headers || {}),
+        ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+    };
 
     const response =
         await fetch(
             `${API_BASE}${path}`,
             {
                 cache: "no-store",
-                ...options
+                ...options,
+                headers,
             }
         );
+
+    if (response.status === 401) {
+
+        // Session expired/invalid -- clear it and send the
+        // user back to the login page instead of surfacing a
+        // confusing 401 error in the dashboard UI.
+        authRedirectInProgress = true;
+
+        localStorage.removeItem("fillpac_auth_token");
+        localStorage.removeItem("fillpac_user");
+        sessionStorage.removeItem("fillpac_auth_token");
+        sessionStorage.removeItem("fillpac_user");
+
+        console.warn(
+            `Session rejected by server on ${path} -- ` +
+            "redirecting to login instead of retrying."
+        );
+
+        window.location.href =
+            "/login?redirect=" + encodeURIComponent(window.location.href);
+
+        throw new Error(`HTTP 401: ${path}`);
+    }
 
     if (!response.ok) {
 
@@ -4253,13 +4299,25 @@ function initializeSocket() {
 
     try {
 
-        const API_BASE =
-    "http://127.0.0.1:8000";
+        const token =
+            localStorage.getItem("fillpac_auth_token") ||
+            sessionStorage.getItem("fillpac_auth_token");
+
+        if (!token) {
+            console.warn(
+                "No auth token available; skipping Socket.IO connection."
+            );
+            return;
+        }
 
 appState.socket =
     io(
         API_BASE,
         {
+            auth: {
+                token: token,
+            },
+
             transports: [
                 "websocket",
                 "polling"
@@ -4280,6 +4338,21 @@ appState.socket =
                 10000
         }
     );
+
+
+        /* --------------------------------------------------
+           CONNECT ERROR (e.g. auth rejected)
+           -------------------------------------------------- */
+
+        appState.socket.on(
+            "connect_error",
+            (error) => {
+                console.error(
+                    "Socket connection error:",
+                    error && error.message
+                );
+            }
+        );
 
 
         /* --------------------------------------------------

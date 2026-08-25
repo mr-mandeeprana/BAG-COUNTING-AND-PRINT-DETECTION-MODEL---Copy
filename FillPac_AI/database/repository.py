@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -8,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from . import auth
 from . import failsafe
 from .connection import database_connection
 from .models import initialize_schema
@@ -127,6 +129,61 @@ def json_string(value: Any) -> str | None:
         ensure_ascii=False,
         default=str,
     )
+
+
+def _event_key(
+    camera_id: str,
+    timestamp: str | None = None,
+    metadata: dict | None = None,
+    *,
+    event_type: str,
+    track_id: int | None = None,
+    condition_code: str | None = None,
+) -> str:
+    """Build a deterministic idempotency key for an event write.
+
+    Priority:
+      1. Explicit event_id/event_key/source_event_id from metadata.
+      2. Stable camera + event type + track/condition + timestamp.
+
+    The key is stored in SQL Server and protected by a filtered UNIQUE
+    index, so a retry (including a failsafe replay) cannot create a
+    second row for the same event.
+    """
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit = (
+        metadata.get("event_key")
+        or metadata.get("event_id")
+        or metadata.get("source_event_id")
+    )
+    if explicit is not None:
+        raw = f"{camera_id}|{event_type}|explicit|{explicit}"
+    else:
+        raw = (
+            f"{camera_id}|{event_type}|"
+            f"track={track_id if track_id is not None else ''}|"
+            f"condition={condition_code or ''}|"
+            f"timestamp={timestamp or ''}"
+        )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _existing_id_by_event_key(conn, table: str, event_key: str) -> int | None:
+    """Return an existing row ID for an idempotency key."""
+    allowed = {
+        "production_events": "production_events",
+        "print_events": "print_events",
+        "roi_snapshots": "roi_snapshots",
+        "jam_events": "jam_events",
+    }
+    table_name = allowed.get(table)
+    if not table_name:
+        raise ValueError(f"Unsupported dedupe table: {table}")
+    row = conn.execute(
+        f"SELECT TOP (1) id FROM dbo.{table_name} WHERE event_key = ?",
+        (event_key,),
+    ).fetchone()
+    return int(row[0]) if row else None
 
 
 def _insert_and_get_id(
@@ -282,35 +339,30 @@ def save_production_event(
 
     timestamp = timestamp or utc_now()
 
+    event_key = _event_key(
+        camera_id, timestamp, metadata, event_type="production",
+        track_id=(metadata or {}).get("track_id"),
+    )
+
     with database_connection() as conn:
+        existing_id = _existing_id_by_event_key(conn, "production_events", event_key)
+        if existing_id is not None:
+            logger.info("Duplicate production event ignored | camera=%s | id=%s", camera_id, existing_id)
+            return existing_id
 
         return _insert_and_get_id(
             conn,
             """
             INSERT INTO production_events (
-                camera_id,
-                timestamp,
-                bag_count,
-                printed_count,
-                unprinted_count,
-                line_count,
-                frame_roi_count,
-                bags_inside_roi,
-                metadata_json
+                camera_id, timestamp, bag_count, printed_count, unprinted_count,
+                line_count, frame_roi_count, bags_inside_roi, metadata_json, event_key
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                camera_id,
-                timestamp,
-                bag_count,
-                printed_count,
-                unprinted_count,
-                line_count,
-                frame_roi_count,
-                bags_inside_roi,
-                json_string(metadata),
+                camera_id, timestamp, bag_count, printed_count, unprinted_count,
+                line_count, frame_roi_count, bags_inside_roi, json_string(metadata), event_key,
             ),
         )
 
@@ -329,30 +381,26 @@ def save_print_event(
 
     timestamp = timestamp or utc_now()
 
+    event_key = _event_key(
+        camera_id, timestamp, metadata, event_type="print", track_id=track_id
+    )
+
     with database_connection() as conn:
+        existing_id = _existing_id_by_event_key(conn, "print_events", event_key)
+        if existing_id is not None:
+            logger.info("Duplicate print event ignored | camera=%s | id=%s", camera_id, existing_id)
+            return existing_id
 
         return _insert_and_get_id(
             conn,
             """
             INSERT INTO print_events (
-                camera_id,
-                timestamp,
-                track_id,
-                result,
-                confidence,
-                metadata_json
+                camera_id, timestamp, track_id, result, confidence, metadata_json, event_key
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                camera_id,
-                timestamp,
-                track_id,
-                result,
-                confidence,
-                json_string(metadata),
-            ),
+            (camera_id, timestamp, track_id, result, confidence, json_string(metadata), event_key),
         )
 
 
@@ -378,8 +426,16 @@ def save_roi_snapshot(
     # _extract_condition_detail() above. Falls back to all-NULL
     # for snapshot types that carry no jam detail.
     detail = _extract_condition_detail(metadata)
+    event_key = _event_key(
+        camera_id, timestamp, metadata, event_type="roi_snapshot",
+        track_id=None, condition_code=detail.get("condition_code"),
+    )
 
     with database_connection() as conn:
+        existing_snapshot_id = _existing_id_by_event_key(conn, "roi_snapshots", event_key)
+        if existing_snapshot_id is not None:
+            logger.info("Duplicate ROI snapshot ignored | camera=%s | id=%s", camera_id, existing_snapshot_id)
+            return existing_snapshot_id
 
         snapshot_id = _insert_and_get_id(
             conn,
@@ -395,6 +451,7 @@ def save_roi_snapshot(
                 sha256,
                 metadata_json,
                 created_at,
+                event_key,
                 source_event_id,
                 condition_code,
                 condition_name,
@@ -416,7 +473,7 @@ def save_roi_snapshot(
                 roi_y2
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 camera_id,
@@ -429,6 +486,7 @@ def save_roi_snapshot(
                 sha256,
                 json_string(metadata),
                 utc_now(),
+                event_key,
                 (
                     str(detail.get("source_event_id"))
                     if detail.get("source_event_id") is not None
@@ -1021,8 +1079,34 @@ def start_jam_event(
     # passed explicitly by the caller and take priority over
     # whatever (if anything) is duplicated inside metadata.
     detail = _extract_condition_detail(metadata)
+    start_time = utc_now()
+    event_key = _event_key(
+        camera_id, start_time, metadata, event_type="jam",
+        condition_code=condition_code,
+    )
 
     with database_connection() as conn:
+        # Hard protection against repeated ACTIVE rows for the same
+        # camera/condition, including concurrent callers.
+        active = conn.execute(
+            """
+            SELECT TOP (1) id
+            FROM dbo.jam_events WITH (UPDLOCK, HOLDLOCK)
+            WHERE camera_id = ? AND condition_code = ? AND status = 'ACTIVE'
+            ORDER BY id DESC
+            """,
+            (camera_id, condition_code),
+        ).fetchone()
+        if active:
+            logger.info(
+                "Duplicate active jam ignored | camera=%s | condition=%s | id=%s",
+                camera_id, condition_code, active[0],
+            )
+            return int(active[0])
+
+        existing_jam_id = _existing_id_by_event_key(conn, "jam_events", event_key)
+        if existing_jam_id is not None:
+            return existing_jam_id
 
         jam_event_id = _insert_and_get_id(
             conn,
@@ -1039,6 +1123,7 @@ def start_jam_event(
                 roi_snapshot_id,
                 metadata_json,
                 created_at,
+                event_key,
                 bag_count,
                 pair_count,
                 active_jam_count,
@@ -1058,11 +1143,11 @@ def start_jam_event(
                 roi_y2
             )
             OUTPUT INSERTED.id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 camera_id,
-                utc_now(),
+                start_time,
                 jam_type,
                 condition_code,
                 condition_name,
@@ -1071,7 +1156,8 @@ def start_jam_event(
                 reason,
                 roi_snapshot_id,
                 json_string(metadata),
-                utc_now(),
+                start_time,
+                event_key,
                 detail.get("bag_count"),
                 detail.get("pair_count"),
                 detail.get("active_jam_count"),
@@ -1672,3 +1758,411 @@ def save_application_log(
                 json_string(metadata),
             ),
         )
+
+# ==========================================================
+# USERS + SESSIONS (LOGIN)
+# ==========================================================
+#
+# Backs the /api/auth/* routes in server.py and the existing
+# login_themed.html / dashboard_auth_themed.js frontend, which
+# already expect:
+#   POST /api/auth/login  -> {token, user_id, username}
+#   GET  /api/auth/verify -> 200 if the Bearer token is valid
+#
+# Passwords and tokens themselves are handled in
+# database/auth.py (stdlib-only PBKDF2 + random tokens); this
+# module is just the SQL Server plumbing around them.
+# ==========================================================
+
+
+def create_user(
+    username: str,
+    password: str,
+    role: str = "operator",
+) -> dict:
+    """
+    Create a new login user. Raises ValueError if the username
+    is already taken or invalid.
+    """
+
+    username = (username or "").strip()
+
+    if not username:
+        raise ValueError("Username must not be empty.")
+
+    if not password or len(password) < 8:
+        raise ValueError(
+            "Password must be at least 8 characters long."
+        )
+
+    password_hash, password_salt = auth.hash_password(password)
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO dbo.users (
+                    username,
+                    password_hash,
+                    password_salt,
+                    role,
+                    is_active,
+                    created_at
+                )
+                OUTPUT INSERTED.id
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    username,
+                    password_hash,
+                    password_salt,
+                    role,
+                    utc_now(),
+                ),
+            )
+
+            user_id = cursor.fetchone()[0]
+
+        except Exception as exc:
+
+            # SQL Server raises a generic driver error for the
+            # UNIQUE constraint on username; surface it as a
+            # clean, catchable ValueError instead.
+            if "UNIQUE" in str(exc).upper() or "2627" in str(exc):
+                raise ValueError(
+                    f"Username '{username}' is already taken."
+                ) from exc
+
+            raise
+
+    return {
+        "id": user_id,
+        "username": username,
+        "role": role,
+    }
+
+
+def get_user_by_username(username: str) -> dict | None:
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT id, username, password_hash, password_salt,
+                   role, is_active
+            FROM dbo.users
+            WHERE username = ?
+            """,
+            (username,),
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "id": row[0],
+            "username": row[1],
+            "password_hash": row[2],
+            "password_salt": row[3],
+            "role": row[4],
+            "is_active": bool(row[5]),
+        }
+
+
+def verify_user_credentials(username: str, password: str) -> dict | None:
+    """
+    Return the user dict (without password fields) if the
+    username/password pair is valid and the account is active,
+    otherwise None. Updates last_login_at on success.
+    """
+
+    user = get_user_by_username(username)
+
+    if user is None or not user["is_active"]:
+        return None
+
+    if not auth.verify_password(
+        password,
+        user["password_hash"],
+        user["password_salt"],
+    ):
+        return None
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "UPDATE dbo.users SET last_login_at = ? WHERE id = ?",
+            (utc_now(), user["id"]),
+        )
+
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+def ensure_default_admin_user(
+    username: str = "admin",
+    password: str = "ChangeMe123!",
+) -> None:
+    """
+    Create a first admin login only if dbo.users is completely
+    empty (fresh install). Never overwrites an existing account.
+    Called once from server.py's startup event.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM dbo.users")
+        user_count = cursor.fetchone()[0]
+
+    if user_count > 0:
+        return
+
+    create_user(username, password, role="admin")
+
+    logger.warning(
+        "No login users existed -- created default admin "
+        "account (username=%s). Log in and change this "
+        "password immediately; anyone with this message can "
+        "read the default password in the code.",
+        username,
+    )
+
+
+# ----------------------------------------------------------
+# SESSIONS
+# ----------------------------------------------------------
+
+def create_session(user_id: int) -> dict:
+    """
+    Start a new login session for user_id. Returns
+    {"token": ..., "expires_at": ...}.
+    """
+
+    token = auth.generate_session_token()
+    now = datetime.now(timezone.utc)
+
+    expires_at = now.timestamp() + (
+        auth.SESSION_LIFETIME_HOURS * 3600
+    )
+    expires_at_iso = datetime.fromtimestamp(
+        expires_at, tz=timezone.utc
+    ).isoformat()
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO dbo.auth_sessions (
+                token, user_id, created_at, expires_at, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                token,
+                user_id,
+                now.isoformat(),
+                expires_at_iso,
+                now.isoformat(),
+            ),
+        )
+
+    return {"token": token, "expires_at": expires_at_iso}
+
+
+def _as_aware_utc(value):
+    """
+    Normalize a value read back from a DATETIMEOFFSET column
+    into an aware UTC datetime, regardless of whether pyodbc
+    (depending on ODBC driver/version) handed it back as
+    timezone-aware or naive. Naive values are assumed to
+    already be UTC, since every DATETIMEOFFSET we write in
+    this module is written as a UTC ISO string.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def get_session_user(token: str) -> dict | None:
+    """
+    Look up the user for a Bearer token. Returns None if the
+    token is missing, unknown, or expired (an expired row is
+    also opportunistically deleted here).
+
+    Every None path logs *why* at DEBUG/INFO level -- a bare 401
+    on the frontend gives no way to tell "token not in DB" apart
+    from "token expired" apart from "account deactivated", so
+    this is the fastest way to diagnose a rejected session from
+    the server log next time it happens.
+    """
+
+    if not token:
+        logger.debug("get_session_user: no token provided.")
+        return None
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT s.expires_at, u.id, u.username, u.role, u.is_active
+            FROM dbo.auth_sessions s
+            JOIN dbo.users u ON u.id = s.user_id
+            WHERE s.token = ?
+            """,
+            (token,),
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            logger.info(
+                "get_session_user: token %s... not found in "
+                "dbo.auth_sessions (never created, already "
+                "deleted/logged-out, or the app server restarted "
+                "against a different database than the one that "
+                "issued it).",
+                token[:8],
+            )
+            return None
+
+        expires_at, user_id, username, role, is_active = row
+
+        expires_at_utc = _as_aware_utc(expires_at)
+
+        now_utc = datetime.now(timezone.utc)
+        expired = expires_at_utc is None or expires_at_utc < now_utc
+
+        if expired:
+            logger.info(
+                "get_session_user: token %s... expired for user_id=%s "
+                "(expires_at=%s, now=%s) -- deleting row.",
+                token[:8], user_id, expires_at_utc, now_utc,
+            )
+            cursor.execute(
+                "DELETE FROM dbo.auth_sessions WHERE token = ?",
+                (token,),
+            )
+            return None
+
+        if not is_active:
+            logger.info(
+                "get_session_user: user_id=%s (username=%s) is "
+                "deactivated (is_active=0) -- deleting session.",
+                user_id, username,
+            )
+            cursor.execute(
+                "DELETE FROM dbo.auth_sessions WHERE token = ?",
+                (token,),
+            )
+            return None
+
+        return {"id": user_id, "username": username, "role": role}
+
+
+def touch_session(token: str) -> None:
+    """
+    Slide a session's expiry forward on active use, so a user
+    working through their shift is never logged out mid-task.
+    Best-effort: failures here should never block the request
+    that triggered them.
+    """
+
+    now = datetime.now(timezone.utc)
+    expires_at_iso = datetime.fromtimestamp(
+        now.timestamp() + (auth.SESSION_LIFETIME_HOURS * 3600),
+        tz=timezone.utc,
+    ).isoformat()
+
+    try:
+        with database_connection() as conn:
+
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE dbo.auth_sessions
+                SET last_seen_at = ?, expires_at = ?
+                WHERE token = ?
+                """,
+                (now.isoformat(), expires_at_iso, token),
+            )
+
+    except Exception:
+        logger.warning(
+            "Could not refresh session expiry (non-fatal).",
+            exc_info=True,
+        )
+
+
+def delete_session(token: str) -> None:
+    """
+    Log out: delete one session token. Safe to call with an
+    already-invalid token.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "DELETE FROM dbo.auth_sessions WHERE token = ?",
+            (token,),
+        )
+
+
+def delete_expired_sessions() -> int:
+    """
+    Housekeeping: remove expired session rows. Safe to call
+    periodically; not required for correctness since
+    get_session_user() also self-cleans on read.
+    """
+
+    initialize_schema()
+
+    with database_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "DELETE FROM dbo.auth_sessions WHERE expires_at < ?",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+        return cursor.rowcount

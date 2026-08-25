@@ -64,7 +64,8 @@ SCHEMA_STATEMENTS = [
             line_count INT NOT NULL DEFAULT 0,
             frame_roi_count INT NOT NULL DEFAULT 0,
             bags_inside_roi INT NOT NULL DEFAULT 0,
-            metadata_json NVARCHAR(MAX)
+            metadata_json NVARCHAR(MAX),
+            event_key NVARCHAR(255) NULL
         );
     END
     """,
@@ -121,7 +122,8 @@ SCHEMA_STATEMENTS = [
             track_id BIGINT,
             result NVARCHAR(50),
             confidence FLOAT,
-            metadata_json NVARCHAR(MAX)
+            metadata_json NVARCHAR(MAX),
+            event_key NVARCHAR(255) NULL
         );
     END
     """,
@@ -144,7 +146,8 @@ SCHEMA_STATEMENTS = [
             height INT,
             sha256 NVARCHAR(128),
             metadata_json NVARCHAR(MAX),
-            created_at DATETIMEOFFSET NOT NULL
+            created_at DATETIMEOFFSET NOT NULL,
+            event_key NVARCHAR(255) NULL
         );
     END
     """,
@@ -178,6 +181,7 @@ SCHEMA_STATEMENTS = [
             roi_snapshot_id BIGINT,
             metadata_json NVARCHAR(MAX),
             created_at DATETIMEOFFSET NOT NULL,
+            event_key NVARCHAR(255) NULL,
 
             CONSTRAINT FK_jam_roi_snapshot
                 FOREIGN KEY (roi_snapshot_id)
@@ -492,6 +496,87 @@ SCHEMA_STATEMENTS = [
     """,
 
     # ======================================================
+    # IDEMPOTENCY / DUPLICATE-PREVENTION KEYS
+    #
+    # Existing deployments are upgraded safely. New event writes
+    # populate event_key and filtered UNIQUE indexes guarantee that
+    # retries/replays cannot create a second row. NULL legacy rows
+    # are intentionally excluded from the unique indexes.
+    # ======================================================
+
+    """
+    IF OBJECT_ID('dbo.production_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.production_events') AND name = 'event_key')
+    BEGIN
+        ALTER TABLE dbo.production_events ADD event_key NVARCHAR(255) NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.print_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.print_events') AND name = 'event_key')
+    BEGIN
+        ALTER TABLE dbo.print_events ADD event_key NVARCHAR(255) NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.roi_snapshots', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.roi_snapshots') AND name = 'event_key')
+    BEGIN
+        ALTER TABLE dbo.roi_snapshots ADD event_key NVARCHAR(255) NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.jam_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jam_events') AND name = 'event_key')
+    BEGIN
+        ALTER TABLE dbo.jam_events ADD event_key NVARCHAR(255) NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.production_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_production_event_key' AND object_id = OBJECT_ID('dbo.production_events'))
+    BEGIN
+        CREATE UNIQUE INDEX UX_production_event_key
+        ON dbo.production_events(event_key)
+        WHERE event_key IS NOT NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.print_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_print_event_key' AND object_id = OBJECT_ID('dbo.print_events'))
+    BEGIN
+        CREATE UNIQUE INDEX UX_print_event_key
+        ON dbo.print_events(event_key)
+        WHERE event_key IS NOT NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.roi_snapshots', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_roi_snapshot_event_key' AND object_id = OBJECT_ID('dbo.roi_snapshots'))
+    BEGIN
+        CREATE UNIQUE INDEX UX_roi_snapshot_event_key
+        ON dbo.roi_snapshots(event_key)
+        WHERE event_key IS NOT NULL;
+    END
+    """,
+
+    """
+    IF OBJECT_ID('dbo.jam_events', 'U') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_jam_event_key' AND object_id = OBJECT_ID('dbo.jam_events'))
+    BEGIN
+        CREATE UNIQUE INDEX UX_jam_event_key
+        ON dbo.jam_events(event_key)
+        WHERE event_key IS NOT NULL;
+    END
+    """,
+
+    # ======================================================
     # INDEXES
     # ======================================================
 
@@ -604,6 +689,76 @@ SCHEMA_STATEMENTS = [
     BEGIN
         CREATE INDEX idx_camera_status
         ON dbo.camera_status(status);
+    END
+    """,
+
+    # ======================================================
+    # USERS (LOGIN)
+    # ======================================================
+
+    """
+    IF OBJECT_ID('dbo.users', 'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.users (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            username NVARCHAR(100) NOT NULL UNIQUE,
+            password_hash NVARCHAR(255) NOT NULL,
+            password_salt NVARCHAR(64) NOT NULL,
+            role NVARCHAR(50) NOT NULL DEFAULT 'operator',
+            is_active BIT NOT NULL DEFAULT 1,
+            created_at DATETIMEOFFSET NOT NULL,
+            last_login_at DATETIMEOFFSET NULL
+        );
+    END
+    """,
+
+    # ======================================================
+    # AUTH SESSIONS (LOGIN TOKENS)
+    #
+    # A logged-in browser holds one of these tokens (sent as
+    # `Authorization: Bearer <token>`). Verifying a request is
+    # just a lookup here instead of decoding a signed token, so
+    # login/logout takes effect immediately and doesn't need any
+    # extra crypto dependency beyond the Python standard library.
+    # ======================================================
+
+    """
+    IF OBJECT_ID('dbo.auth_sessions', 'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.auth_sessions (
+            token NVARCHAR(128) NOT NULL PRIMARY KEY,
+            user_id INT NOT NULL,
+            created_at DATETIMEOFFSET NOT NULL,
+            expires_at DATETIMEOFFSET NOT NULL,
+            last_seen_at DATETIMEOFFSET NOT NULL,
+            CONSTRAINT fk_auth_sessions_user
+                FOREIGN KEY (user_id) REFERENCES dbo.users(id)
+                ON DELETE CASCADE
+        );
+    END
+    """,
+
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.indexes
+        WHERE name = 'idx_auth_sessions_user'
+          AND object_id = OBJECT_ID('dbo.auth_sessions')
+    )
+    BEGIN
+        CREATE INDEX idx_auth_sessions_user
+        ON dbo.auth_sessions(user_id);
+    END
+    """,
+
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.indexes
+        WHERE name = 'idx_auth_sessions_expires'
+          AND object_id = OBJECT_ID('dbo.auth_sessions')
+    )
+    BEGIN
+        CREATE INDEX idx_auth_sessions_expires
+        ON dbo.auth_sessions(expires_at);
     END
     """,
 ]

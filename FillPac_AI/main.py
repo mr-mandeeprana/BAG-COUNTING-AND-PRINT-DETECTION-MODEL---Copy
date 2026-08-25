@@ -27,7 +27,7 @@ Architecture
         +---- Pipeline 1 -----+
         +---- Pipeline 2 -----+
         +---- Pipeline 3 -----+
-        +---- Pipeline 4 -----+
+        +---- Pipeline 4 -----+FillPac_AI/main.py
                   |
                   v
           get_latest_frame()
