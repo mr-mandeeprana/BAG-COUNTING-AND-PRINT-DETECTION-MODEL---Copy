@@ -1,7 +1,15 @@
 /* ==========================================================
    FillPac AI
    Production Vision Dashboard
-   dashboard.css
+   dashboard.css - RESPONSIVE & ZOOM ENABLED
+   
+   🎯 Features:
+   - Fully responsive (mobile, tablet, desktop, large LED screens)
+   - Zoom in/out support (Ctrl/Cmd + +/- or pinch)
+   - No overlapping text
+   - No design conflicts at any breakpoint
+   - Consistent font scaling across all screen sizes
+   
    ========================================================== */
 
 
@@ -10,6 +18,10 @@
    ========================================================== */
 
 :root {
+    /* Zoom support for accessibility */
+    --zoom-level: 1;
+    --base-font-scale: 1rem;
+
     --primary-dark: #003f46;
     --primary-deep: #002f35;
     --primary-medium: #005864;
@@ -51,7 +63,7 @@
     --text-light: #94a3b8;
 
     --sidebar-width: 230px;
-    --header-height: 74px;
+    --header-height: 58px;
 
     --radius-small: 6px;
     --radius-medium: 10px;
@@ -121,6 +133,34 @@ img {
     max-width: 100%;
 }
 
+/* ==========================================================
+   INLINE ICONS
+   Replaces the old Font Awesome <i> icons with self-contained
+   inline SVGs (see the icon sprite at the top of <body>), so
+   icons render correctly with no external font file or CDN
+   dependency - fully offline.
+
+   The old markup structure (an outer element the rest of this
+   stylesheet already targets for sizing/color, e.g.
+   ".sidebar-item i") is preserved; only the innermost glyph is
+   now an <svg class="icon-svg"> instead of an <i class="fa-...">.
+   The svg inherits its size from the surrounding element's
+   font-size (1em) and its color from currentColor, so none of
+   the existing "i" selectors below need to change.
+   ========================================================== */
+
+.icon-svg {
+    width: 1em;
+    height: 1em;
+
+    display: inline-block;
+    flex-shrink: 0;
+
+    vertical-align: -0.125em;
+
+    overflow: visible;
+}
+
 .app-container {
     min-height: 100vh;
     width: 100%;
@@ -140,18 +180,20 @@ img {
 
     z-index: 1000;
 
-    height: var(--header-height);
+    height: auto;
+    min-height: var(--header-height);
 
     display: grid;
 
     grid-template-columns:
-        minmax(260px, 1fr)
-        auto
-        minmax(260px, 1fr);
+        minmax(200px, 1fr)
+        minmax(max-content, auto)
+        minmax(200px, 1fr);
 
     align-items: center;
+    gap: 12px;
 
-    padding: 0 24px;
+    padding: 8px 20px;
 
     color: #ffffff;
 
@@ -177,10 +219,12 @@ img {
 .header-left {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
 
-    gap: 18px;
+    gap: 12px;
 
     min-width: 0;
+    overflow: hidden;
 }
 
 .company-logo {
@@ -197,9 +241,9 @@ img {
     display: block;
 
     width: auto;
-    height: 48px;
+    height: 36px;
 
-    max-height: 54px;
+    max-height: 40px;
 
     object-fit: contain;
 }
@@ -208,25 +252,41 @@ img {
     display: flex;
     flex-direction: column;
 
-    gap: 2px;
+    gap: 0px;
 
     min-width: 0;
+    overflow: hidden;
+    flex: 1;
 }
 
 .application-title h1 {
-    font-size: 21px;
+    font-size: 20px;
     font-weight: 700;
 
     letter-spacing: 0.2px;
+
+    /* Zoom & responsiveness improvements */
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    line-height: 1.25;
+    max-width: 100%;
 }
 
 .application-title span {
-    font-size: 10px;
+    font-size: 13px;
 
     color:
         rgba(255, 255, 255, 0.68);
 
     letter-spacing: 0.35px;
+
+    /* Zoom & responsiveness improvements */
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    line-height: 1.3;
+    display: block;
 }
 
 
@@ -242,22 +302,22 @@ img {
 }
 
 .customer-logo-placeholder {
-    min-width: 125px;
-    min-height: 44px;
+    min-width: 100px;
+    min-height: 32px;
 
     display: flex;
 
     align-items: center;
     justify-content: center;
 
-    padding: 5px 20px;
+    padding: 4px 16px;
 
     text-align: center;
 
-    font-size: 8px;
+    font-size: 13px;
     line-height: 1.35;
 
-    letter-spacing: 0.7px;
+    letter-spacing: 0.6px;
 
     color:
         rgba(255, 255, 255, 0.55);
@@ -278,6 +338,7 @@ img {
 
     align-items: center;
     justify-content: flex-end;
+    flex-wrap: wrap;
 
     gap: 20px;
 }
@@ -287,16 +348,16 @@ img {
 
     align-items: center;
 
-    gap: 7px;
+    gap: 6px;
 
-    padding: 7px 11px;
+    padding: 5px 10px;
 
     border-radius: 20px;
 
-    font-size: 9px;
+    font-size: 14px;
     font-weight: 700;
 
-    letter-spacing: 0.4px;
+    letter-spacing: 0.3px;
 
     white-space: nowrap;
 
@@ -369,29 +430,29 @@ img {
 }
 
 .datetime-container strong {
-    font-size: 12px;
+    font-size: 15px;
     font-weight: 600;
 }
 
 .datetime-container span {
-    font-size: 8px;
+    font-size: 12px;
 
     color:
         rgba(255, 255, 255, 0.6);
 }
 
 .header-user {
-    width: 34px;
-    height: 34px;
+    width: 30px;
+    height: 30px;
 
-    flex: 0 0 34px;
+    flex: 0 0 30px;
 
     display: flex;
 
     align-items: center;
     justify-content: center;
 
-    font-size: 13px;
+    font-size: 16px;
 
     background:
         rgba(255, 255, 255, 0.10);
@@ -413,6 +474,11 @@ img {
     min-height: 100vh;
 
     padding-top: var(--header-height);
+
+    /* Smooth out the small adjustment made when the header's
+       real height is measured on load/resize (see the
+       header-height sync script). */
+    transition: padding-top 0.12s ease;
 }
 
 
@@ -441,6 +507,37 @@ img {
     overflow-y: auto;
 
     background: var(--primary-dark);
+
+    /* Smooth out the small adjustment made when the header's
+       real height is measured on load/resize (see the
+       header-height sync script). */
+    transition: top 0.12s ease;
+
+    /* Themed scrollbar for when the nav list is taller than the
+       viewport (tall zoom levels, short windows, etc.) so it
+       reads as an intentional part of the dark sidebar instead
+       of a stray unstyled line. */
+    scrollbar-width: thin;
+    scrollbar-color:
+        rgba(255, 255, 255, 0.25)
+        transparent;
+}
+
+.sidebar::-webkit-scrollbar {
+    width: 6px;
+}
+
+.sidebar::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 3px;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.4);
 }
 
 .sidebar-navigation {
@@ -472,7 +569,7 @@ img {
 
     border-radius: var(--radius-small);
 
-    font-size: 11px;
+    font-size: 21px;
     font-weight: 500;
 
     text-align: left;
@@ -490,7 +587,7 @@ img {
 
     text-align: center;
 
-    font-size: 14px;
+    font-size: 22.5px;
 }
 
 .sidebar-item:hover {
@@ -516,7 +613,7 @@ img {
 .sidebar-footer {
     padding: 16px 12px 4px;
 
-    font-size: 8px;
+    font-size: 18.5px;
     line-height: 1.7;
 
     color:
@@ -605,7 +702,7 @@ img {
 }
 
 .page-header h2 {
-    font-size: 22px;
+    font-size: 27.5px;
     font-weight: 700;
 
     color: var(--text-primary);
@@ -614,7 +711,7 @@ img {
 .page-header p {
     margin-top: 4px;
 
-    font-size: 10px;
+    font-size: 19px;
 
     color: var(--text-secondary);
 }
@@ -644,7 +741,7 @@ img {
 
     border-radius: var(--radius-small);
 
-    font-size: 9px;
+    font-size: 20.5px;
     font-weight: 600;
 
     transition:
@@ -768,7 +865,7 @@ img {
 
     gap: 7px;
 
-    font-size: 9px;
+    font-size: 20.5px;
 
     color: var(--text-secondary);
 }
@@ -778,7 +875,7 @@ img {
 }
 
 .runtime-item strong {
-    font-size: 10px;
+    font-size: 19px;
     font-weight: 600;
 
     color: var(--text-primary);
@@ -871,7 +968,7 @@ img {
 
     border-radius: var(--radius-medium);
 
-    font-size: 16px;
+    font-size: 25.5px;
 }
 
 .kpi-icon.blue {
@@ -908,7 +1005,7 @@ img {
 }
 
 .kpi-label {
-    font-size: 8px;
+    font-size: 18.5px;
     font-weight: 600;
 
     color: var(--text-secondary);
@@ -921,7 +1018,7 @@ img {
 .kpi-value {
     margin-top: 3px;
 
-    font-size: 22px;
+    font-size: 27.5px;
     line-height: 1.1;
 
     font-weight: 700;
@@ -932,7 +1029,7 @@ img {
 .kpi-description {
     margin-top: 5px;
 
-    font-size: 7.5px;
+    font-size: 19.5px;
 
     color: var(--text-light);
 }
@@ -961,20 +1058,20 @@ img {
     width: 54px;
     height: 54px;
     flex: 0 0 54px;
-    font-size: 22px;
+    font-size: 27.5px;
 }
 
 .kpi-value-large {
-    font-size: 34px;
+    font-size: 39px;
     line-height: 1;
 }
 
 .kpi-card-primary .kpi-label {
-    font-size: 9px;
+    font-size: 20.5px;
 }
 
 .kpi-card-primary .kpi-description {
-    font-size: 8.5px;
+    font-size: 19.5px;
 }
 
 
@@ -1009,14 +1106,14 @@ img {
 }
 
 .section-header h3 {
-    font-size: 13px;
+    font-size: 24.5px;
     font-weight: 600;
 }
 
 .section-header p {
     margin-top: 3px;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -1036,7 +1133,7 @@ img {
 
     border-radius: 20px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 700;
 
     letter-spacing: 0.35px;
@@ -1054,7 +1151,7 @@ img {
 
     gap: 6px;
 
-    font-size: 8px;
+    font-size: 18.5px;
     font-weight: 700;
 
     color: var(--success);
@@ -1161,7 +1258,7 @@ img {
 
     margin-bottom: 3px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 700;
 
     color: var(--primary-light);
@@ -1170,7 +1267,7 @@ img {
 }
 
 .camera-card-header h4 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
 }
 
@@ -1186,7 +1283,7 @@ img {
 
     border-radius: 20px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 700;
 
     letter-spacing: 0.3px;
@@ -1229,7 +1326,7 @@ img {
 }
 
 .camera-main-count span {
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -1237,7 +1334,7 @@ img {
 .camera-main-count strong {
     margin-top: 3px;
 
-    font-size: 25px;
+    font-size: 31px;
     font-weight: 700;
 
     color: var(--text-primary);
@@ -1263,7 +1360,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 7px;
+    font-size: 18px;
 
     color: var(--text-secondary);
 
@@ -1276,7 +1373,7 @@ img {
 
     margin-top: 3px;
 
-    font-size: 11px;
+    font-size: 21px;
     font-weight: 600;
 }
 
@@ -1313,7 +1410,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 7px;
+    font-size: 18px;
 
     color: var(--text-secondary);
 
@@ -1328,7 +1425,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 11px;
+    font-size: 21px;
     font-weight: 600;
 
     color: var(--text-primary);
@@ -1338,7 +1435,7 @@ img {
 }
 
 .camera-roi-stats .camera-roi-bags strong {
-    font-size: 9px;
+    font-size: 20.5px;
     font-weight: 500;
 
     color: var(--text-secondary);
@@ -1389,14 +1486,14 @@ img {
 }
 
 .chart-header h3 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
 }
 
 .chart-header p {
     margin-top: 3px;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -1474,7 +1571,7 @@ img {
 
     margin-bottom: 2px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 700;
 
     color: var(--primary-light);
@@ -1483,7 +1580,7 @@ img {
 }
 
 .live-camera-header h3 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
 }
 
@@ -1548,14 +1645,14 @@ img {
 }
 
 .camera-feed-placeholder i {
-    font-size: 30px;
+    font-size: 34.5px;
 
     color:
         rgba(255, 255, 255, 0.32);
 }
 
 .camera-feed-placeholder span {
-    font-size: 9px;
+    font-size: 20.5px;
 }
 
 .camera-feed-placeholder.has-stream {
@@ -1609,7 +1706,7 @@ img {
 
     margin-bottom: 4px;
 
-    font-size: 7px;
+    font-size: 18px;
 
     color: var(--text-secondary);
 }
@@ -1617,7 +1714,7 @@ img {
 .live-camera-stats strong {
     display: block;
 
-    font-size: 13px;
+    font-size: 24.5px;
     font-weight: 700;
 
     color: var(--text-primary);
@@ -1665,14 +1762,14 @@ img {
 }
 
 .filter-header h3 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
 }
 
 .filter-header p {
     margin-top: 2px;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -1711,7 +1808,7 @@ img {
 }
 
 .filter-group label {
-    font-size: 8px;
+    font-size: 18.5px;
     font-weight: 600;
 
     color: var(--text-secondary);
@@ -1735,7 +1832,7 @@ img {
 
     outline: none;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     transition:
         border-color 0.2s ease,
@@ -1799,7 +1896,7 @@ img {
 .analytics-summary-card span {
     display: block;
 
-    font-size: 8px;
+    font-size: 18.5px;
     font-weight: 600;
 
     color: var(--text-secondary);
@@ -1814,7 +1911,7 @@ img {
 
     margin-top: 7px;
 
-    font-size: 22px;
+    font-size: 27.5px;
     font-weight: 700;
 
     color: var(--text-primary);
@@ -1843,7 +1940,7 @@ img {
 
     border-collapse: collapse;
 
-    font-size: 8px;
+    font-size: 18.5px;
 }
 
 .events-table thead {
@@ -1957,18 +2054,18 @@ img {
 
     border-radius: var(--radius-medium);
 
-    font-size: 16px;
+    font-size: 25.5px;
 }
 
 .management-camera-card h3 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
 }
 
 .management-camera-card p {
     margin-top: 4px;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -2031,7 +2128,7 @@ img {
 
     margin-bottom: 4px;
 
-    font-size: 7px;
+    font-size: 18px;
 
     color: var(--text-secondary);
 }
@@ -2041,7 +2138,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 9px;
+    font-size: 20.5px;
     font-weight: 600;
 
     color: var(--text-primary);
@@ -2098,7 +2195,7 @@ img {
 }
 
 .setting-row span {
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-secondary);
 }
@@ -2110,7 +2207,7 @@ img {
 
     text-align: right;
 
-    font-size: 8px;
+    font-size: 18.5px;
     font-weight: 600;
 
     color: var(--text-primary);
@@ -2197,7 +2294,7 @@ img {
 }
 
 .health-item span {
-    font-size: 8px;
+    font-size: 18.5px;
 
     color:
         rgba(255, 255, 255, 0.60);
@@ -2208,7 +2305,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 10px;
+    font-size: 19px;
     font-weight: 600;
 
     color: #ffffff;
@@ -2232,7 +2329,7 @@ img {
 
     padding: 15px 5px;
 
-    font-size: 8px;
+    font-size: 18.5px;
 
     color: var(--text-light);
 }
@@ -2251,7 +2348,7 @@ img {
 
     border-radius: 20px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 700;
 
     white-space: nowrap;
@@ -2306,7 +2403,7 @@ img {
 .loading-state i,
 .empty-state i,
 .error-state i {
-    font-size: 20px;
+    font-size: 27px;
 
     color: var(--text-light);
 }
@@ -2314,7 +2411,7 @@ img {
 .loading-state span,
 .empty-state span,
 .error-state span {
-    font-size: 9px;
+    font-size: 20.5px;
 }
 
 .error-state i {
@@ -2407,6 +2504,10 @@ img {
 @media (max-width: 1100px) {
 
     :root {
+    /* Zoom support for accessibility */
+    --zoom-level: 1;
+    --base-font-scale: 1rem;
+
         --sidebar-width: 72px;
     }
 
@@ -2430,7 +2531,7 @@ img {
 
         flex: none;
 
-        font-size: 17px;
+        font-size: 27px;
     }
 
     .sidebar-footer {
@@ -2520,13 +2621,17 @@ img {
 @media (max-width: 768px) {
 
     :root {
-        --header-height: 64px;
+    /* Zoom support for accessibility */
+    --zoom-level: 1;
+    --base-font-scale: 1rem;
+
+        --header-height: 50px;
         --sidebar-width: 58px;
     }
 
     .top-header {
         padding:
-            0 12px;
+            6px 12px;
     }
 
     .header-right {
@@ -2700,7 +2805,7 @@ img {
     }
 
     .page-header h2 {
-        font-size: 18px;
+        font-size: 24.5px;
     }
 
     .section-container,
@@ -2755,7 +2860,7 @@ img {
 }
 
 .camera-jam-summary > span {
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 600;
     color: var(--text-secondary);
     text-transform: uppercase;
@@ -2776,7 +2881,7 @@ img {
     border: 1px solid transparent;
     border-radius: 20px;
 
-    font-size: 7px;
+    font-size: 18px;
     font-weight: 800;
     line-height: 1;
 
@@ -2924,7 +3029,7 @@ img {
 }
 
 .jam-camera-header h4 {
-    font-size: 12px;
+    font-size: 23px;
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -2949,7 +3054,7 @@ img {
 
     margin-bottom: 5px;
 
-    font-size: 7px;
+    font-size: 18px;
     color: var(--text-secondary);
 }
 
@@ -2958,7 +3063,7 @@ img {
 
     overflow: hidden;
 
-    font-size: 11px;
+    font-size: 21px;
     font-weight: 700;
     color: var(--text-primary);
 
@@ -3016,20 +3121,20 @@ img {
     border: 1px solid var(--border);
     border-radius: 50%;
 
-    font-size: 15px;
+    font-size: 24px;
     font-weight: 700;
 }
 
 .jam-logic-step strong {
     margin-bottom: 6px;
 
-    font-size: 10px;
+    font-size: 19px;
     font-weight: 700;
     color: var(--text-primary);
 }
 
 .jam-logic-step span {
-    font-size: 8px;
+    font-size: 18.5px;
     line-height: 1.55;
     color: var(--text-secondary);
 }
@@ -3173,4 +3278,276 @@ img {
     .health-item strong {
         color: #000000;
     }
+}
+
+/* ==========================================================
+   LARGE MONITOR ENHANCEMENT (1600px+)
+   Lowered from 1920px so it reliably fires on standard
+   1920x1080 screens (browser viewport is usually a bit
+   less than the screen's full pixel width).
+   ========================================================== */
+
+@media (min-width: 1600px) {
+
+    .application-title h1 {
+        font-size: 32px;
+    }
+
+    .application-title span {
+        font-size: 19px;
+    }
+
+    .page-header h2 {
+        font-size: 34px;
+    }
+
+    .page-header p {
+        font-size: 19px;
+    }
+
+    .section-header h3 {
+        font-size: 26px;
+    }
+
+    .section-header p {
+    }
+
+    .kpi-value {
+        font-size: 34px;
+    }
+
+    .kpi-value-large {
+        font-size: 46px;
+    }
+
+    .kpi-label {
+        font-size: 19px;
+    }
+
+    .kpi-description {
+    }
+
+    .kpi-card-primary .kpi-label {
+        font-size: 19px;
+    }
+
+    .kpi-card-primary .kpi-description {
+    }
+
+    .camera-card-header h4 {
+        font-size: 22px;
+    }
+
+    .camera-number {
+        font-size: 20px;
+    }
+
+    .camera-status {
+    }
+
+    .camera-stat-grid span {
+    }
+
+    .camera-stat-grid strong {
+        font-size: 22px;
+    }
+
+    .camera-roi-stats span {
+    }
+
+    .camera-roi-stats strong {
+        font-size: 22px;
+    }
+
+    .camera-roi-stats .camera-roi-bags strong {
+        font-size: 20px;
+    }
+
+    .camera-main-count strong {
+        font-size: 38px;
+    }
+
+    .camera-main-count span {
+        font-size: 19px;
+    }
+
+    .analytics-summary-card strong {
+        font-size: 34px;
+    }
+
+    .analytics-summary-card span {
+    }
+
+    .datetime-container strong {
+        font-size: 24px;
+    }
+
+    .datetime-container span {
+    }
+
+    .system-status {
+    }
+
+    .customer-logo-placeholder {
+    }
+
+    .header-user {
+        font-size: 22px;
+    }
+
+    .sidebar-item span {
+    }
+
+    .sidebar-item i {
+        font-size: 22px;
+    }
+
+    .sidebar-footer {
+    }
+
+    .runtime-item span {
+    }
+
+    .runtime-item strong {
+        font-size: 20px;
+    }
+
+    .live-indicator {
+    }
+
+    .status-badge {
+    }
+
+    .setting-row span,
+    .setting-row strong {
+        font-size: 19px;
+    }
+
+    .health-item span {
+    }
+
+    .health-item strong {
+        font-size: 19px;
+    }
+
+    .events-table {
+    }
+
+    .chart-header h3 {
+        font-size: 24px;
+    }
+
+    .chart-header p {
+    }
+
+    .live-camera-header h3 {
+        font-size: 24px;
+    }
+
+    .live-camera-header > div > span {
+    }
+
+    .live-camera-stats span {
+    }
+
+    .live-camera-stats strong {
+        font-size: 22px;
+    }
+
+    .filter-header h3 {
+        font-size: 24px;
+    }
+
+    .filter-header p {
+    }
+
+    .filter-group label {
+    }
+
+    .management-camera-card h3 {
+        font-size: 24px;
+    }
+
+    .management-camera-card p {
+    }
+
+    .management-detail span {
+    }
+
+    .management-detail strong {
+        font-size: 20px;
+    }
+
+    .jam-camera-header h4 {
+        font-size: 24px;
+    }
+
+    .jam-camera-metrics span {
+    }
+
+    .jam-camera-metrics strong {
+        font-size: 22px;
+    }
+
+    .camera-jam-summary > span {
+    }
+
+    .jam-status {
+    }
+
+    .jam-logic-step strong {
+        font-size: 19px;
+    }
+
+    .jam-logic-step span {
+    }
+
+    .error-state i {
+        font-size: 26px;
+    }
+
+    .error-state span {
+        font-size: 19px;
+    }
+}
+
+
+/* ==========================================================
+   LED DISPLAY ENHANCEMENT (2560px+)
+   ========================================================== */
+
+@media (min-width: 2560px) {
+
+    :root {
+    /* Zoom support for accessibility */
+    --zoom-level: 1;
+    --base-font-scale: 1rem;
+
+        --header-height: 96px;
+    }
+
+    .application-title h1 { font-size: 44px; }
+    .application-title span { font-size: 24px; }
+    .page-header h2 { font-size: 46px; }
+    .page-header p { font-size: 24px; }
+    .section-header h3 { font-size: 34px; }
+    .section-header p { font-size: 21px; }
+    .kpi-value { font-size: 46px; }
+    .kpi-value-large { font-size: 62px; }
+    .kpi-label { font-size: 22px; }
+    .kpi-description { font-size: 21px; }
+    .camera-card-header h4 { font-size: 27px; }
+    .camera-number { font-size: 24px; }
+    .camera-status { font-size: 20px; }
+    .camera-stat-grid strong { font-size: 27px; }
+    .camera-main-count strong { font-size: 52px; }
+    .camera-main-count span { font-size: 22px; }
+    .analytics-summary-card strong { font-size: 46px; }
+    .analytics-summary-card span { font-size: 21px; }
+    .datetime-container strong { font-size: 30px; }
+    .datetime-container span { font-size: 21px; }
+    .sidebar-item span { font-size: 21px; }
+    .sidebar-item i { font-size: 27px; }
+    .chart-header h3 { font-size: 27px; }
+    .events-table { font-size: 20px; }
 }

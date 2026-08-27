@@ -3531,7 +3531,7 @@ function initializeLiveStreams() {
 
                 feedContainer.innerHTML =
                     `
-                    <i class="fa-solid fa-video-slash"></i>
+                    <svg class="icon-svg" aria-hidden="true"><use href="#icon-video-slash" xlink:href="#icon-video-slash"></use></svg>
                     <span>
                         Live video stream not connected
                     </span>
@@ -3877,7 +3877,7 @@ function renderCameraManagement(data) {
                     <div class="management-camera-title">
 
                         <div class="camera-management-icon">
-                            <i class="fa-solid fa-camera"></i>
+                            <svg class="icon-svg" aria-hidden="true"><use href="#icon-camera" xlink:href="#icon-camera"></use></svg>
                         </div>
 
                         <div>
