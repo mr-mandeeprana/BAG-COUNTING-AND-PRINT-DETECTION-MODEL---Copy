@@ -1,9 +1,7 @@
-/*
-==========================================================
-FillPac AI
-Dashboard Frontend
-==========================================================
-*/
+/* ==========================================================
+   FillPac AI
+   Dashboard Frontend
+   ========================================================== */
 
 "use strict";
 
@@ -17,6 +15,17 @@ const API_BASE = window.location.origin;
 const REFRESH_INTERVAL_MS = 5000;
 
 const CAMERA_COUNT = 4;
+
+/*
+Number of selectable packers shown in the "Packer Running
+Status" selector and the notification packer filter. Only
+Packer 1 is currently installed/configured, so this is set to
+1 - Packers 2-5 have been removed from the UI. If more packers
+are commissioned later, raise this back up and re-add their
+buttons to the #packerSelectorButtons and
+#notificationPackerFilter markup in index.html.
+*/
+const PACKER_COUNT = 1;
 
 
 /* ==========================================================
@@ -45,7 +54,55 @@ const appState = {
 
     production: null,
 
-    cameraConfig: null
+    cameraConfig: null,
+
+    notifications: [],
+
+    /*
+    Session history of generated report PDFs, newest first, so
+    the "Recent Reports" list on the Reports page can offer a
+    re-download without regenerating from scratch. Not persisted
+    across page reloads - just like the rest of appState.
+    */
+    reports: [],
+
+    /*
+    Restructured to track each packer (1..PACKER_COUNT)
+    independently under `packers`, rather than a single global
+    plc/pms/dcs/packer state. This is what lets notifications
+    say "Packer 2 PLC Offline" instead of always assuming there
+    is only one packer.
+    */
+    lastNotificationStates: {
+        cameras: {},
+        packers: {}
+    },
+
+    currentUser: null,
+
+    userRole: "operator",
+
+    cameraViewIndex: 1,
+
+    // Which packer the System Status page and notification
+    // panel are currently focused on (1..PACKER_COUNT).
+    selectedPacker: 1,
+
+    // "all" or a packer index as a string ("1".."5"). Filters
+    // which notifications are shown in the notification panel.
+    notificationPackerFilter: "all",
+
+    productionTrendRangeHours: 8,
+
+    /*
+    0 = "LIVE" (no filter). Tracked here (not just as a CSS
+    "active" class on the button) so the periodic refresh loop
+    can re-apply the selected KPI range after every data refresh
+    - otherwise the live /state poll every 5s was silently
+    overwriting the filtered numbers back to live totals, which
+    is why the range buttons looked like they "weren't working".
+    */
+    kpiRangeHours: 0
 };
 
 
@@ -60,6 +117,28 @@ const PAGE_INFO = {
         subtitle: "Real-time FillPac AI production overview"
     },
 
+    "system-status": {
+        title: "System Status",
+        subtitle: "Real-time system health and component status"
+    },
+
+    reports: {
+        title: "Reports",
+        subtitle: "Production and performance reports"
+    },
+
+    about: {
+        title: "About",
+        subtitle: "FillPac Vision Intelligence Platform information"
+    },
+
+    settings: {
+        title: "Settings",
+        subtitle: "FillPac AI dashboard settings",
+        adminOnly: true
+    },
+
+    // Legacy pages (kept for backward compatibility, but hidden from UI)
     "live-monitor": {
         title: "Live Monitor",
         subtitle: "Real-time camera streams and AI inspection"
@@ -88,12 +167,24 @@ const PAGE_INFO = {
     cameras: {
         title: "Cameras",
         subtitle: "Camera configuration and runtime status"
-    },
-
-    settings: {
-        title: "Settings",
-        subtitle: "FillPac AI dashboard settings"
     }
+};
+
+
+/* ==========================================================
+   REPORT TYPE LABELS
+
+   Human-readable titles for each <option value="..."> in the
+   #reportType select on the Reports page. Used both for the
+   generated PDF's heading and the "Recent Reports" list.
+   ========================================================== */
+
+const REPORT_TYPE_LABELS = {
+    production: "Production Report",
+    print_detection: "Print Detection Report",
+    camera_performance: "Camera Performance Report",
+    system_status: "System Status Report",
+    exception: "Exception / Alert Report"
 };
 
 
@@ -408,10 +499,34 @@ function baseChartOptions(extra = {}) {
 
 function updateProductionTrendChart(hourly) {
 
-    const rows =
+    const fullRows =
         Array.isArray(hourly)
             ? hourly
             : [];
+
+    /*
+    The backend's /analytics endpoint returns hourly buckets for
+    its own default window. Rather than requiring a new backend
+    query parameter (which would need backend changes outside
+    this frontend), the 1/4/8/16/24 HR filter slices the most
+    recent N hourly buckets already returned by the existing
+    pipeline. This keeps full backward compatibility with the
+    existing /analytics response shape.
+    */
+
+    const rangeHours =
+        Math.max(
+            1,
+            safeNumber(
+                appState.productionTrendRangeHours,
+                8
+            )
+        );
+
+    const rows =
+        fullRows.slice(
+            -rangeHours
+        );
 
     const labels =
         rows.map(row => row.hour);
@@ -421,22 +536,39 @@ function updateProductionTrendChart(hourly) {
             row => safeNumber(row.total, 0)
         );
 
+    const printed =
+        rows.map(
+            row => safeNumber(row.printed, 0)
+        );
+
+    /*
+    Changed from a single-series line chart to a grouped column
+    (bar) chart with two series - "Count" (total bags) and
+    "Print" (printed bags) - shown side by side for each hour so
+    both can be compared together at a glance.
+    */
+
     const chart =
         getOrCreateChart(
             "productionChart",
             () => ({
-                type: "line",
+                type: "bar",
                 data: {
                     labels,
                     datasets: [
                         {
-                            label: "Bags produced",
+                            label: "Count",
                             data: totals,
-                            borderColor: CHART_COLORS.blue,
-                            backgroundColor: CHART_COLORS.blueSoft,
-                            fill: true,
-                            tension: 0.35,
-                            pointRadius: 2
+                            backgroundColor: CHART_COLORS.blue,
+                            borderRadius: 4,
+                            maxBarThickness: 28
+                        },
+                        {
+                            label: "Print",
+                            data: printed,
+                            backgroundColor: CHART_COLORS.success,
+                            borderRadius: 4,
+                            maxBarThickness: 28
                         }
                     ]
                 },
@@ -460,8 +592,37 @@ function updateProductionTrendChart(hourly) {
         return;
     }
 
+    /*
+    If an existing chart instance was created before this change
+    (e.g. hot-reload during development) it may still only have
+    one dataset - guard against that instead of assuming index 1
+    always exists.
+    */
+
+    chart.config.type = "bar";
     chart.data.labels = labels;
+    chart.data.datasets[0].label = "Count";
     chart.data.datasets[0].data = totals;
+    chart.data.datasets[0].backgroundColor = CHART_COLORS.blue;
+    chart.data.datasets[0].borderColor = undefined;
+    chart.data.datasets[0].fill = undefined;
+    chart.data.datasets[0].tension = undefined;
+    chart.data.datasets[0].pointRadius = undefined;
+
+    if (chart.data.datasets[1]) {
+        chart.data.datasets[1].label = "Print";
+        chart.data.datasets[1].data = printed;
+        chart.data.datasets[1].backgroundColor = CHART_COLORS.success;
+    } else {
+        chart.data.datasets.push({
+            label: "Print",
+            data: printed,
+            backgroundColor: CHART_COLORS.success,
+            borderRadius: 4,
+            maxBarThickness: 28
+        });
+    }
+
     chart.update();
 }
 
@@ -928,6 +1089,205 @@ function initializeNavigation() {
 }
 
 
+function initializeNotificationSystem() {
+
+    // Load user role to determine feature visibility
+    loadUserRole();
+
+    const notificationBell = byId("notificationBell");
+    const notificationPanel = byId("notificationPanel");
+    const closeNotificationPanel = byId("closeNotificationPanel");
+    const markAllAsReadCheckbox = byId("markAllAsReadCheckbox");
+
+    if (notificationBell && notificationPanel) {
+        notificationBell.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const isVisible = notificationPanel.style.display !== "none";
+            /*
+            Must match the CSS's "display: flex" for .notification-panel
+            (a header/status/filter/list/footer column). Setting this to
+            "block" instead broke that flex layout every time the panel
+            opened, which is why the list's flex:1 + min-height:0 sizing
+            (and therefore its scrollbar) never actually took effect.
+            */
+            notificationPanel.style.display = isVisible ? "none" : "flex";
+
+            // Opening the panel can change the list's available
+            // height (e.g. if the page scrolled since it was last
+            // open), so re-check whether the "more below" hint
+            // should show.
+            if (!isVisible) {
+                refreshNotificationScrollHint();
+            }
+        });
+    }
+
+    // Hide the "more below" hint once the person has scrolled far
+    // enough to see the bottom of the list; show it again if they
+    // scroll back up and there's still more content past the
+    // visible area.
+    const notificationList = byId("notificationList");
+
+    if (notificationList) {
+
+        notificationList.addEventListener(
+            "scroll",
+            refreshNotificationScrollHint
+        );
+    }
+
+    if (closeNotificationPanel) {
+        closeNotificationPanel.addEventListener("click", () => {
+            if (notificationPanel) {
+                notificationPanel.style.display = "none";
+            }
+        });
+    }
+
+    /*
+    The "Mark all as read" control is a toggle switch rather than
+    a one-shot button: switching it ON marks every notification as
+    read, switching it back OFF marks them all unread again. Its
+    checked state is also kept in sync (see updateNotificationUI)
+    with the actual data, so if a new unread notification arrives
+    the switch automatically flips back off.
+    */
+
+    if (markAllAsReadCheckbox) {
+
+        markAllAsReadCheckbox.addEventListener("change", () => {
+
+            if (markAllAsReadCheckbox.checked) {
+                markAllNotificationsAsRead();
+            } else {
+                markAllNotificationsAsUnread();
+            }
+        });
+
+        markAllAsReadCheckbox.addEventListener(
+            "click",
+            (e) => e.stopPropagation()
+        );
+    }
+
+    // Close notification panel when clicking outside
+    document.addEventListener("click", (e) => {
+        if (notificationPanel && notificationPanel.style.display !== "none") {
+            if (!notificationPanel.contains(e.target) && notificationBell && !notificationBell.contains(e.target)) {
+                notificationPanel.style.display = "none";
+            }
+        }
+    });
+
+    initializeNotificationPackerFilter();
+}
+
+
+/* ==========================================================
+   NOTIFICATION PANEL — PACKER FILTER (ALL / P1-P5)
+   ========================================================== */
+
+function initializeNotificationPackerFilter() {
+
+    const container =
+        byId("notificationPackerFilter");
+
+    if (!container) {
+        return;
+    }
+
+    const buttons =
+        container.querySelectorAll(
+            ".time-range-button"
+        );
+
+    buttons.forEach(
+        button => {
+
+            button.addEventListener(
+                "click",
+                event => {
+
+                    // Prevent this click from bubbling up to the
+                    // document-level "click outside closes panel"
+                    // listener registered above.
+                    event.stopPropagation();
+
+                    appState.notificationPackerFilter =
+                        button.dataset.packer;
+
+                    buttons.forEach(
+                        other => {
+
+                            other.classList.toggle(
+                                "active",
+                                other === button
+                            );
+                        }
+                    );
+
+                    updateNotificationUI();
+                }
+            );
+        }
+    );
+}
+
+
+/* ==========================================================
+   SYSTEM STATUS PAGE — PACKER SELECTOR (PACKER 1-5)
+   ========================================================== */
+
+function initializePackerSelector() {
+
+    const container =
+        byId("packerSelectorButtons");
+
+    if (!container) {
+        return;
+    }
+
+    const buttons =
+        container.querySelectorAll(
+            ".time-range-button"
+        );
+
+    buttons.forEach(
+        button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    const index =
+                        safeNumber(
+                            button.dataset.packer,
+                            1
+                        );
+
+                    appState.selectedPacker =
+                        index;
+
+                    buttons.forEach(
+                        other => {
+
+                            other.classList.toggle(
+                                "active",
+                                other === button
+                            );
+                        }
+                    );
+
+                    renderSystemStatus(
+                        appState.dashboardState || {}
+                    );
+                }
+            );
+        }
+    );
+}
+
+
 async function showPage(page) {
 
     // ------------------------------------------------------
@@ -939,6 +1299,26 @@ async function showPage(page) {
         console.warn(
             "Unknown dashboard page:",
             page
+        );
+
+        return;
+    }
+
+
+    // ------------------------------------------------------
+    // Check access permissions
+    // ------------------------------------------------------
+
+    if (!canAccessPage(page)) {
+
+        console.warn(
+            `Access denied to page: ${page}`
+        );
+
+        addNotification(
+            "Access Denied",
+            `You do not have permission to access this page.`,
+            "danger"
         );
 
         return;
@@ -1064,6 +1444,268 @@ function updatePageHeader(page) {
         "pageSubtitle",
         info.subtitle
     );
+
+    /*
+    The global "Dashboard / Real-time FillPac AI production
+    overview" title+subtitle is removed only on the Dashboard
+    page itself (per request); it still shows normally on every
+    other page (System Status, Reports, About, Settings, etc.).
+    */
+
+    const headerText =
+        byId("pageHeaderText");
+
+    if (headerText) {
+
+        headerText.classList.toggle(
+            "page-header-hidden",
+            page === "dashboard"
+        );
+    }
+}
+
+
+/* ==========================================================
+   NOTIFICATION SYSTEM
+   ========================================================== */
+
+function addNotification(
+    title,
+    message,
+    severity = "info",
+    source = "system"
+) {
+
+    const notification = {
+        id: `notif-${Date.now()}-${Math.random()}`,
+        title,
+        message,
+        severity,
+        source,
+        timestamp: new Date(),
+        read: false
+    };
+
+    appState.notifications.unshift(notification);
+
+    // Keep only last 50 notifications
+    if (appState.notifications.length > 50) {
+        appState.notifications.pop();
+    }
+
+    updateNotificationUI();
+
+    return notification;
+}
+
+
+function updateNotificationUI() {
+
+    const badge = byId("notificationBadge");
+    const list = byId("notificationList");
+    const markAllAsReadCheckbox = byId("markAllAsReadCheckbox");
+
+    if (!badge || !list) {
+        return;
+    }
+
+    const unreadCount = appState.notifications.filter(n => !n.read).length;
+
+    if (unreadCount > 0) {
+        badge.textContent = unreadCount;
+        badge.style.display = "flex";
+    } else {
+        badge.style.display = "none";
+    }
+
+    /*
+    Keep the toggle switch reflecting reality: checked only when
+    there's at least one notification and none of them are
+    unread. If a fresh notification comes in, the switch flips
+    back off on its own.
+    */
+
+    if (markAllAsReadCheckbox) {
+        markAllAsReadCheckbox.checked =
+            appState.notifications.length > 0
+            && unreadCount === 0;
+    }
+
+    if (appState.notifications.length === 0) {
+        list.innerHTML = "<p class=\"no-notifications\">No notifications</p>";
+        refreshNotificationScrollHint();
+        return;
+    }
+
+    /*
+    Packer filter (ALL / P1 / P2 / P3 / P4 / P5): when a specific
+    packer is selected, only show notifications whose source
+    starts with "packer-{N}-" or "camera" notifications tied to
+    that context are hidden, since they aren't specific to any
+    one packer. "all" (the default) shows everything, unchanged
+    from before.
+    */
+
+    const filter =
+        appState.notificationPackerFilter
+        || "all";
+
+    const filteredNotifications =
+        filter === "all"
+            ? appState.notifications
+            : appState.notifications.filter(
+                notif =>
+                    String(notif.source || "")
+                        .startsWith(`packer-${filter}-`)
+            );
+
+    if (filteredNotifications.length === 0) {
+
+        list.innerHTML =
+            `<p class="no-notifications">No notifications for Packer ${filter}</p>`;
+
+        refreshNotificationScrollHint();
+
+        return;
+    }
+
+    list.innerHTML = filteredNotifications.map(notif => {
+        const severityClass = `notif-${notif.severity}`;
+        const readClass = notif.read ? "notif-read" : "notif-unread";
+        const timeStr = formatTime(notif.timestamp);
+
+        return `
+            <div class="notification-item ${severityClass} ${readClass}" data-notif-id="${notif.id}">
+                <div class="notif-dot"></div>
+                <div class="notif-content">
+                    <strong>${escapeHtml(notif.title)}</strong>
+                    <p>${escapeHtml(notif.message)}</p>
+                </div>
+                <span class="notif-time">${timeStr}</span>
+            </div>
+        `;
+    }).join("");
+
+    refreshNotificationScrollHint();
+}
+
+
+/* ==========================================================
+   NOTIFICATION LIST — "MORE BELOW" SCROLL HINT
+
+   Makes it unmistakable that the notification list scrolls:
+   shows a small bouncing-chevron hint pinned to the bottom of
+   the list whenever there is more content below the currently
+   visible area, and hides it once scrolled within a few pixels
+   of the bottom. Re-run after every re-render (new/removed
+   notifications, filter changes) since that can change whether
+   there's overflow at all.
+   ========================================================== */
+
+function refreshNotificationScrollHint() {
+
+    const list = byId("notificationList");
+    const hint = byId("notificationScrollHint");
+
+    if (!list || !hint) {
+        return;
+    }
+
+    /*
+    Wait a frame so the browser has finished laying out the
+    freshly-injected innerHTML before we measure scrollHeight -
+    reading it in the same tick as the innerHTML write can
+    occasionally see stale (pre-update) dimensions.
+    */
+
+    requestAnimationFrame(() => {
+
+        const hasOverflow =
+            list.scrollHeight - list.clientHeight > 4;
+
+        const nearBottom =
+            list.scrollHeight - list.scrollTop - list.clientHeight < 4;
+
+        hint.style.display =
+            hasOverflow && !nearBottom
+                ? "flex"
+                : "none";
+    });
+}
+
+
+function markAllNotificationsAsRead() {
+
+    appState.notifications.forEach(n => {
+        n.read = true;
+    });
+
+    updateNotificationUI();
+}
+
+
+function markAllNotificationsAsUnread() {
+
+    appState.notifications.forEach(n => {
+        n.read = false;
+    });
+
+    updateNotificationUI();
+}
+
+
+/* ==========================================================
+   ROLE-BASED ACCESS CONTROL
+   ========================================================== */
+
+function loadUserRole() {
+
+    const userStr = localStorage.getItem("fillpac_user") || sessionStorage.getItem("fillpac_user");
+
+    if (userStr) {
+        try {
+            const user = JSON.parse(userStr);
+            appState.currentUser = user;
+            appState.userRole = user.role || "operator";
+        } catch (e) {
+            console.warn("Failed to parse user info:", e);
+            appState.userRole = "operator";
+        }
+    }
+
+    updateSettingsVisibility();
+}
+
+
+function updateSettingsVisibility() {
+
+    const settingsBtn = byId("settingsNavButton");
+
+    if (!settingsBtn) {
+        return;
+    }
+
+    if (appState.userRole === "admin") {
+        settingsBtn.style.display = "flex";
+    } else {
+        settingsBtn.style.display = "none";
+    }
+}
+
+
+function canAccessPage(page) {
+
+    const pageInfo = PAGE_INFO[page];
+
+    if (!pageInfo) {
+        return false;
+    }
+
+    if (pageInfo.adminOnly && appState.userRole !== "admin") {
+        return false;
+    }
+
+    return true;
 }
 
 
@@ -1084,6 +1726,17 @@ async function loadCurrentPage() {
                 await loadDashboardState();
 
                 await loadAnalytics();
+
+                /*
+                Production KPI cards + Camera Production table
+                now live on the Dashboard tab (moved from the
+                former standalone "Production" tab), so load
+                that data here too.
+                */
+
+                await loadProduction();
+
+                reapplyActiveKpiRangeFilter();
 
                 break;
 
@@ -1140,6 +1793,29 @@ async function loadCurrentPage() {
                 await loadDashboardState();
 
                 await loadCameraConfig();
+
+                break;
+
+
+            case "system-status":
+
+                await loadDashboardState();
+
+                renderSystemStatus(appState.dashboardState);
+
+                break;
+
+
+            case "reports":
+
+                renderReportsPage();
+
+                break;
+
+
+            case "about":
+
+                renderAboutPage();
 
                 break;
 
@@ -1294,21 +1970,50 @@ function renderDashboardState(state) {
     );
 
 
-    updatePrintInspectionChart(
+    const printedForQuality =
         safeNumber(
             state.total_printed_count
             ??
             state.total_printed_bags_count
             ??
             0
-        ),
+        );
+
+    const missingForQuality =
         safeNumber(
             state.total_missing_count
             ??
             state.total_not_printed_bags_count
             ??
             0
-        )
+        );
+
+    updatePrintInspectionChart(
+        printedForQuality,
+        missingForQuality
+    );
+
+
+    /*
+    Print Quality = Printed / (Printed + Missing) * 100.
+
+    This is the same underlying camera counts already shown in
+    the Printed / Not Printed KPI cards above, so the percentage
+    can never disagree with those numbers (see data-consistency
+    requirement). Division by zero (no classified bags yet) is
+    shown as "--" rather than NaN/Infinity.
+    */
+
+    const classifiedTotal =
+        printedForQuality + missingForQuality;
+
+    setText(
+        "printQuality",
+        classifiedTotal > 0
+            ? formatPercent(
+                (printedForQuality / classifiedTotal) * 100
+            )
+            : "--"
     );
 
 
@@ -1346,6 +2051,31 @@ function renderDashboardState(state) {
     renderServiceHealth(
         state.service_status || {}
     );
+
+
+    /* ------------------------------------------------------
+       SYSTEM CHANGE DETECTION
+       Detects state transitions and generates notifications
+       ------------------------------------------------------ */
+
+    detectAndNotifySystemChanges(state);
+
+
+    /* ------------------------------------------------------
+       KPI RANGE FILTER
+
+       Everything above just overwrote the KPI cards with LIVE
+       totals from `state`. renderDashboardState() runs very
+       frequently - on every Socket.IO "state" / "state_update" /
+       "dashboard_state" push (much more often than the 5s REST
+       poll) - so a selected 1/4/8/16/24 HR filter was being wiped
+       out almost instantly after being clicked. Re-applying it
+       here, at the end of the one function every live-update path
+       funnels through, guarantees the filter sticks no matter
+       which path triggered the update.
+       ------------------------------------------------------ */
+
+    reapplyActiveKpiRangeFilter();
 }
 
 
@@ -1452,8 +2182,368 @@ function renderServiceHealth(
 
 
 /* ==========================================================
-   CAMERA LOOKUP
+   STATUS VALUE NORMALIZATION
+
+   Backends are inconsistent about how they report an "online" /
+   "running" state - sometimes a boolean, sometimes a number,
+   sometimes a string in any casing ("online", "ONLINE",
+   "Online", "running", "true", "1", "connected", "ok"). A
+   strict `=== "online"` check (the old behaviour) silently
+   treated every one of those other formats as offline, which is
+   what caused PLC/PMS/DCS to show "Offline" and fire spurious
+   notifications even while the system was healthy. Every status
+   comparison in this file should go through this function.
    ========================================================== */
+
+function normalizeBooleanStatus(value) {
+
+    if (typeof value === "boolean") {
+        return value;
+    }
+
+    if (typeof value === "number") {
+        return value !== 0;
+    }
+
+    const text =
+        String(value ?? "")
+            .trim()
+            .toLowerCase();
+
+    return [
+        "online",
+        "running",
+        "active",
+        "true",
+        "1",
+        "connected",
+        "ok",
+        "healthy"
+    ].includes(text);
+}
+
+
+/* ==========================================================
+   PACKER LOOKUP
+
+   Mirrors findCameraByIndex(): looks for a `state.packers` map
+   keyed by packer (packer_1, "Packer 1", etc.) and matches by
+   index. If the backend hasn't been upgraded to send a
+   `packers` map yet, Packer 1 is synthesized from the existing
+   top-level packer_running/plc_status/pms_status/dcs_status
+   fields so the dashboard keeps working unchanged for
+   single-packer installs. Packers 2-5 return null (shown in the
+   UI as "NOT CONFIGURED") until the backend actually reports
+   them.
+   ========================================================== */
+
+function findPackerByIndex(state, index) {
+
+    const packersMap =
+        state?.packers
+        ??
+        state?.packer_list
+        ??
+        null;
+
+    if (
+        packersMap
+        &&
+        typeof packersMap === "object"
+    ) {
+
+        const entries =
+            Object.entries(packersMap);
+
+        const wanted =
+            `packer${index}`
+                .replaceAll(" ", "")
+                .replaceAll("_", "")
+                .toLowerCase();
+
+        const direct =
+            entries.find(
+                ([key, packer]) => {
+
+                    const values = [
+                        key,
+                        packer?.packer_id,
+                        packer?.name,
+                        packer?.packer_name
+                    ];
+
+                    return values.some(
+                        value =>
+                            String(value || "")
+                                .replaceAll(" ", "")
+                                .replaceAll("_", "")
+                                .toLowerCase()
+                            === wanted
+                    );
+                }
+            );
+
+        if (direct) {
+            return direct[1];
+        }
+
+        return entries[index - 1]?.[1] || null;
+    }
+
+    // No multi-packer data from the backend yet - synthesize
+    // Packer 1 from the existing single-packer top-level fields.
+    if (index === 1) {
+
+        return {
+            packer_id: "packer_1",
+            name: "Packer 1",
+            running: state?.packer_running,
+            plc_status: state?.plc_status ?? state?.plc_online,
+            pms_status: state?.pms_status ?? state?.pms_online,
+            dcs_status: state?.dcs_status ?? state?.dcs_online
+        };
+    }
+
+    return null;
+}
+
+
+function packerIsRunning(packer) {
+
+    if (!packer) {
+        return false;
+    }
+
+    return normalizeBooleanStatus(
+        packer.running
+        ??
+        packer.packer_running
+        ??
+        packer.status
+    );
+}
+
+
+/* ==========================================================
+   NOTIFICATION PANEL — LIVE PACKER STATUS CHIP
+
+   Keeps a persistent, always-current "Packer N: RUNNING /
+   STOPPED" chip at the top of the notification panel, so
+   opening it immediately shows the live state rather than
+   requiring the person to interpret a list of historical alert
+   entries to figure out whether the packer is running right
+   now.
+   ========================================================== */
+
+function updateNotificationLiveStatus(
+    index,
+    running
+) {
+
+    const dot =
+        byId("notificationLiveStatusDot");
+
+    const text =
+        byId("notificationLiveStatusText");
+
+    if (!text) {
+        return;
+    }
+
+    if (running === null) {
+
+        text.textContent =
+            `Packer ${index}: No data`;
+
+        if (dot) {
+            dot.className =
+                "live-status-dot unknown";
+        }
+
+        return;
+    }
+
+    text.textContent =
+        `Packer ${index}: ${running ? "RUNNING" : "STOPPED"}`;
+
+    if (dot) {
+
+        dot.className =
+            `live-status-dot ${running ? "running" : "stopped"}`;
+    }
+}
+
+
+/* ==========================================================
+   SYSTEM STATE CHANGE DETECTION
+   ========================================================== */
+
+function detectAndNotifySystemChanges(state) {
+
+    if (!state || typeof state !== "object") {
+        return;
+    }
+
+    // Check camera status changes
+    const cameras = state.cameras || {};
+    Object.entries(cameras).forEach(([cameraId, cameraData]) => {
+        const cameraNum = parseInt(cameraId.replace("camera_", "")) + 1;
+        const isOnline = Boolean(cameraData.online) || cameraIsOnline(cameraData);
+        const wasOnline = appState.lastNotificationStates.cameras[cameraId];
+
+        if (wasOnline === undefined) {
+            // First time checking this camera
+            appState.lastNotificationStates.cameras[cameraId] = isOnline;
+        } else if (wasOnline !== isOnline) {
+            // Status changed
+            appState.lastNotificationStates.cameras[cameraId] = isOnline;
+
+            if (isOnline) {
+                addNotification(
+                    `Camera ${cameraNum} Online`,
+                    `Camera ${cameraNum} connection restored`,
+                    "success",
+                    `camera-${cameraNum}`
+                );
+            } else {
+                addNotification(
+                    `Camera ${cameraNum} Offline`,
+                    `Camera ${cameraNum} connection lost`,
+                    "danger",
+                    `camera-${cameraNum}`
+                );
+            }
+        }
+    });
+
+    // ------------------------------------------------------
+    // PACKERS (1..PACKER_COUNT)
+    //
+    // Each packer's running/PLC/PMS/DCS state is tracked
+    // independently and compared with normalizeBooleanStatus(),
+    // which accepts booleans, numbers, or strings in any casing
+    // ("online"/"ONLINE"/"running"/true/1/etc). This replaces
+    // the old strict `=== "online"` check, which treated any
+    // other casing/format as offline - the cause of stale
+    // "Offline"/"Stopped" notifications piling up even while the
+    // system was actually healthy and running.
+    // ------------------------------------------------------
+
+    if (!appState.lastNotificationStates.packers) {
+        appState.lastNotificationStates.packers = {};
+    }
+
+    for (
+        let index = 1;
+        index <= PACKER_COUNT;
+        index += 1
+    ) {
+
+        const packer =
+            findPackerByIndex(state, index);
+
+        if (!packer) {
+            continue;
+        }
+
+        const key =
+            `packer-${index}`;
+
+        if (!appState.lastNotificationStates.packers[key]) {
+            appState.lastNotificationStates.packers[key] = {};
+        }
+
+        const previous =
+            appState.lastNotificationStates.packers[key];
+
+        const checks = [
+            {
+                field: "running",
+                value: packerIsRunning(packer),
+                onLabel: "Running",
+                offLabel: "Stopped",
+                onMessage: "Production resumed",
+                offMessage: "Production line is stopped",
+                onSeverity: "success",
+                offSeverity: "warning"
+            },
+            {
+                field: "plc",
+                value: normalizeBooleanStatus(packer.plc_status),
+                onLabel: "PLC Online",
+                offLabel: "PLC Offline",
+                onMessage: "Packer PLC communication restored",
+                offMessage: "Packer PLC communication unavailable",
+                onSeverity: "success",
+                offSeverity: "danger"
+            },
+            {
+                field: "pms",
+                value: normalizeBooleanStatus(packer.pms_status),
+                onLabel: "PMS Online",
+                offLabel: "PMS Offline",
+                onMessage: "PMS PC connection restored",
+                offMessage: "PMS PC connection unavailable",
+                onSeverity: "success",
+                offSeverity: "danger"
+            },
+            {
+                field: "dcs",
+                value: normalizeBooleanStatus(packer.dcs_status),
+                onLabel: "DCS Online",
+                offLabel: "DCS Offline",
+                onMessage: "DCS connection restored",
+                offMessage: "DCS connection unavailable",
+                onSeverity: "success",
+                offSeverity: "danger"
+            }
+        ];
+
+        checks.forEach(
+            check => {
+
+                const prior =
+                    previous[check.field];
+
+                if (prior === undefined) {
+
+                    previous[check.field] =
+                        check.value;
+
+                    return;
+                }
+
+                if (prior === check.value) {
+                    return;
+                }
+
+                previous[check.field] =
+                    check.value;
+
+                addNotification(
+                    `Packer ${index} ${check.value ? check.onLabel : check.offLabel}`,
+                    check.value ? check.onMessage : check.offMessage,
+                    check.value ? check.onSeverity : check.offSeverity,
+                    `${key}-${check.field}`
+                );
+            }
+        );
+
+        // Keep the live status chip in the notification panel in
+        // sync with whichever packer the System Status page is
+        // currently focused on.
+        if (index === (appState.selectedPacker || 1)) {
+
+            updateNotificationLiveStatus(
+                index,
+                packerIsRunning(packer)
+            );
+        }
+    }
+}
+
+
+
 
 function findCameraByIndex(
     cameras,
@@ -1708,13 +2798,65 @@ function renderCameraCard(
     );
 
 
-    setText(
-        `camera${index}Status`,
+    const statusRaw =
         String(
             camera.status
             || "offline"
-        ).toUpperCase()
+        ).toLowerCase();
+
+    const isOnline =
+        Boolean(
+            camera.online
+            ??
+            (statusRaw === "online")
+        );
+
+    setText(
+        `camera${index}Status`,
+        isOnline
+            ? "ONLINE"
+            : "OFFLINE"
     );
+
+    /*
+    Bug fix: the status badge's CSS class was never updated to
+    match the live status, so it always kept its initial
+    "offline" (red) class from the HTML template even when the
+    camera was actually online. Toggling the class here makes
+    the badge render green when online and red when offline.
+    */
+
+    const statusBadge =
+        byId(`camera${index}Status`);
+
+    if (statusBadge) {
+
+        statusBadge.classList.toggle(
+            "online",
+            isOnline
+        );
+
+        statusBadge.classList.toggle(
+            "offline",
+            !isOnline
+        );
+    }
+
+    const cameraCard =
+        byId(`camera-card-${index}`);
+
+    if (cameraCard) {
+
+        cameraCard.classList.toggle(
+            "online",
+            isOnline
+        );
+
+        cameraCard.classList.toggle(
+            "offline",
+            !isOnline
+        );
+    }
 }
 
 
@@ -2406,13 +3548,20 @@ function renderProduction(data) {
         );
 
 
-    const ratePerHour =
-        safeNumber(
-            data.production_rate_per_hour
-            ??
-            0
-        );
+    /*
+    Production Rate must never be invented. Only render a number
+    when the backend actually provides one; otherwise show "--"
+    rather than a fabricated 0.
+    */
 
+    const rateAvailable =
+        data.production_rate_per_hour !== null
+        &&
+        data.production_rate_per_hour !== undefined
+        &&
+        Number.isFinite(
+            Number(data.production_rate_per_hour)
+        );
 
     setText(
         "productionTotal",
@@ -2440,7 +3589,9 @@ function renderProduction(data) {
 
     setText(
         "productionRate",
-        formatInteger(ratePerHour)
+        rateAvailable
+            ? formatInteger(data.production_rate_per_hour)
+            : "--"
     );
 
 
@@ -4279,7 +5430,1290 @@ function getJamSystemSummary(cameras) {
 
 
     return summary;
-}/* ==========================================================
+}
+
+
+/* ==========================================================
+   SYSTEM STATUS PAGE
+   ========================================================== */
+
+function renderSystemStatus(state) {
+
+    if (!state || typeof state !== "object") {
+        return;
+    }
+
+    // Update camera status
+    renderCameraStatusList(state.cameras || {});
+
+    // Update system health indicators (scoped to the selected packer)
+    updateSystemHealthDisplay(state);
+
+
+    /* ------------------------------------------------------
+       PACKER RUNNING STATUS (selected packer, 1-5)
+       ------------------------------------------------------ */
+
+    const selectedIndex =
+        appState.selectedPacker || 1;
+
+    const subtitleElement =
+        byId("packerSelectorSubtitle");
+
+    if (subtitleElement) {
+
+        subtitleElement.textContent =
+            `Showing: Packer ${selectedIndex}`;
+    }
+
+    const packer =
+        findPackerByIndex(
+            state,
+            selectedIndex
+        );
+
+    const packerStatusElement =
+        byId("packerRunningStatus");
+
+    if (!packer) {
+
+        // Packer has no data yet (backend hasn't reported it) -
+        // show clearly rather than defaulting to a misleading
+        // RUNNING/STOPPED value.
+
+        setText(
+            "packerRunningStatus",
+            "NOT CONFIGURED"
+        );
+
+        if (packerStatusElement) {
+
+            packerStatusElement.classList.remove(
+                "status-value-running",
+                "status-value-stopped"
+            );
+        }
+
+        setText("packerPlcStatus", "--");
+        setText("packerPmsStatus", "--");
+        setText("packerDcsStatus", "--");
+
+        updateNotificationLiveStatus(
+            selectedIndex,
+            null
+        );
+
+        return;
+    }
+
+    const packerRunning =
+        packerIsRunning(packer);
+
+    setText(
+        "packerRunningStatus",
+        packerRunning ? "RUNNING" : "STOPPED"
+    );
+
+    if (packerStatusElement) {
+
+        packerStatusElement.classList.toggle(
+            "status-value-running",
+            packerRunning
+        );
+
+        packerStatusElement.classList.toggle(
+            "status-value-stopped",
+            !packerRunning
+        );
+    }
+
+    setText(
+        "packerPlcStatus",
+        normalizeBooleanStatus(packer.plc_status)
+            ? "Online"
+            : "Offline"
+    );
+
+    setText(
+        "packerPmsStatus",
+        normalizeBooleanStatus(packer.pms_status)
+            ? "Online"
+            : "Offline"
+    );
+
+    setText(
+        "packerDcsStatus",
+        normalizeBooleanStatus(packer.dcs_status)
+            ? "Online"
+            : "Offline"
+    );
+
+    updateNotificationLiveStatus(
+        selectedIndex,
+        packerRunning
+    );
+}
+
+
+function renderCameraStatusList(cameras) {
+
+    const container = byId("cameraStatusList");
+
+    if (!container) {
+        return;
+    }
+
+    if (!cameras || Object.keys(cameras).length === 0) {
+        container.innerHTML = "<p>No cameras found</p>";
+        return;
+    }
+
+    const entries = [];
+
+    for (let index = 1; index <= CAMERA_COUNT; index += 1) {
+
+        const cameraData = findCameraByIndex(cameras, index);
+
+        if (!cameraData) {
+            continue;
+        }
+
+        entries.push([`camera_${index - 1}`, cameraData, index]);
+    }
+
+    const items = entries.map(([cameraId, cameraData, cameraNum]) => {
+        const online = Boolean(cameraData.online ?? cameraIsOnline(cameraData));
+        const status = online ? "ONLINE" : "OFFLINE";
+        const statusClass = online ? "status-online" : "status-offline";
+        const fps = safeNumber(cameraData.fps, 0).toFixed(1);
+
+        /*
+        Jam status is preserved here (rather than dropped along
+        with the old standalone Jam Monitoring tab) since it is
+        real operator-relevant camera health information.
+        */
+        const jamStatus = normalizeJamStatus(cameraData);
+
+        return `
+            <div class="status-item ${statusClass}">
+                <div class="status-header">
+                    <span class="status-name">Camera ${cameraNum}</span>
+                    <span class="status-badge">${status}</span>
+                </div>
+                <div class="status-details">
+                    <span class="detail">Printed: <strong>${formatInteger(cameraData.printed_count ?? cameraData.printed_bags_count ?? 0)}</strong></span>
+                    <span class="detail">Missing: <strong>${formatInteger(cameraData.missing_count ?? cameraData.not_printed_bags_count ?? 0)}</strong></span>
+                    <span class="detail">FPS: <strong>${fps}</strong></span>
+                    <span class="detail">Jam: <strong class="jam-status ${jamStatus}">${jamStatus.toUpperCase()}</strong></span>
+                </div>
+                <button class="camera-view-btn" onclick="showCameraView('${cameraId}')" type="button">
+                    View Camera
+                </button>
+            </div>
+        `;
+    }).join("");
+
+    container.innerHTML = items;
+}
+
+
+function updateSystemHealthDisplay(state) {
+
+    /*
+    Camera System Health
+
+    Bug fix: this used to count active cameras via
+    `Object.values(state.cameras).filter(c => c.online)`, which
+    only ever checked the raw `online` boolean and could miss
+    cameras whose backend payload instead reports status via a
+    `status` string ("online"/"running"/"active"). That silently
+    undercounted active cameras here even though the same camera
+    showed correctly as ONLINE on its Camera Production Overview
+    card elsewhere on the dashboard.
+
+    Now this walks the same 4 camera slots via findCameraByIndex()
+    and checks each one with the shared cameraIsOnline() helper,
+    so the count shown here can never disagree with what the
+    camera cards show.
+    */
+
+    const cameras =
+        state.cameras || {};
+
+    let camerasOnline = 0;
+
+    let totalCameras = 0;
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const camera =
+            findCameraByIndex(cameras, index);
+
+        if (!camera) {
+            continue;
+        }
+
+        totalCameras += 1;
+
+        if (
+            cameraIsOnline(camera)
+            ||
+            Boolean(camera.online)
+        ) {
+
+            camerasOnline += 1;
+        }
+    }
+
+    const cameraHealth =
+        totalCameras === 0 || camerasOnline === totalCameras
+            ? "Healthy"
+            : camerasOnline > 0
+                ? "Warning"
+                : "Critical";
+
+    const cameraIndicator = byId("cameraStatusIndicator");
+    if (cameraIndicator) {
+        cameraIndicator.className = `status-indicator ${cameraHealth.toLowerCase()}`;
+        cameraIndicator.textContent = cameraHealth === "Healthy" ? "●" : cameraHealth === "Warning" ? "⚠" : "●";
+    }
+    setText("cameraStatusDetail", `${camerasOnline} of ${totalCameras} cameras online`);
+
+
+    /*
+    Packer PLC / PMS / DCS Health
+
+    Scoped to whichever packer is currently selected on the
+    System Status page (see the Packer 1-5 selector), falling
+    back to Packer 1 by default. Status comparisons go through
+    normalizeBooleanStatus() so "online"/"ONLINE"/"running"/
+    true/1/etc are all recognised, instead of only the exact
+    lowercase string "online".
+    */
+
+    const packer =
+        findPackerByIndex(
+            state,
+            appState.selectedPacker || 1
+        );
+
+    const plcOnline =
+        normalizeBooleanStatus(packer?.plc_status);
+
+    const plcIndicator = byId("plcStatusIndicator");
+    if (plcIndicator) {
+        plcIndicator.className = `status-indicator ${plcOnline ? "healthy" : "critical"}`;
+    }
+    setText("plcStatusDetail", plcOnline ? "Online" : "Offline");
+
+    const pmsOnline =
+        normalizeBooleanStatus(packer?.pms_status);
+
+    const pmsIndicator = byId("pmsStatusIndicator");
+    if (pmsIndicator) {
+        pmsIndicator.className = `status-indicator ${pmsOnline ? "healthy" : "critical"}`;
+    }
+    setText("pmsStatusDetail", pmsOnline ? "Online" : "Offline");
+
+    const dcsOnline =
+        normalizeBooleanStatus(packer?.dcs_status);
+
+    const dcsIndicator = byId("dcsStatusIndicator");
+    if (dcsIndicator) {
+        dcsIndicator.className = `status-indicator ${dcsOnline ? "healthy" : "critical"}`;
+    }
+    setText("dcsStatusDetail", dcsOnline ? "Online" : "Offline");
+}
+
+
+/* ==========================================================
+   REPORTS PAGE
+
+   FIXED: reports are generated entirely client-side using
+   jsPDF + jsPDF-AutoTable (both already loaded in index.html)
+   from data already sitting in appState, instead of calling a
+   nonexistent POST /reports/generate backend endpoint. That
+   endpoint never existed, so every click was guaranteed to hit
+   the catch block and fire a "Report Failed" notification.
+
+   Also fixed: the Generate button's click listener is now only
+   attached once (see dataset.listenerAttached guard below).
+   Previously renderReportsPage() called addEventListener() on
+   every visit to the Reports page with nothing to prevent
+   duplicates, so visiting the page N times meant N stacked
+   listeners on the same button - a single click then fired
+   handleGenerateReport() N times, producing exactly the
+   multiple near-simultaneous "Report Failed" toasts seen in
+   the screenshot.
+
+   Also fixed: the "Recent Reports" list is no longer hard-coded
+   to "No reports generated yet" - it now reflects
+   appState.reports so successfully generated reports actually
+   show up and can be identified later.
+   ========================================================== */
+
+function renderReportsPage() {
+
+    renderRecentReportsList();
+
+    const generateBtn = byId("generateReportBtn");
+
+    if (generateBtn && !generateBtn.dataset.listenerAttached) {
+
+        generateBtn.addEventListener("click", handleGenerateReport);
+
+        generateBtn.dataset.listenerAttached = "true";
+    }
+
+    // Set today's date as default (only if not already set, so
+    // navigating away and back doesn't clobber a date the
+    // operator already picked).
+    const dateInput = byId("reportDate");
+    if (dateInput && !dateInput.value) {
+        const today = new Date().toISOString().split('T')[0];
+        dateInput.value = today;
+    }
+
+    // Set default times
+    const startTimeInput = byId("reportStartTime");
+    const endTimeInput = byId("reportEndTime");
+    if (startTimeInput && !startTimeInput.value) {
+        startTimeInput.value = "00:00";
+    }
+    if (endTimeInput && !endTimeInput.value) {
+        endTimeInput.value = "23:59";
+    }
+}
+
+
+function renderRecentReportsList() {
+
+    const container = byId("recentReportsList");
+
+    if (!container) {
+        return;
+    }
+
+    if (!appState.reports || appState.reports.length === 0) {
+
+        container.innerHTML =
+            "<p class=\"no-reports\">No reports generated yet</p>";
+
+        return;
+    }
+
+    container.innerHTML =
+        appState.reports
+            .map(
+                report => `
+                <div class="report-list-item">
+                    <strong>${escapeHtml(report.title)}</strong>
+                    <p>${escapeHtml(report.date)} · ${
+                        report.camera === "all"
+                            ? "All Cameras"
+                            : escapeHtml(report.camera)
+                    } · ${escapeHtml(formatDateTime(report.generatedAt))}</p>
+                </div>
+                `
+            )
+            .join("");
+}
+
+
+async function handleGenerateReport() {
+
+    const reportType = byId("reportType")?.value || "production";
+    const reportDate = byId("reportDate")?.value || new Date().toISOString().split('T')[0];
+    const startTime = byId("reportStartTime")?.value || "00:00";
+    const endTime = byId("reportEndTime")?.value || "23:59";
+    const camera = byId("reportCamera")?.value || "all";
+
+    const generateBtn = byId("generateReportBtn");
+
+    if (generateBtn) {
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Generating...";
+    }
+
+    try {
+
+        const doc =
+            buildReportPdf({
+                reportType,
+                reportDate,
+                startTime,
+                endTime,
+                camera
+            });
+
+        const label =
+            REPORT_TYPE_LABELS[reportType]
+            ||
+            "Report";
+
+        const filename =
+            `fillpac-${reportType}-${reportDate}-${Date.now()}.pdf`;
+
+        doc.save(filename);
+
+        appState.reports.unshift({
+            id: `report-${Date.now()}`,
+            title: label,
+            date: reportDate,
+            camera,
+            generatedAt: new Date(),
+            filename
+        });
+
+        // Keep only the last 20 reports in the session list.
+        if (appState.reports.length > 20) {
+            appState.reports.pop();
+        }
+
+        renderRecentReportsList();
+
+        addNotification(
+            "Report Generated",
+            `${label} created successfully`,
+            "success"
+        );
+
+    }
+
+    catch (error) {
+
+        console.error("Failed to generate report:", error);
+
+        addNotification(
+            "Report Failed",
+            "Failed to generate report. Please check your inputs.",
+            "danger"
+        );
+
+    }
+
+    finally {
+
+        if (generateBtn) {
+            generateBtn.disabled = false;
+            generateBtn.textContent = "Generate Report";
+        }
+    }
+}
+
+
+/* ==========================================================
+   REPORT PDF BUILDER (client-side)
+
+   Builds a jsPDF document for the requested report type using
+   data already loaded into appState (production, dashboard
+   state/cameras, packer status, notifications). Never invents
+   numbers: each section reads the same fields the rest of the
+   dashboard already renders and trusts.
+   ========================================================== */
+
+function buildReportPdf({
+    reportType,
+    reportDate,
+    startTime,
+    endTime,
+    camera
+}) {
+
+    const jsPDFCtor =
+        window.jspdf
+        &&
+        window.jspdf.jsPDF;
+
+    if (!jsPDFCtor) {
+
+        throw new Error(
+            "jsPDF library not loaded"
+        );
+    }
+
+    const doc =
+        new jsPDFCtor({
+            unit: "pt",
+            format: "a4"
+        });
+
+    const label =
+        REPORT_TYPE_LABELS[reportType]
+        ||
+        "Report";
+
+    doc.setFontSize(18);
+    doc.text("FillPac Vision Intelligence Platform", 40, 50);
+
+    doc.setFontSize(13);
+    doc.setTextColor(80);
+    doc.text(label, 40, 72);
+
+    doc.setFontSize(10);
+    doc.setTextColor(120);
+
+    doc.text(
+        `Date: ${reportDate}   Time: ${startTime} - ${endTime}   Camera: ${
+            camera === "all" ? "All Cameras" : camera
+        }`,
+        40,
+        90
+    );
+
+    doc.text(
+        `Generated: ${new Date().toLocaleString()}`,
+        40,
+        104
+    );
+
+    let cursorY = 130;
+
+    switch (reportType) {
+
+        case "production":
+            cursorY = addProductionReportSection(doc, cursorY);
+            break;
+
+        case "print_detection":
+            cursorY = addPrintDetectionReportSection(doc, cursorY);
+            break;
+
+        case "camera_performance":
+            cursorY = addCameraPerformanceReportSection(doc, cursorY, camera);
+            break;
+
+        case "system_status":
+            cursorY = addSystemStatusReportSection(doc, cursorY);
+            break;
+
+        case "exception":
+            cursorY = addExceptionReportSection(doc, cursorY);
+            break;
+
+        default:
+            doc.text(
+                "No data available for this report type.",
+                40,
+                cursorY
+            );
+    }
+
+    void cursorY;
+
+    return doc;
+}
+
+
+function addProductionReportSection(doc, startY) {
+
+    const production =
+        appState.production
+        ||
+        {};
+
+    const rows = [
+        ["Total Bags", formatInteger(production.total_bags ?? 0)],
+        ["Printed Bags", formatInteger(production.printed_bags ?? 0)],
+        ["Not Printed", formatInteger(production.not_printed_bags ?? 0)],
+        ["Print Quality", formatPercent(production.print_quality ?? 0)],
+        [
+            "Production Rate (bags/hr)",
+            production.production_rate_per_hour != null
+                ? formatInteger(production.production_rate_per_hour)
+                : "--"
+        ]
+    ];
+
+    doc.autoTable({
+        startY,
+        head: [["Metric", "Value"]],
+        body: rows,
+        theme: "grid",
+        headStyles: { fillColor: [0, 63, 70] }
+    });
+
+    return doc.lastAutoTable.finalY + 24;
+}
+
+
+function addPrintDetectionReportSection(doc, startY) {
+
+    const cameras =
+        appState.dashboardState?.cameras
+        ||
+        {};
+
+    const rows = [];
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        const cam =
+            findCameraByIndex(cameras, index);
+
+        if (!cam) {
+            continue;
+        }
+
+        const printed =
+            cam.printed_count
+            ??
+            cam.printed_bags_count
+            ??
+            0;
+
+        const missing =
+            cam.missing_count
+            ??
+            cam.not_printed_bags_count
+            ??
+            0;
+
+        const total =
+            printed + missing;
+
+        rows.push([
+            `Camera ${index}`,
+            formatInteger(printed),
+            formatInteger(missing),
+            total > 0
+                ? formatPercent((printed / total) * 100)
+                : "--"
+        ]);
+    }
+
+    doc.autoTable({
+        startY,
+        head: [["Camera", "Printed", "Missing", "Print Rate"]],
+        body:
+            rows.length
+                ? rows
+                : [["No camera data available", "", "", ""]],
+        theme: "grid",
+        headStyles: { fillColor: [0, 63, 70] }
+    });
+
+    return doc.lastAutoTable.finalY + 24;
+}
+
+
+function addCameraPerformanceReportSection(doc, startY, cameraFilter) {
+
+    const cameras =
+        appState.dashboardState?.cameras
+        ||
+        {};
+
+    const rows = [];
+
+    for (
+        let index = 1;
+        index <= CAMERA_COUNT;
+        index += 1
+    ) {
+
+        if (
+            cameraFilter !== "all"
+            &&
+            cameraFilter !== `Camera ${index}`
+        ) {
+            continue;
+        }
+
+        const cam =
+            findCameraByIndex(cameras, index);
+
+        if (!cam) {
+            continue;
+        }
+
+        rows.push([
+            `Camera ${index}`,
+            String(cam.status ?? "offline").toUpperCase(),
+            formatDecimal(cam.fps, 1),
+            formatInteger(cam.count ?? cam.total_count ?? 0),
+            normalizeJamStatus(cam).toUpperCase()
+        ]);
+    }
+
+    doc.autoTable({
+        startY,
+        head: [["Camera", "Status", "FPS", "Count", "Jam Status"]],
+        body:
+            rows.length
+                ? rows
+                : [["No camera data available", "", "", "", ""]],
+        theme: "grid",
+        headStyles: { fillColor: [0, 63, 70] }
+    });
+
+    return doc.lastAutoTable.finalY + 24;
+}
+
+
+function addSystemStatusReportSection(doc, startY) {
+
+    const state =
+        appState.dashboardState
+        ||
+        {};
+
+    const packer =
+        findPackerByIndex(state, 1);
+
+    const rows = [
+        ["System Status", String(state.system_status ?? "offline").toUpperCase()],
+        ["System Uptime", formatUptime(state.uptime_seconds)],
+        ["Packer 1 Running", packerIsRunning(packer) ? "RUNNING" : "STOPPED"],
+        ["Packer 1 PLC", normalizeBooleanStatus(packer?.plc_status) ? "Online" : "Offline"],
+        ["Packer 1 PMS", normalizeBooleanStatus(packer?.pms_status) ? "Online" : "Offline"],
+        ["Packer 1 DCS", normalizeBooleanStatus(packer?.dcs_status) ? "Online" : "Offline"]
+    ];
+
+    doc.autoTable({
+        startY,
+        head: [["Component", "Status"]],
+        body: rows,
+        theme: "grid",
+        headStyles: { fillColor: [0, 63, 70] }
+    });
+
+    return doc.lastAutoTable.finalY + 24;
+}
+
+
+function addExceptionReportSection(doc, startY) {
+
+    const notifications =
+        (appState.notifications || [])
+            .filter(
+                n =>
+                    n.severity === "danger"
+                    ||
+                    n.severity === "warning"
+            );
+
+    const rows =
+        notifications.map(
+            n => [
+                formatDateTime(n.timestamp),
+                n.severity.toUpperCase(),
+                n.title,
+                n.message
+            ]
+        );
+
+    doc.autoTable({
+        startY,
+        head: [["Time", "Severity", "Title", "Message"]],
+        body:
+            rows.length
+                ? rows
+                : [["--", "--", "No exceptions recorded", "--"]],
+        theme: "grid",
+        headStyles: { fillColor: [0, 63, 70] },
+        columnStyles: { 3: { cellWidth: 220 } }
+    });
+
+    return doc.lastAutoTable.finalY + 24;
+}
+
+
+/* ==========================================================
+   ABOUT PAGE
+   ================================================== */
+
+function renderAboutPage() {
+
+    // Version info
+    setText("aboutVersion", "BGCNT_01_01_01");
+    setText("aboutFrontend", "BGCNT_01_01_01");
+    setText("currentVersion", "BGCNT_01_01_01");
+    setText("updateStatus", "Up to date");
+
+    // Try to fetch additional version info
+    try {
+        apiFetch("/version").then(data => {
+            if (data) {
+                if (data.backend) setText("aboutBackend", data.backend);
+                if (data.ai_model) setText("aboutAIModel", data.ai_model);
+                if (data.build) setText("aboutBuild", data.build);
+            }
+        }).catch(e => {
+            console.log("Version endpoint not available");
+        });
+    } catch (e) {
+        // Version endpoint may not exist
+    }
+}
+
+
+/* ==========================================================
+   PRODUCTION STATISTICS TIME RANGE FILTER
+   ========================================================== */
+
+function initializeProductionTrendRangeButtons() {
+
+    const container =
+        byId("productionTrendRangeButtons");
+
+    if (!container) {
+        return;
+    }
+
+    const buttons =
+        container.querySelectorAll(
+            ".time-range-button"
+        );
+
+    buttons.forEach(
+        button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    const hours =
+                        safeNumber(
+                            button.dataset.hours,
+                            8
+                        );
+
+                    appState.productionTrendRangeHours =
+                        hours;
+
+                    buttons.forEach(
+                        other => {
+
+                            other.classList.toggle(
+                                "active",
+                                other === button
+                            );
+                        }
+                    );
+
+                    /*
+                    Re-render immediately from already-loaded
+                    analytics data rather than re-fetching, so
+                    the chart updates without a page reload.
+                    */
+
+                    updateProductionTrendChart(
+                        appState.analytics?.hourly || []
+                    );
+                }
+            );
+        }
+    );
+}
+
+
+/* ==========================================================
+   DASHBOARD KPI TIME RANGE FILTER (LIVE / 1 / 4 / 8 / 16 / 24 HR)
+
+   Reuses the same hourly buckets already returned by /analytics
+   (data.hourly, each row shaped { hour, total, printed, missing })
+   that power the Production Statistics chart, so no backend
+   changes are needed. "LIVE" restores the all-time cumulative
+   totals from the live dashboard state; the other buttons sum
+   the most recent N hourly buckets instead.
+   ========================================================== */
+
+function initializeKpiRangeButtons() {
+
+    const container =
+        byId("kpiRangeButtons");
+
+    if (!container) {
+        return;
+    }
+
+    const buttons =
+        container.querySelectorAll(
+            ".time-range-button"
+        );
+
+    buttons.forEach(
+        button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    const hours =
+                        safeNumber(
+                            button.dataset.hours,
+                            0
+                        );
+
+                    appState.kpiRangeHours =
+                        hours;
+
+                    buttons.forEach(
+                        other => {
+
+                            other.classList.toggle(
+                                "active",
+                                other === button
+                            );
+                        }
+                    );
+
+                    applyKpiRangeFilter(hours);
+                }
+            );
+        }
+    );
+}
+
+
+/*
+Re-applies the currently active KPI range filter (if any) after
+a live data refresh. The periodic refresh loop calls this right
+after loadDashboardState()/loadProduction()/loadAnalytics(),
+since those calls re-render the KPI cards from live totals and
+would otherwise silently wipe out a selected 1/4/8/16/24 HR
+filter within one refresh cycle (5s).
+*/
+
+function reapplyActiveKpiRangeFilter() {
+
+    if (appState.kpiRangeHours) {
+
+        applyKpiRangeFilter(
+            appState.kpiRangeHours
+        );
+    }
+}
+
+
+function applyKpiRangeFilter(hours) {
+
+    const label =
+        byId("kpiRangeLabel");
+
+    /*
+    hours === 0 means "LIVE": restore the cumulative totals from
+    the live dashboard state, exactly as they were before any
+    range filter existed.
+    */
+
+    if (!hours) {
+
+        if (label) {
+            label.textContent = "Live totals";
+        }
+
+        renderDashboardState(
+            appState.dashboardState || {}
+        );
+
+        return;
+    }
+
+    if (label) {
+        label.textContent = `Last ${hours} hr${hours === 1 ? "" : "s"}`;
+    }
+
+    const hourly =
+        Array.isArray(appState.analytics?.hourly)
+            ? appState.analytics.hourly
+            : [];
+
+    const rows =
+        hourly.slice(-hours);
+
+    const total =
+        rows.reduce(
+            (sum, row) => sum + safeNumber(row.total, 0),
+            0
+        );
+
+    const printed =
+        rows.reduce(
+            (sum, row) => sum + safeNumber(row.printed, 0),
+            0
+        );
+
+    const missing =
+        rows.reduce(
+            (sum, row) => sum + safeNumber(row.missing, 0),
+            0
+        );
+
+    const classifiedTotal =
+        printed + missing;
+
+    setText(
+        "totalBags",
+        formatInteger(total)
+    );
+
+    setText(
+        "printedBags",
+        formatInteger(printed)
+    );
+
+    setText(
+        "missingBags",
+        formatInteger(missing)
+    );
+
+    setText(
+        "printQuality",
+        classifiedTotal > 0
+            ? formatPercent((printed / classifiedTotal) * 100)
+            : "--"
+    );
+
+    setText(
+        "productionRate",
+        formatInteger(
+            Math.round(total / hours)
+        )
+    );
+
+    updatePrintInspectionChart(
+        printed,
+        missing
+    );
+}
+
+
+/* ==========================================================
+   CAMERA VIEW MODAL
+
+   Reuses the same /live/{camera name} streaming endpoint that
+   initializeLiveStreams() already uses, rather than introducing
+   a second streaming mechanism.
+   ========================================================== */
+
+function renderCameraViewModal(index) {
+
+    const clampedIndex =
+        Math.min(
+            CAMERA_COUNT,
+            Math.max(1, index)
+        );
+
+    appState.cameraViewIndex =
+        clampedIndex;
+
+    const camera =
+        findCameraByIndex(
+            appState.dashboardState?.cameras || {},
+            clampedIndex
+        );
+
+    const online =
+        Boolean(
+            camera?.online
+            ??
+            cameraIsOnline(camera)
+        );
+
+    const cameraDisplayName =
+        `Camera ${clampedIndex}`;
+
+    setText(
+        "cameraViewTitle",
+        cameraDisplayName
+    );
+
+    const statusElement =
+        byId("cameraViewStatus");
+
+    if (statusElement) {
+
+        statusElement.textContent =
+            online ? "ONLINE" : "OFFLINE";
+
+        statusElement.classList.toggle("online", online);
+        statusElement.classList.toggle("offline", !online);
+    }
+
+    const feed =
+        byId("cameraViewFeed");
+
+    if (!feed) {
+        return;
+    }
+
+    if (!online) {
+
+        feed.innerHTML =
+            `
+            <svg class="icon-svg" aria-hidden="true"><use href="#icon-video-slash" xlink:href="#icon-video-slash"></use></svg>
+            <span>Camera Offline</span>
+            `;
+
+        return;
+    }
+
+    feed.innerHTML = "";
+
+    const image =
+        document.createElement("img");
+
+    image.alt =
+        `${cameraDisplayName} live feed`;
+
+    image.addEventListener(
+        "error",
+        () => {
+
+            feed.innerHTML =
+                `
+                <svg class="icon-svg" aria-hidden="true"><use href="#icon-video-slash" xlink:href="#icon-video-slash"></use></svg>
+                <span>Live video stream not connected</span>
+                `;
+        }
+    );
+
+    image.src =
+        `${API_BASE}/live/${encodeURIComponent(cameraDisplayName)}?t=${Date.now()}`;
+
+    feed.appendChild(image);
+}
+
+
+function showCameraView(cameraId) {
+
+    const cameraNum =
+        parseInt(
+            String(cameraId).replace("camera_", ""),
+            10
+        )
+        + 1;
+
+    const modal =
+        byId("cameraViewModal");
+
+    if (!modal) {
+        return;
+    }
+
+    modal.style.display =
+        "flex";
+
+    renderCameraViewModal(
+        Number.isFinite(cameraNum)
+            ? cameraNum
+            : 1
+    );
+}
+
+
+function closeCameraView() {
+
+    const modal =
+        byId("cameraViewModal");
+
+    if (!modal) {
+        return;
+    }
+
+    modal.style.display =
+        "none";
+}
+
+
+function initializeCameraViewModal() {
+
+    const closeButton =
+        byId("cameraViewClose");
+
+    if (closeButton) {
+
+        closeButton.addEventListener(
+            "click",
+            closeCameraView
+        );
+    }
+
+    const modal =
+        byId("cameraViewModal");
+
+    if (modal) {
+
+        modal.addEventListener(
+            "click",
+            event => {
+
+                if (event.target === modal) {
+
+                    closeCameraView();
+                }
+            }
+        );
+    }
+
+    const prevButton =
+        byId("cameraViewPrev");
+
+    if (prevButton) {
+
+        prevButton.addEventListener(
+            "click",
+            () => {
+
+                const current =
+                    appState.cameraViewIndex || 1;
+
+                const next =
+                    current <= 1
+                        ? CAMERA_COUNT
+                        : current - 1;
+
+                renderCameraViewModal(next);
+            }
+        );
+    }
+
+    const nextButton =
+        byId("cameraViewNext");
+
+    if (nextButton) {
+
+        nextButton.addEventListener(
+            "click",
+            () => {
+
+                const current =
+                    appState.cameraViewIndex || 1;
+
+                const next =
+                    current >= CAMERA_COUNT
+                        ? 1
+                        : current + 1;
+
+                renderCameraViewModal(next);
+            }
+        );
+    }
+
+    document.addEventListener(
+        "keydown",
+        event => {
+
+            if (event.key === "Escape") {
+
+                closeCameraView();
+            }
+        }
+    );
+}
+
+
+/* ==========================================================
    SOCKET.IO
    ========================================================== */
 
@@ -4913,9 +7347,25 @@ function handleProductionEvent(
     if (
         appState.currentPage
         === "production"
+        ||
+        appState.currentPage
+        === "dashboard"
     ) {
 
+        /*
+        Production KPI cards + Camera Production table now live
+        on the Dashboard tab (moved from the former standalone
+        "Production" tab), so refresh them here too on live
+        socket push, not just on the REST poll interval.
+        */
+
         loadProduction()
+            .then(
+                () => {
+
+                    reapplyActiveKpiRangeFilter();
+                }
+            )
             .catch(
                 error => {
 
@@ -5063,11 +7513,19 @@ function startRefreshLoop() {
 
                     /* ----------------------------------------------
                        PRODUCTION
+
+                       Also runs on the Dashboard page, since the
+                       Production KPI cards + Camera Production
+                       table were moved there from the former
+                       standalone "Production" tab.
                        ---------------------------------------------- */
 
                     if (
                         appState.currentPage
                         === "production"
+                        ||
+                        appState.currentPage
+                        === "dashboard"
                     ) {
 
                         await loadProduction();
@@ -5091,6 +7549,25 @@ function startRefreshLoop() {
                     ) {
 
                         await loadAnalytics();
+                    }
+
+
+                    /* ----------------------------------------------
+                       KPI RANGE FILTER
+
+                       loadDashboardState()/loadProduction()/
+                       loadAnalytics() above just re-rendered the KPI
+                       cards from live totals - if a 1/4/8/16/24 HR
+                       filter is active, re-apply it now so it isn't
+                       silently reverted to LIVE every refresh cycle.
+                       ---------------------------------------------- */
+
+                    if (
+                        appState.currentPage
+                        === "dashboard"
+                    ) {
+
+                        reapplyActiveKpiRangeFilter();
                     }
 
 
@@ -5252,6 +7729,24 @@ function initializeRefreshButton() {
                 ) {
 
                     await loadCameraConfig();
+                }
+
+
+                else if (
+                    appState.currentPage
+                    === "dashboard"
+                ) {
+
+                    /*
+                    Production KPI cards + Camera Production
+                    table, and the Analytics-fed data, now live
+                    on the Dashboard tab (moved from the former
+                    standalone "Production"/"Analytics" tabs).
+                    */
+
+                    await loadAnalytics();
+
+                    await loadProduction();
                 }
 
             }
@@ -5441,6 +7936,25 @@ function initializeKeyboardShortcuts() {
                     ) {
 
                         await loadCameraConfig();
+                    }
+
+
+                    else if (
+                        appState.currentPage
+                        === "dashboard"
+                    ) {
+
+                        /*
+                        Production KPI cards + Camera Production
+                        table, and the Analytics-fed data, now
+                        live on the Dashboard tab (moved from the
+                        former standalone "Production"/"Analytics"
+                        tabs).
+                        */
+
+                        await loadAnalytics();
+
+                        await loadProduction();
                     }
 
                 }
@@ -6025,6 +8539,21 @@ async function initialLoad() {
         ) {
 
             await loadAnalytics();
+
+            /*
+            Production KPI cards + Camera Production table now
+            live on the Dashboard tab (moved from the former
+            standalone "Production" tab), so fetch that data
+            on initial load too, not just on the refresh loop.
+            */
+
+            if (
+                appState.currentPage
+                === "dashboard"
+            ) {
+
+                await loadProduction();
+            }
         }
 
 
@@ -6097,6 +8626,13 @@ async function initializeDashboard() {
 
 
     /* ------------------------------------------------------
+       NOTIFICATION SYSTEM
+       ------------------------------------------------------ */
+
+    initializeNotificationSystem();
+
+
+    /* ------------------------------------------------------
        CLOCK
        ------------------------------------------------------ */
 
@@ -6160,6 +8696,24 @@ async function initializeDashboard() {
 
 
     initializeLiveMonitorControls();
+
+
+    /* ------------------------------------------------------
+       CAMERA VIEW MODAL
+       ------------------------------------------------------ */
+
+    initializeCameraViewModal();
+
+
+    /* ------------------------------------------------------
+       PRODUCTION STATISTICS TIME RANGE FILTER
+       ------------------------------------------------------ */
+
+    initializeProductionTrendRangeButtons();
+
+    initializeKpiRangeButtons();
+
+    initializePackerSelector();
 
 
     /* ------------------------------------------------------

@@ -465,6 +465,496 @@ img {
 
 
 /* ==========================================================
+   SYSTEM UPTIME
+   ========================================================== */
+
+.system-uptime-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.uptime-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.uptime-value {
+    font-size: 14px;
+    font-weight: 600;
+    font-family: 'Monaco', 'Courier New', monospace;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+
+/* ==========================================================
+   NOTIFICATION SYSTEM
+   ========================================================== */
+
+.notification-icon-container {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.notification-button {
+    position: relative;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 6px;
+    cursor: pointer;
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 16px;
+    transition: all 0.2s ease;
+}
+
+.notification-button:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 1);
+}
+
+.notification-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    background: var(--danger);
+    color: white;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.notification-panel {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 320px;
+
+    /*
+    Plain fallback first: guaranteed to work on every browser,
+    including older/embedded ones that don't support min()/
+    calc(var()). Without this, if the smarter rule below is
+    invalid on a given browser, max-height falls back to
+    "none" (unbounded) instead of this value - which is
+    exactly what caused the panel to grow to fit every
+    notification instead of capping and scrolling.
+    */
+    max-height: 400px;
+
+    /*
+    Enhancement for modern browsers: cap the panel's height to
+    whatever actually fits below the header on the current
+    screen (falls back to 400px on wider screens where that's
+    never the binding constraint). This is what keeps the
+    panel's footer reachable on short/mobile viewports.
+    */
+    max-height: min(400px, calc(100vh - var(--header-height, 74px) - 24px));
+
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    box-shadow: var(--shadow-large);
+    display: flex;
+    flex-direction: column;
+    z-index: 1000;
+    overflow: hidden;
+}
+
+.notification-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+}
+
+.notification-panel-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.notification-close-btn {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--text-light);
+    font-size: 18px;
+    cursor: pointer;
+    transition: color 0.2s ease;
+}
+
+.notification-close-btn:hover {
+    color: var(--text-primary);
+}
+
+
+/* ==========================================================
+   NOTIFICATION PANEL — LIVE PACKER STATUS CHIP
+   ========================================================== */
+
+.notification-live-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    padding: 10px 14px;
+
+    background: var(--surface-secondary);
+    border-bottom: 1px solid var(--border);
+
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+
+    flex: 0 0 auto;
+}
+
+.live-status-dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 8px;
+
+    border-radius: 50%;
+
+    background: var(--text-light);
+}
+
+.live-status-dot.running {
+    background: var(--success);
+
+    box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+
+    animation: livePulse 1.8s infinite;
+}
+
+.live-status-dot.stopped {
+    background: var(--warning);
+
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.live-status-dot.unknown {
+    background: var(--text-light);
+}
+
+
+/* ==========================================================
+   NOTIFICATION PANEL — PACKER FILTER (ALL / PACKER 1)
+   Rendered as a two-state sliding toggle: a pill background
+   (::before) slides between the two options depending on which
+   button carries the "active" class. dashboard.js still just
+   toggles "active" on the buttons like before - no JS changes
+   needed for the slide animation.
+   ========================================== */
+
+.notification-packer-filter {
+    position: relative;
+    display: flex;
+
+    padding: 4px;
+    margin: 10px 14px;
+
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+
+    flex: 0 0 auto;
+}
+
+.notification-packer-filter::before {
+    content: "";
+    position: absolute;
+    top: 4px;
+    left: 4px;
+
+    width: calc(50% - 4px);
+    height: calc(100% - 8px);
+
+    background: var(--accent-blue);
+    border-radius: 999px;
+
+    transition: transform 0.25s ease;
+    z-index: 0;
+}
+
+.notification-packer-filter:has(.time-range-button[data-packer="1"].active)::before {
+    transform: translateX(100%);
+}
+
+.notification-packer-filter .time-range-button {
+    position: relative;
+    z-index: 1;
+
+    flex: 1 1 50%;
+
+    padding: 6px 10px;
+    font-size: 11px;
+    text-align: center;
+
+    background: transparent;
+    border: none;
+    border-radius: 999px;
+
+    color: var(--text-secondary);
+    transition: color 0.2s ease;
+}
+
+.notification-packer-filter .time-range-button.active {
+    color: #fff;
+    background: transparent;
+}
+
+.notification-list-wrapper {
+    position: relative;
+
+    flex: 1;
+    min-height: 0;
+
+    display: flex;
+    flex-direction: column;
+}
+
+.notification-scroll-hint {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+
+    padding: 6px 0 8px;
+
+    pointer-events: none;
+
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+
+    background: linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0),
+        var(--surface) 55%
+    );
+}
+
+.notification-scroll-hint .icon-svg {
+    width: 13px;
+    height: 13px;
+
+    animation: notificationScrollHintBounce 1.4s ease-in-out infinite;
+}
+
+@keyframes notificationScrollHintBounce {
+    0%, 100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(3px);
+    }
+}
+
+.notification-list {
+    flex: 1;
+
+    /*
+    Without this, a flex child's default min-height is "auto",
+    meaning it refuses to shrink below its content height - so
+    with many notifications the list just grows past the
+    panel's max-height instead of clipping and scrolling. This
+    is what makes the scrollbar actually kick in.
+    */
+    min-height: 0;
+
+    overflow-y: auto;
+    /* Explicitly allow vertical touch panning inside this box,
+       rather than relying on the browser's default touch-action
+       inference - some mobile browsers need this to be explicit
+       for a scrollable box nested inside other interactive UI
+       (the panel's click-to-close handling, etc). */
+    touch-action: pan-y;
+    /* Smooth momentum scrolling on iOS Safari. */
+    -webkit-overflow-scrolling: touch;
+    /* Stop a scroll gesture inside the list from also scrolling
+       the page behind it once the list hits its own top/bottom. */
+    overscroll-behavior: contain;
+    /* Firefox: always show a visible thin scrollbar rather than
+       an auto-hiding overlay one. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-dark) transparent;
+
+    padding: 0;
+}
+
+.notification-list::-webkit-scrollbar {
+    /* Wider and more visible than a typical thin scrollbar, so
+       it reads clearly as "this box scrolls" rather than being
+       mistaken for a hairline decoration. */
+    width: 10px;
+}
+
+.notification-list::-webkit-scrollbar-track {
+    background: var(--surface-secondary);
+}
+
+.notification-list::-webkit-scrollbar-thumb {
+    background: var(--border-dark);
+    border-radius: 999px;
+    border: 2px solid var(--surface-secondary);
+}
+
+.notification-list::-webkit-scrollbar-thumb:hover {
+    background: var(--text-light);
+}
+
+.notification-item {
+    display: flex;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--surface-secondary);
+    align-items: flex-start;
+    transition: background 0.2s ease;
+}
+
+.notification-item:hover {
+    background: var(--surface-secondary);
+}
+
+.notification-item:last-child {
+    border-bottom: none;
+}
+
+.notification-item.notif-success {
+    background: rgba(22, 163, 74, 0.05);
+    border-left: 3px solid var(--success);
+}
+
+.notification-item.notif-danger {
+    background: rgba(220, 38, 38, 0.05);
+    border-left: 3px solid var(--danger);
+}
+
+.notification-item.notif-warning {
+    background: rgba(245, 158, 11, 0.05);
+    border-left: 3px solid var(--warning);
+}
+
+.notification-item.notif-info {
+    background: rgba(25, 118, 210, 0.05);
+    border-left: 3px solid var(--accent-blue);
+}
+
+.notif-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: 0 0 8px;
+    margin-top: 4px;
+}
+
+.notif-success .notif-dot {
+    background: var(--success);
+}
+
+.notif-danger .notif-dot {
+    background: var(--danger);
+}
+
+.notif-warning .notif-dot {
+    background: var(--warning);
+}
+
+.notif-info .notif-dot {
+    background: var(--accent-blue);
+}
+
+.notif-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.notif-content strong {
+    display: block;
+    font-size: 13px;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.notif-content p {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    word-break: break-word;
+}
+
+.notif-time {
+    font-size: 11px;
+    color: var(--text-light);
+    white-space: nowrap;
+    flex: 0 0 auto;
+    margin-left: 8px;
+}
+
+.notification-panel-footer {
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    flex: 0 0 auto;
+}
+
+.mark-read-btn {
+    width: 100%;
+    padding: 8px 12px;
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.mark-read-btn:hover {
+    background: var(--accent-blue);
+    color: white;
+    border-color: var(--accent-blue);
+}
+
+.no-notifications {
+    padding: 20px 14px;
+    text-align: center;
+    color: var(--text-light);
+    font-size: 13px;
+}
+
+
+/* ==========================================================
    BODY
    ========================================================== */
 
@@ -701,6 +1191,10 @@ img {
     margin-bottom: 18px;
 }
 
+.page-header-hidden {
+    display: none;
+}
+
 .page-header h2 {
     font-size: 27.5px;
     font-weight: 700;
@@ -722,6 +1216,13 @@ img {
     align-items: center;
 
     gap: 8px;
+
+    /*
+    Keeps the Refresh button right-aligned even when the
+    title/subtitle beside it (#pageHeaderText) is hidden, e.g.
+    on the Dashboard page.
+    */
+    margin-left: auto;
 }
 
 
@@ -3550,4 +4051,725 @@ img {
     .sidebar-item i { font-size: 27px; }
     .chart-header h3 { font-size: 27px; }
     .events-table { font-size: 20px; }
+}
+
+
+/* ==========================================================
+   SYSTEM STATUS PAGE
+   ========================================================== */
+
+.system-status-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.health-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 0;
+}
+
+.health-card {
+    padding: 16px;
+    background: linear-gradient(135deg, var(--surface-secondary) 0%, var(--surface) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.health-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.health-card-header h4 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.status-indicator {
+    font-size: 20px;
+    color: var(--text-light);
+}
+
+.status-indicator.healthy {
+    color: var(--success);
+}
+
+.status-indicator.warning {
+    color: var(--warning);
+}
+
+.status-indicator.critical {
+    color: var(--danger);
+}
+
+.health-card p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.status-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.status-item {
+    padding: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    border-left: 3px solid var(--border);
+}
+
+.status-item.status-online {
+    background: rgba(22, 163, 74, 0.03);
+    border-left-color: var(--success);
+}
+
+.status-item.status-offline {
+    background: rgba(220, 38, 38, 0.03);
+    border-left-color: var(--danger);
+}
+
+.status-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.status-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.status-badge {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.status-item.status-online .status-badge {
+    background: rgba(22, 163, 74, 0.15);
+    color: var(--success);
+}
+
+.status-item.status-offline .status-badge {
+    background: rgba(220, 38, 38, 0.15);
+    color: var(--danger);
+}
+
+.status-details {
+    display: flex;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.detail {
+    display: flex;
+    gap: 4px;
+}
+
+.detail strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.camera-view-btn {
+    width: 100%;
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: var(--accent-blue);
+    color: white;
+    border: none;
+    border-radius: var(--radius-small);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s ease;
+}
+
+.camera-view-btn:hover {
+    background: var(--accent-blue-hover);
+}
+
+.packer-status-card {
+    padding: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+}
+
+.status-display {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.status-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.status-value {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--success);
+}
+
+
+/* ==========================================================
+   PACKER RUNNING STATUS — SUBSYSTEM GRID (PLC / PMS / DCS)
+   ========================================================== */
+
+.packer-subsystem-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+
+    margin-top: 16px;
+    padding-top: 16px;
+
+    border-top: 1px solid var(--border);
+}
+
+.packer-subsystem-item {
+    min-width: 0;
+    padding: 10px 12px;
+
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+
+    text-align: center;
+}
+
+.packer-subsystem-item span {
+    display: block;
+
+    margin-bottom: 4px;
+
+    font-size: 12px;
+    font-weight: 600;
+
+    color: var(--text-secondary);
+
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+
+.packer-subsystem-item strong {
+    display: block;
+
+    font-size: 15px;
+    font-weight: 700;
+
+    color: var(--text-primary);
+}
+
+@media (max-width: 480px) {
+
+    .packer-subsystem-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+/* ==========================================================
+   REPORTS PAGE
+   ========================================================== */
+
+.reports-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.report-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    padding: 0;
+}
+
+.form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.form-row label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.form-input {
+    padding: 10px 12px;
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+    font-size: 13px;
+    color: var(--text-primary);
+    font-family: inherit;
+    transition: border-color 0.2s ease;
+}
+
+.form-input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.1);
+}
+
+.action-button {
+    padding: 10px 20px;
+    background: var(--accent-blue);
+    color: white;
+    border: none;
+    border-radius: var(--radius-small);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s ease;
+    grid-column: 1 / -1;
+}
+
+.action-button:hover {
+    background: var(--accent-blue-hover);
+}
+
+.reports-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.no-reports {
+    padding: 20px;
+    text-align: center;
+    color: var(--text-light);
+    font-size: 13px;
+    background: var(--surface-secondary);
+    border-radius: var(--radius-medium);
+}
+
+
+/* ==========================================================
+   ABOUT PAGE
+   ========================================================== */
+
+.about-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.about-section {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+}
+
+.about-section:first-of-type {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+.about-section h4 {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.about-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+}
+
+.about-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.about-item.full-width {
+    grid-column: 1 / -1;
+}
+
+.about-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-light);
+}
+
+.about-value {
+    font-size: 14px;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.update-card {
+    padding: 14px;
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+}
+
+.update-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+}
+
+.update-row:not(:last-child) {
+    border-bottom: 1px solid var(--border);
+}
+
+.update-row span {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.update-row strong {
+    font-size: 14px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+
+/* ==========================================================
+   SIDEBAR DIVIDER
+   ========================================================== */
+
+.sidebar-divider {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.1);
+    margin: 10px 0;
+}
+
+
+/* ==========================================================
+   HEADER: SYSTEM UPTIME (moved out of the old runtime-summary
+   bar and into the top header, next to the clock)
+   ========================================================== */
+
+.header-uptime {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+    white-space: nowrap;
+}
+
+.header-uptime span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.header-uptime span .icon-svg {
+    width: 12px;
+    height: 12px;
+}
+
+.header-uptime strong {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ffffff;
+}
+
+
+/* ==========================================================
+   DASHBOARD CAMERA CARD: "Camera View" BUTTON
+   ========================================================== */
+
+.camera-view-button {
+    width: 100%;
+    margin-top: 12px;
+    justify-content: center;
+}
+
+
+/* ==========================================================
+   PRODUCTION STATISTICS: TIME RANGE FILTER
+   ========================================================== */
+
+.time-range-buttons {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.kpi-range-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.time-range-button {
+    padding: 6px 14px;
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.18s ease;
+}
+
+.time-range-button:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+}
+
+.time-range-button.active {
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
+    color: #ffffff;
+}
+
+
+/* ==========================================================
+   CAMERA VIEW MODAL
+   ========================================================== */
+
+.camera-view-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    background: rgba(0, 20, 24, 0.72);
+    padding: 20px;
+}
+
+.camera-view-modal-content {
+    width: min(720px, 100%);
+    max-height: 90vh;
+
+    background: var(--surface);
+    border-radius: var(--radius-medium);
+    box-shadow: var(--shadow-large);
+
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.camera-view-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    padding: 14px 18px;
+
+    background: var(--primary-dark);
+    color: #ffffff;
+}
+
+.camera-view-modal-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.modal-close-btn {
+    width: 28px;
+    height: 28px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    background: rgba(255, 255, 255, 0.12);
+    border: none;
+    border-radius: 6px;
+
+    color: #ffffff;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+
+    transition: background 0.2s ease;
+}
+
+.modal-close-btn:hover {
+    background: rgba(255, 255, 255, 0.24);
+}
+
+.camera-view-modal-body {
+    flex: 1;
+    min-height: 320px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    background: #000;
+}
+
+.camera-view-feed {
+    width: 100%;
+    height: 100%;
+    min-height: 320px;
+
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 14px;
+}
+
+.camera-view-feed img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.camera-view-feed .icon-svg {
+    width: 36px;
+    height: 36px;
+}
+
+.camera-view-modal-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+}
+
+
+/* ==========================================================
+   PACKER RUNNING STATUS COLOR STATES
+   ========================================================== */
+
+.status-value-running {
+    color: var(--success);
+}
+
+.status-value-stopped {
+    color: var(--danger);
+}
+
+
+/* ==========================================================
+   ABOUT PAGE — ICON HEADER CARDS
+   ========================================================== */
+
+.about-card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.about-card-header .icon-svg {
+    width: 20px;
+    height: 20px;
+    color: var(--primary-light);
+}
+
+.about-card-header h3 {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.about-card p {
+    margin-bottom: 12px;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+}
+
+.about-card p:last-of-type {
+    margin-bottom: 0;
+}
+
+.about-card-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    margin-top: 16px;
+    padding-top: 14px;
+
+    border-top: 1px solid var(--border);
+
+    font-size: 13px;
+    color: var(--text-light);
+}
+
+.about-card-footer .icon-svg {
+    width: 14px;
+    height: 14px;
+}
+
+
+/* ==========================================================
+   ABOUT PAGE — BADGE-STYLE VALUES
+   ========================================================== */
+
+.about-value-badge {
+    display: inline-block;
+    margin-top: 4px;
+
+    padding: 6px 12px;
+
+    border-radius: var(--radius-small);
+
+    font-size: 13px;
+    font-weight: 700;
+
+    width: fit-content;
+}
+
+.about-value-badge.badge-blue {
+    color: #ffffff;
+    background: var(--accent-blue);
+}
+
+.about-value-badge.badge-grey {
+    color: var(--text-primary);
+    background: var(--border-dark);
+}
+
+.about-value-badge.badge-orange {
+    color: #ffffff;
+    background: var(--warning);
 }

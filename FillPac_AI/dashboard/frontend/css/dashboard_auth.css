@@ -33,7 +33,17 @@
     padding: 0 20px;
     height: 60px;
     border-left: 1px solid rgba(255, 255, 255, 0.15);
-    margin-left: auto;
+
+    /*
+    NOTE: margin-left: auto intentionally removed here.
+    .user-menu is injected inside .header-right, which already
+    packs all of its children (status, uptime, clock,
+    notification bell, user-menu) tightly against the right
+    edge via justify-content: flex-end. An auto left-margin on
+    this element fights that layout, shoving .user-menu all the
+    way to the far edge and leaving a large empty gap between
+    it and the notification bell.
+    */
 }
 
 .user-info {
