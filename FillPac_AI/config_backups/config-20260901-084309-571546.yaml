@@ -125,7 +125,7 @@ condition_c:
     y1: 90
     x2: 1220
     y2: 680
-  max_allowed_bags: 1
+  max_allowed_bags: 2
   min_track_age: 4
   ignore_unstable_tracks: true
   ignore_motion_jumps: true

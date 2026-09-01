@@ -94,6 +94,17 @@ try:
 except ImportError:
     yaml = None
 
+# ConfigManager (src/config_manager.py) is the only place that
+# writes config.yaml from the dashboard's Settings page. It
+# backs up config.yaml before every write and validates
+# candidate content using the same rules src.config.Config
+# applies to the running pipeline, so a bad edit here can never
+# corrupt the file the AI pipeline reads on its next restart.
+from src.config_manager import (
+    ConfigManager,
+    ConfigValidationError,
+)
+
 
 # ==========================================================
 # PROJECT PATHS
@@ -106,6 +117,8 @@ DASHBOARD_DIR = BACKEND_DIR.parent
 PROJECT_ROOT = DASHBOARD_DIR.parent
 
 CONFIG_FILE = PROJECT_ROOT / "config.yaml"
+
+CONFIG_MANAGER = ConfigManager(CONFIG_FILE)
 
 # NOTE: state.json, count_events.jsonl and the
 # logs/condition_c/events/*.json files are gone -- that data
@@ -1734,6 +1747,27 @@ async def get_current_user(
     return user
 
 
+async def require_admin(
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """
+    Same as get_current_user, but additionally requires the
+    "admin" role (dbo.users.role -- see database/repository.py's
+    create_user/ensure_default_admin_user). Used to gate
+    config.yaml writes so an "operator" account can view the
+    Settings page but not change values that affect jam/count
+    detection; only "admin" accounts can save/reload/reset.
+    """
+
+    if (user.get("role") or "").lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="This action requires an administrator account.",
+        )
+
+    return user
+
+
 @api.post("/api/auth/login")
 async def auth_login(payload: LoginRequest):
 
@@ -3100,6 +3134,212 @@ async def config(_user: dict = Depends(get_current_user)):
     return (
         read_safe_config()
     )
+
+
+# ==========================================================
+# SETTINGS (full read/write access to config.yaml)
+# ==========================================================
+#
+# /config above is a reduced, read-only view used by the live
+# dashboard. These routes expose and edit the COMPLETE
+# config.yaml so the Settings page never has to guess at a
+# field it doesn't explicitly list.
+#
+# IMPORTANT -- saving here does NOT change the behaviour of an
+# already-running FillPac AI process. Every detector
+# (JamDetector, BagSpacingDetector, EntryROICounter, etc.)
+# copies its thresholds out of config.yaml exactly once, inside
+# Pipeline.__init__, when the process starts. A saved change
+# takes effect the next time the FillPac AI service is
+# restarted -- every response below says so explicitly via
+# "applied_live": False so the frontend can show that to the
+# operator instead of implying the change is already live.
+
+@api.get("/api/settings")
+async def get_settings(
+    _user: dict = Depends(get_current_user),
+):
+
+    try:
+        data = CONFIG_MANAGER.load()
+
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        )
+
+    except ConfigValidationError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+    return {
+        "config": data,
+        "last_modified": (
+            datetime.fromtimestamp(
+                CONFIG_FILE.stat().st_mtime,
+                tz=timezone.utc,
+            ).isoformat()
+            if CONFIG_FILE.exists()
+            else None
+        ),
+    }
+
+
+@api.post("/api/settings/validate")
+async def validate_settings(
+    payload: dict,
+    _user: dict = Depends(require_admin),
+):
+    """
+    Validate a candidate config WITHOUT writing it -- backs the
+    [Validate] button so an admin can check edits are legal
+    before committing to [Save].
+    """
+
+    try:
+        CONFIG_MANAGER.validate(payload)
+
+    except ConfigValidationError as error:
+        return {
+            "valid": False,
+            "error": str(error),
+        }
+
+    return {
+        "valid": True,
+        "error": None,
+    }
+
+
+@api.put("/api/settings")
+async def put_settings(
+    payload: dict,
+    _user: dict = Depends(require_admin),
+):
+
+    try:
+        result = CONFIG_MANAGER.save(payload)
+
+    except ConfigValidationError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    logger.info(
+        "config.yaml saved via /api/settings (%d field(s) "
+        "changed, backup: %s)",
+        len(result["changes"]),
+        result["backup_path"],
+    )
+
+    return {
+        "saved": True,
+        "applied_live": False,
+        "message": (
+            "Settings saved. Restart the FillPac AI service "
+            "to apply these changes to the running pipeline."
+        ),
+        "backup_path": result["backup_path"],
+        "changes": result["changes"],
+    }
+
+
+@api.post("/api/settings/reload")
+async def reload_settings(
+    _user: dict = Depends(require_admin),
+):
+    """
+    Confirms config.yaml on disk is currently valid and
+    loadable -- the same check the AI pipeline runs at startup.
+    Does NOT push values into the running pipeline; see the
+    note above the /api/settings routes.
+    """
+
+    try:
+        data = CONFIG_MANAGER.load()
+        CONFIG_MANAGER.validate(data)
+
+    except (FileNotFoundError, ConfigValidationError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    return {
+        "valid": True,
+        "applied_live": False,
+        "message": (
+            "config.yaml is valid. Restart the FillPac AI "
+            "service to apply it."
+        ),
+    }
+
+
+@api.get("/api/settings/backups")
+async def list_settings_backups(
+    _user: dict = Depends(get_current_user),
+):
+
+    return {
+        "backups": CONFIG_MANAGER.list_backups(),
+    }
+
+
+@api.post("/api/settings/reset")
+async def reset_settings(
+    backup: str | None = Query(default=None),
+    _user: dict = Depends(require_admin),
+):
+    """
+    Restore config.yaml from a backup written by a previous
+    /api/settings save. Defaults to the most recent backup
+    (i.e. "undo my last save") when `backup` is not given.
+    """
+
+    backups = CONFIG_MANAGER.list_backups()
+
+    if not backups:
+        raise HTTPException(
+            status_code=404,
+            detail="No config.yaml backups exist yet.",
+        )
+
+    target = backup or backups[0]
+
+    try:
+        data = CONFIG_MANAGER.restore_backup(target)
+
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        )
+
+    except ConfigValidationError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    logger.info(
+        "config.yaml restored from backup: %s",
+        target,
+    )
+
+    return {
+        "restored": True,
+        "applied_live": False,
+        "restored_from": target,
+        "config": data,
+        "message": (
+            "config.yaml restored. Restart the FillPac AI "
+            "service to apply it."
+        ),
+    }
 
 
 # ==========================================================

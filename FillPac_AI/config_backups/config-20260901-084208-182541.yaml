@@ -1,0 +1,1041 @@
+project:
+  name: FillPac AI
+  version: 1.1.0
+
+
+# ==========================================================
+# MODEL
+# ==========================================================
+
+model:
+  path: models/fillpac_yolo26n_best.pt
+
+  # Global YOLO confidence must be <= lowest class threshold.
+  confidence: 0.20
+  iou: 0.45
+
+  device: cpu
+
+  # Better resolution for relatively small print objects.
+  image_size: 640
+
+  half: false
+  max_detections: 20
+  min_bbox_area: 800
+
+  detection_roi:
+    x1: 0
+    y1: 120
+    x2: 1920
+    y2: 1080
+
+  allowed_classes:
+    - 0
+    - 1
+
+  # Class-specific thresholds
+  bag_confidence: 0.35
+  print_confidence: 0.20
+
+
+# ==========================================================
+# TRACKER
+# ==========================================================
+
+tracker:
+  type: bytetrack
+
+  track_high_thresh: 0.45
+  track_low_thresh: 0.10
+  new_track_thresh: 0.60
+
+  track_buffer: 60
+  match_thresh: 0.85
+
+  # Matched to the camera's actual FPS (see camera logs:
+  # "connected (1280x720, 25.00 FPS)"). ByteTrack uses this
+  # to convert track_buffer (in frames) into real seconds --
+  # at 30 it assumed 60 frames = 2.0s; at the true 25fps that
+  # window is actually 2.4s.
+  frame_rate: 25
+  minimum_consecutive_frames: 1
+
+  min_track_age: 4
+
+  min_bbox_area: 4000
+  min_bbox_area_ratio: 0.002
+  min_track_confidence: 0.25
+
+  max_jump_distance: 250
+  min_iou_warning: 0.10
+
+  unstable_frame_threshold: 3
+  history_ttl_frames: 120
+
+
+# ==========================================================
+# COUNTING
+# ==========================================================
+
+counting:
+  method: center
+
+  # Vertical counting line (x1==x2) requires horizontal crossing.
+  # Evidence from live screenshots (higher/newer track IDs sitting
+  # further left) points to right -> left travel. Flip to "right"
+  # if Count stays at 0 after this change.
+  direction: left
+
+  duplicate_distance: 30
+  duplicate_time: 0.8
+
+  line_tolerance: 12
+  late_start_margin: 40
+
+  minimum_cross_distance: 15
+  min_track_frames: 4
+
+  stale_track_frames: 120
+
+
+# ==========================================================
+# PRINT DETECTION
+# ==========================================================
+
+print_detection:
+  enabled: true
+
+  confidence: 0.20
+  iou: 0.45
+
+  iou_threshold: 0.0
+  min_overlap_ratio: 0.30
+
+  min_print_area: 80
+  max_print_area: 0
+
+  min_aspect_ratio: 0
+  max_aspect_ratio: 0
+  max_center_distance: 0
+
+  # Temporal voting
+  vote_threshold: 0.60
+  min_votes: 4
+  min_observations: 4
+
+  history_size: 30
+  history_ttl_frames: 120
+
+  min_observation_speed: 0.0
+  skip_motion_jump_observations: true
+
+
+# ==========================================================
+# JAM DETECTION
+# ==========================================================
+#
+# Current normal-video observations:
+#
+# Far bags:
+#   approximately 12-15 px/s
+#
+# Mid / near bags:
+#   approximately 35-100+ px/s
+#
+# Therefore:
+#
+# <= 4 px/s     = potentially stationary
+# 4-9 px/s      = slow
+# > 9 px/s      = normal
+#
+# A JAM is NOT triggered only by low speed.
+# Low movement must persist for the configured time.
+#
+# ==========================================================
+
+jam_detection:
+  enabled: true
+
+  # ENLARGED ROI (was 273,120 -> 1007,600) so both bags stay
+  # comfortably inside the region even mid-glide, not just when
+  # perfectly centered. Real 1280x720 RTSP sub-stream resolution.
+  roi:
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
+
+  # Trajectory history
+  history_seconds: 1.0
+  min_history_seconds: 0.5
+
+  # Motion thresholds
+  stationary_speed_threshold: 4.0
+  slow_speed_threshold: 9.0
+
+  # Temporal decision
+  warning_time_seconds: 3.0
+  jam_time_seconds: 5.0
+
+  recovery_time_seconds: 1.0
+
+  # Track validation
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  track_ttl_seconds: 2.0
+
+# ==========================================================
+# BAG SPACING JAM DETECTION - CONDITION B
+# ==========================================================
+#
+# Purpose:
+# Detect a bag jam when the physical edge-to-edge distance
+# between any two adjacent bags is less than or equal to
+# the configured threshold.
+#
+# Decision:
+#
+#   gap_mm <= jam_threshold_mm  -> JAM
+#   gap_mm >  jam_threshold_mm  -> NORMAL
+#
+# IMPORTANT:
+# - No timer is used.
+# - No stationary condition is required.
+# - Only adjacent bags are compared.
+# - Distance is calculated after pixel -> mm calibration.
+#
+# NOTE:
+# Calibration values below are DEVELOPMENT REFERENCE VALUES.
+# They MUST be replaced with actual measured conveyor
+# coordinates for production.
+# ==========================================================
+
+bag_spacing:
+  enabled: true
+
+  # Conveyor movement direction
+  direction: left
+
+  # --------------------------------------------------------
+  # JAM DISTANCE
+  # --------------------------------------------------------
+  #
+  # Actual required minimum normal spacing = 300 mm
+  # Measurement / calibration margin        =   5 mm
+  #
+  # Effective jam threshold                 = 305 mm
+  #
+  # Therefore:
+  #
+  # > 305 mm  = NORMAL
+  # <=305 mm  = JAM
+  # --------------------------------------------------------
+
+  minimum_safe_gap_mm: 650.0
+  measurement_margin_mm: 5.0
+  jam_threshold_mm: 655.0
+
+  # --------------------------------------------------------
+  # TRACK VALIDATION
+  # --------------------------------------------------------
+
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  # --------------------------------------------------------
+  # STATE DEBOUNCE (HYSTERESIS)
+  # --------------------------------------------------------
+  #
+  # The gap_mm <= threshold decision above is still evaluated
+  # every frame with no timer, exactly as documented -- these
+  # two settings only control how many CONSECUTIVE frames that
+  # raw decision must hold before the reported jam state (and
+  # therefore the SQL jam_events start/end row) actually flips.
+  # This is what stops a bag gliding right at the threshold from
+  # flooding jam_events with many sub-second start/recover rows.
+  #
+  # At 25 fps, 3 frames = ~120ms of confirmation.
+  jam_confirm_frames: 3
+  recovery_confirm_frames: 3
+
+  # --------------------------------------------------------
+  # BAG SPACING ROI
+  # --------------------------------------------------------
+  #
+  # Only bags whose centers are inside this region are
+  # considered for spacing calculation.
+  #
+  # ENLARGED ROI (was 273,120 -> 1007,600), matches the jam
+  # monitoring area above. Real 1280x720 RTSP sub-stream resolution.
+  # --------------------------------------------------------
+
+  roi:
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
+
+  # --------------------------------------------------------
+  # CAMERA CALIBRATION
+  # --------------------------------------------------------
+  #
+  # Homography maps:
+  #
+  #       IMAGE PIXELS
+  #            |
+  #            v
+  #       REAL WORLD
+  #       MILLIMETRES
+  #
+  # Point order MUST remain:
+  #
+  # P1 = top-left
+  # P2 = top-right
+  # P3 = bottom-right
+  # P4 = bottom-left
+  #
+  # --------------------------------------------------------
+
+  calibration:
+
+    # PLACEHOLDER - updated to match the ENLARGED ROI corners
+    # (150,60)-(1250,710) so the geometry stays structurally
+    # consistent with the resized ROI above. This still does NOT
+    # reflect real physical measurements. Do not trust mm output
+    # from this until the conveyor is measured and these points
+    # (and world_points_mm below) are replaced with real values.
+
+    image_points:
+      - [180, 90]     # P1
+      - [1220, 90]    # P2
+      - [1220, 680]   # P3
+      - [180, 680]    # P4
+
+    # PLACEHOLDER world dimensions -- UNCHANGED. Do not scale this
+    # up just because the pixel ROI grew; it must come from an
+    # actual physical measurement of the new ROI's real-world
+    # width/length on the conveyor.
+
+    world_points_mm:
+      - [0, 0]        # P1
+      - [2540, 0]      # P2
+      - [2540, 1550]   # P3
+      - [0, 1550]     # P4
+
+# ==========================================================
+# ROI OCCUPANCY JAM DETECTION - CONDITION C
+# ==========================================================
+#
+# Purpose:
+# Detect bag accumulation inside a predefined ROI.
+#
+# Decision:
+#
+# bag_count_in_roi > max_allowed_bags
+#            -> CONDITION C JAM
+#
+# When triggered:
+#   • Save ROI image
+#   • Save jam log
+#   • Save distances between bags
+#
+# Final Jam:
+#
+# Condition A OR
+# Condition B OR
+# Condition C
+#
+# ==========================================================
+
+condition_c:
+
+  enabled: true
+
+  # ENLARGED ROI (was 273,120 -> 1007,600), matches jam_detection
+  # and bag_spacing above.
+  roi:
+
+    x1: 180
+    y1: 90
+    x2: 1220
+    y2: 680
+
+  # ROI is sized to normally hold ~2 bags at once (see jam_detection
+  # comment above). JAM should only fire on a 3rd bag accumulating,
+  # not on the normal 2-bag occupancy shown in the test screenshots.
+  # FIXED: was 1, which meant 2 bags (the normal, expected occupancy)
+  # incorrectly triggered ROI OCCUPANCY : JAM. Now allows 2 before
+  # firing, matching the comment above and the ROI's actual sizing.
+  max_allowed_bags: 1
+
+  # Ignore unstable tracks
+  min_track_age: 4
+
+  ignore_unstable_tracks: true
+  ignore_motion_jumps: true
+
+  # STATE DEBOUNCE (HYSTERESIS) -- see bag_spacing above for
+  # why this is needed. bag_count flickering by +/-1 right at
+  # max_allowed_bags used to flood jam_events with sub-second
+  # start/recover rows; this requires N consecutive frames of
+  # agreement before the reported jam state flips.
+  jam_confirm_frames: 3
+  recovery_confirm_frames: 3
+
+  # Save evidence
+  save_roi_image: true
+
+  save_full_frame: false
+
+  # save_logs / log_directory are deprecated: the per-event
+  # JSON log file has been removed. Condition C events are
+  # now persisted to SQL Server (dbo.jam_events / dbo.roi_
+  # snapshots) by the pipeline, using the image saved below.
+
+  save_distances: true
+
+  capture_cooldown_seconds: 1
+
+  image_directory: logs/roi_images
+
+# ==========================================================
+# CAMERAS
+# ==========================================================
+
+cameras:
+
+  # ========================================================
+  # CAMERA 1
+  # COUNT + PRINT + JAM
+  # ========================================================
+
+  - id: 1
+    name: Camera 1
+
+    enabled: true
+    mode: video
+    source: "data/videos/camera1_test.mp4"
+    # source: "rtsp://beumer:Beumer!123@172.20.45.131:554/video/live?channel=1&subtype=1"
+
+    buffer_size: 1
+
+    inference_timeout: 15
+    dashboard_publish_interval: 0.5
+
+    model:
+      path: models/fillpac_yolo26n_best.pt
+
+      confidence: 0.20
+      iou: 0.45
+
+
+      device: cpu
+      image_size: 640
+      half: true
+
+      max_detections: 50
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      direction: right
+
+      duplicate_distance: 50
+      duplicate_time: 1.5
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      minimum_cross_distance: 0
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
+    # ==================================================
+    # SEPARATE BAG ENTRY ROI COUNTER
+    # ==================================================
+
+    entry_roi_counting:
+      enabled: true
+
+      roi:
+        x1: 273
+        y1: 120
+        x2: 640
+        y2: 600
+
+      min_track_frames: 4
+      duplicate_distance: 50
+      max_history: 300
+
+    print_detection:
+      enabled: true
+
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      # ENLARGED ROI (was 273,120 -> 1007,600) -- Camera 1's own
+      # override, must match the global jam_detection ROI above
+      # or this one wins for Camera 1 specifically.
+      roi:
+        x1: 180
+        y1: 90
+        x2: 1220
+        y2: 680
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
+    # Vertical counting line, centered on the real 1280x720 sub-stream (was horizontal line at Y=380)
+    roi:
+      x1: 640
+      y1: 120
+      x2: 640
+      y2: 600
+
+      # NEW physical-center counting ROI (primary count event).
+      # Bags moving right -> left are counted when their center
+      # enters this zone (273 to 640), not when they cross the
+      # x=640 line. The line above remains as a fallback.
+      entry_roi:
+        enabled: true
+        x1: 273
+        y1: 120
+        x2: 640
+        y2: 600
+
+        entry_direction: left
+
+
+  # ========================================================
+  # CAMERA 2
+  # COUNT + PRINT + JAM
+  # ========================================================
+
+  - id: 2
+    name: Camera 2
+
+    enabled: true
+
+    mode: video
+    source: "data/videos/camera1_test.mp4"
+
+    buffer_size: 1
+
+    inference_timeout: 15
+    dashboard_publish_interval: 0.5
+
+    model:
+      path: models/fillpac_yolo26n_best.pt
+
+      confidence: 0.20
+      iou: 0.45
+
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 80
+        x2: 1280
+        y2: 720
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      # TEMPORARY DIAGNOSTIC VALUE (was left) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "left" or "right" based
+      # on the actual observed movement.
+      direction: both
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting on
+      # Camera 2. Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
+    # ==================================================
+    entry_roi_counting:
+      enabled: true
+
+      roi:
+        x1: 273
+        y1: 120
+        x2: 640
+        y2: 600
+
+      min_track_frames: 4
+      duplicate_distance: 50
+      max_history: 300
+    # ==================================================
+    print_detection:
+      enabled: true
+
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 273
+        y1: 120
+        x2: 1007
+        y2: 600
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
+    roi:
+      x1: 640
+      y1: 120
+      x2: 640
+      y2: 600
+
+
+  # ========================================================
+  # CAMERA 3
+  # COUNT + JAM
+  # PRINT DISABLED
+  # ========================================================
+
+  - id: 3
+    name: Camera 3
+
+    enabled: false
+
+    mode: video
+    source: "data/videos/camera 3.mp4"
+
+    buffer_size: 1
+
+    inference_timeout: 15
+    dashboard_publish_interval: 0.5
+
+    model:
+      path: models/fillpac_yolo26n_best.pt
+
+      confidence: 0.20
+      iou: 0.45
+
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      # TEMPORARY DIAGNOSTIC VALUE (was up) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "up" or "down" based
+      # on the actual observed movement.
+      direction: both
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting.
+      # Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
+    print_detection:
+      enabled: false
+
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
+    roi:
+      x1: 0
+      y1: 380
+      x2: 477
+      y2: 380
+
+
+  # ========================================================
+  # CAMERA 4
+  # COUNT + JAM
+  # PRINT DISABLED
+  # ========================================================
+
+  - id: 4
+    name: Camera 4
+
+    enabled: false
+
+    mode: video
+    source: "data/videos/camera 4.mp4"
+
+    buffer_size: 1
+
+    inference_timeout: 15
+    dashboard_publish_interval: 0.5
+
+    model:
+      path: models/fillpac_yolo26n_best.pt
+
+      confidence: 0.20
+      iou: 0.45
+
+      device: cpu
+      image_size: 640
+      half: false
+
+      max_detections: 20
+      min_bbox_area: 800
+
+      detection_roi:
+        x1: 0
+        y1: 120
+        x2: 1920
+        y2: 1080
+
+      allowed_classes:
+        - 0
+        - 1
+
+      bag_confidence: 0.35
+      print_confidence: 0.20
+
+    counting:
+      method: center
+      # TEMPORARY DIAGNOSTIC VALUE (was up) -- run with "both"
+      # first to confirm the counting mechanism itself works,
+      # regardless of which physical direction is correct. Once
+      # a bag counts, set this back to "up" or "down" based
+      # on the actual observed movement.
+      direction: both
+
+      duplicate_distance: 30
+      duplicate_time: 0.8
+
+      line_tolerance: 12
+      late_start_margin: 40
+
+      # TEMPORARY TEST VALUE (was 15) -- set to 0 to remove this
+      # restriction while verifying physical-center counting.
+      # Restore to 15 once Count is confirmed working.
+      minimum_cross_distance: 0
+      min_track_frames: 4
+
+      stale_track_frames: 120
+
+    print_detection:
+      enabled: false
+
+      confidence: 0.20
+      iou: 0.45
+
+      iou_threshold: 0.0
+      min_overlap_ratio: 0.30
+
+      min_print_area: 80
+      max_print_area: 0
+
+      min_aspect_ratio: 0
+      max_aspect_ratio: 0
+      max_center_distance: 0
+
+      vote_threshold: 0.60
+      min_votes: 4
+      min_observations: 4
+
+      history_size: 30
+      history_ttl_frames: 120
+
+      min_observation_speed: 0.0
+      skip_motion_jump_observations: true
+
+    jam_detection:
+      enabled: true
+
+      roi:
+        x1: 0
+        y1: 150
+        x2: 477
+        y2: 500
+
+      history_seconds: 1.0
+      min_history_seconds: 0.5
+
+      stationary_speed_threshold: 4.0
+      slow_speed_threshold: 9.0
+
+      warning_time_seconds: 3.0
+      jam_time_seconds: 5.0
+      recovery_time_seconds: 1.0
+
+      min_track_age: 4
+
+      ignore_unstable_tracks: true
+      ignore_motion_jumps: true
+
+      track_ttl_seconds: 2.0
+
+    roi:
+      x1: 0
+      y1: 380
+      x2: 477
+      y2: 380
+
+
+# ==========================================================
+# DISPLAY
+# ==========================================================
+
+display:
+  show_boxes: true
+  show_labels: true
+  show_center: true
+  show_roi: true
+  show_fps: true
+  show_count: true
+
+  # Condition A
+  show_jam_roi: true
+  show_jam_status: true
+  show_jam_speed: true
+  show_stationary_time: true
+
+  # Condition B
+  show_spacing_roi: true
+  show_spacing_lines: true
+  show_spacing_status: true
+  show_spacing_jam_boxes: true
+
+# ==========================================================
+# OUTPUT
+# ==========================================================
+
+output:
+  save_video: false
+  save_images: false
+
+  output_path: data/output
+
+
+# ==========================================================
+# ELASTICSEARCH
+# ==========================================================
+
+elasticsearch:
+  enabled: false
+
+  host: localhost
+  port: 9200
+
+  indices:
+    count: fillpac-count
+    print: fillpac-print
+    camera: fillpac-camera
+
+
+# ==========================================================
+# DASHBOARD
+# ==========================================================
+
+dashboard:
+  enabled: true
+
+  host: 0.0.0.0
+  port: 8000
+
+  # state.json has been removed. DashboardState now persists
+  # to SQL Server (dbo.system_state / dbo.camera_status) on
+  # every publish -- there is no file to configure.
+
+  publish_interval: 0.25
+  stale_timeout: 10.0
+
+
+# ==========================================================
+# LOGGING
+# ==========================================================
+
+logging:
+  level: INFO
+
+  file: logs/application.log
+
+  # count_events.jsonl has been removed. Confirmed bag counts
+  # are now written straight to SQL Server (dbo.production_events)
+  # by CountLogger -- there is no file to configure.
+
+  count_flush_immediately: true

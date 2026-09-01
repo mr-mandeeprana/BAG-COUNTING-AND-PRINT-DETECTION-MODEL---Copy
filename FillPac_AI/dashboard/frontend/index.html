@@ -2620,7 +2620,14 @@ img {
 
             <!-- ==================================================
                  PAGE 8
-                 SETTINGS
+                 SETTINGS / MAINTENANCE
+                 Fully data-driven editor for config.yaml, built
+                 from whatever GET /api/settings returns (see
+                 dashboard.js "SETTINGS PAGE" block). Nothing in
+                 this markup hard-codes a parameter name -- the
+                 tabs, groups and fields below are populated
+                 entirely by loadSettings()/renderSettingsTabs()/
+                 renderSettingsActiveTab().
                  ================================================== -->
 
             <section
@@ -2628,230 +2635,55 @@ img {
                 class="dashboard-page"
             >
 
+                <div class="settings-toolbar">
 
-                <div class="settings-grid">
+                    <div class="settings-toolbar-left">
 
+                        <label class="settings-toggle-switch">
+                            <input type="checkbox" id="settingsAdvancedToggle">
+                            <span class="settings-toggle-slider"></span>
+                        </label>
 
-                    <!-- SYSTEM -->
+                        <span class="settings-toggle-label">
+                            Show Advanced Settings
+                        </span>
 
-                    <section class="section-container settings-card">
+                        <span id="settingsStatusText" class="settings-status-text">
+                            Loading configuration...
+                        </span>
 
+                    </div>
 
-                        <div class="section-header">
+                    <div class="settings-toolbar-right">
 
-                            <div>
+                        <button id="settingsValidateBtn" class="secondary-button" type="button">
+                            Validate
+                        </button>
 
-                                <h3>
-                                    System Information
-                                </h3>
+                        <button id="settingsResetBtn" class="reset-button" type="button">
+                            Reset to Last Backup
+                        </button>
 
-                                <p>
-                                    FillPac AI runtime environment
-                                </p>
+                        <button id="settingsSaveBtn" class="primary-button" type="button">
+                            Save Changes
+                        </button>
 
-                            </div>
-
-                        </div>
-
-
-                        <div class="settings-list">
-
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Project Root
-                                </span>
-
-                                <strong id="settingProjectRoot">
-                                    --
-                                </strong>
-
-                            </div>
-
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Configuration File
-                                </span>
-
-                                <strong id="settingConfigFile">
-                                    --
-                                </strong>
-
-                            </div>
-
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Events File
-                                </span>
-
-                                <strong id="settingEventsFile">
-                                    --
-                                </strong>
-
-                            </div>
-
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Dashboard API
-                                </span>
-
-                                <strong>
-                                    http://127.0.0.1:8000
-                                </strong>
-
-                            </div>
-
-
-                        </div>
-
-
-                    </section>
-
-
-                    <!-- MODEL -->
-
-                    <section class="section-container settings-card">
-
-
-                        <div class="section-header">
-
-                            <div>
-
-                                <h3>
-                                    AI Model
-                                </h3>
-
-                                <p>
-                                    Detection model configuration
-                                </p>
-
-                            </div>
-
-                        </div>
-
-
-                        <div
-                            id="modelSettings"
-                            class="settings-list"
-                        >
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Status
-                                </span>
-
-                                <strong>
-                                    Loading...
-                                </strong>
-
-                            </div>
-
-                        </div>
-
-
-                    </section>
-
-
-                    <!-- COUNTING -->
-
-                    <section class="section-container settings-card">
-
-
-                        <div class="section-header">
-
-                            <div>
-
-                                <h3>
-                                    Counting Configuration
-                                </h3>
-
-                                <p>
-                                    Bag counting parameters
-                                </p>
-
-                            </div>
-
-                        </div>
-
-
-                        <div
-                            id="countingSettings"
-                            class="settings-list"
-                        >
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Status
-                                </span>
-
-                                <strong>
-                                    Loading...
-                                </strong>
-
-                            </div>
-
-                        </div>
-
-
-                    </section>
-
-
-                    <!-- DASHBOARD -->
-
-                    <section class="section-container settings-card">
-
-
-                        <div class="section-header">
-
-                            <div>
-
-                                <h3>
-                                    Dashboard Configuration
-                                </h3>
-
-                                <p>
-                                    Dashboard service settings
-                                </p>
-
-                            </div>
-
-                        </div>
-
-
-                        <div
-                            id="dashboardSettings"
-                            class="settings-list"
-                        >
-
-                            <div class="setting-row">
-
-                                <span>
-                                    Status
-                                </span>
-
-                                <strong>
-                                    Loading...
-                                </strong>
-
-                            </div>
-
-                        </div>
-
-
-                    </section>
-
+                    </div>
 
                 </div>
 
+                <div id="settingsBanner" class="settings-banner" style="display:none;"></div>
+
+                <div id="settingsTabs" class="settings-tabs"></div>
+
+                <div id="settingsFormRoot" class="settings-form-root">
+
+                    <div class="setting-row">
+                        <span>Status</span>
+                        <strong>Loading configuration...</strong>
+                    </div>
+
+                </div>
 
             </section>
 
@@ -2935,6 +2767,52 @@ img {
 
 
 <!-- ==========================================================
+     SETTINGS CONFIRM-CHANGES MODAL
+     Shown by handleSettingsSaveClick()/openSettingsConfirmModal()
+     before PUT /api/settings actually writes config.yaml, so an
+     admin can review every changed field first. Reuses the same
+     overlay/header/close-button/nav classes as cameraViewModal
+     above so it matches the rest of the dashboard's modal style.
+     ========================================================== -->
+
+<div id="settingsConfirmModal" class="camera-view-modal" style="display:none;">
+
+    <div class="camera-view-modal-content settings-confirm-content">
+
+        <div class="camera-view-modal-header">
+
+            <h3>Confirm Configuration Changes</h3>
+
+            <button id="settingsConfirmClose" class="modal-close-btn" type="button" aria-label="Close">&times;</button>
+
+        </div>
+
+
+        <div style="padding: 16px 18px; overflow-y: auto;">
+
+            <div id="settingsConfirmList" class="settings-confirm-list"></div>
+
+        </div>
+
+
+        <div class="camera-view-modal-nav">
+
+            <button id="settingsConfirmCancel" class="secondary-button" type="button">
+                Cancel
+            </button>
+
+            <button id="settingsConfirmApply" class="primary-button" type="button">
+                Save to config.yaml
+            </button>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ==========================================================
      LOGIN / AUTH JAVASCRIPT
      (must load before dashboard.js: it guards page access,
      redirecting to /login if there is no valid session, before
@@ -2947,7 +2825,7 @@ img {
      DASHBOARD JAVASCRIPT
      ========================================================== -->
 
-<script src="js/dashboard.js?v=20260831-notification-scroll-fix"></script>
+<script src="js/dashboard.js?v=20260901-settings-fix"></script>
 
 <!-- ==========================================================
      HEADER / SIDEBAR ALIGNMENT FIX

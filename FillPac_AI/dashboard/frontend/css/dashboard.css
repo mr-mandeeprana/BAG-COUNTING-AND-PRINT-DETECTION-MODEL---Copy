@@ -4089,13 +4089,13 @@ img {
 
 .health-card-header h4 {
     margin: 0;
-    font-size: 14px;
+    font-size: 19px;
     font-weight: 600;
     color: var(--text-primary);
 }
 
 .status-indicator {
-    font-size: 20px;
+    font-size: 22px;
     color: var(--text-light);
 }
 
@@ -4113,7 +4113,7 @@ img {
 
 .health-card p {
     margin: 0;
-    font-size: 13px;
+    font-size: 18px;
     color: var(--text-secondary);
 }
 
@@ -4149,13 +4149,13 @@ img {
 }
 
 .status-name {
-    font-size: 14px;
+    font-size: 19px;
     font-weight: 600;
     color: var(--text-primary);
 }
 
 .status-badge {
-    font-size: 11px;
+    font-size: 16px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -4176,7 +4176,7 @@ img {
 .status-details {
     display: flex;
     gap: 12px;
-    font-size: 12px;
+    font-size: 17px;
     color: var(--text-secondary);
 }
 
@@ -4198,7 +4198,7 @@ img {
     color: white;
     border: none;
     border-radius: var(--radius-small);
-    font-size: 12px;
+    font-size: 17px;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.2s ease;
@@ -4222,13 +4222,13 @@ img {
 }
 
 .status-label {
-    font-size: 14px;
+    font-size: 19px;
     font-weight: 600;
     color: var(--text-secondary);
 }
 
 .status-value {
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 700;
     color: var(--success);
 }
@@ -4265,7 +4265,7 @@ img {
 
     margin-bottom: 4px;
 
-    font-size: 12px;
+    font-size: 17px;
     font-weight: 600;
 
     color: var(--text-secondary);
@@ -4277,7 +4277,7 @@ img {
 .packer-subsystem-item strong {
     display: block;
 
-    font-size: 15px;
+    font-size: 19px;
     font-weight: 700;
 
     color: var(--text-primary);
@@ -4315,7 +4315,7 @@ img {
 }
 
 .form-row label {
-    font-size: 13px;
+    font-size: 18px;
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -4325,7 +4325,7 @@ img {
     background: var(--surface-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-small);
-    font-size: 13px;
+    font-size: 18px;
     color: var(--text-primary);
     font-family: inherit;
     transition: border-color 0.2s ease;
@@ -4343,7 +4343,7 @@ img {
     color: white;
     border: none;
     border-radius: var(--radius-small);
-    font-size: 13px;
+    font-size: 18px;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.2s ease;
@@ -4364,9 +4364,32 @@ img {
     padding: 20px;
     text-align: center;
     color: var(--text-light);
-    font-size: 13px;
+    font-size: 18px;
     background: var(--surface-secondary);
     border-radius: var(--radius-medium);
+}
+
+.report-list-item {
+    padding: 14px 16px;
+
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    box-shadow: var(--shadow-small);
+}
+
+.report-list-item strong {
+    display: block;
+    margin-bottom: 4px;
+
+    font-size: 19px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.report-list-item p {
+    font-size: 17px;
+    color: var(--text-secondary);
 }
 
 
@@ -4394,7 +4417,7 @@ img {
 
 .about-section h4 {
     margin: 0 0 16px 0;
-    font-size: 16px;
+    font-size: 21px;
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -4416,7 +4439,7 @@ img {
 }
 
 .about-label {
-    font-size: 12px;
+    font-size: 17px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -4424,7 +4447,7 @@ img {
 }
 
 .about-value {
-    font-size: 14px;
+    font-size: 19px;
     color: var(--text-primary);
     font-weight: 500;
 }
@@ -4448,12 +4471,12 @@ img {
 }
 
 .update-row span {
-    font-size: 13px;
+    font-size: 18px;
     color: var(--text-secondary);
 }
 
 .update-row strong {
-    font-size: 14px;
+    font-size: 19px;
     color: var(--text-primary);
     font-weight: 600;
 }
@@ -4705,14 +4728,14 @@ img {
 }
 
 .about-card-header h3 {
-    font-size: 20px;
+    font-size: 23px;
     font-weight: 700;
     color: var(--text-primary);
 }
 
 .about-card p {
     margin-bottom: 12px;
-    font-size: 15px;
+    font-size: 18.5px;
     line-height: 1.6;
     color: var(--text-secondary);
 }
@@ -4731,7 +4754,7 @@ img {
 
     border-top: 1px solid var(--border);
 
-    font-size: 13px;
+    font-size: 17px;
     color: var(--text-light);
 }
 
@@ -4753,7 +4776,7 @@ img {
 
     border-radius: var(--radius-small);
 
-    font-size: 13px;
+    font-size: 18px;
     font-weight: 700;
 
     width: fit-content;
@@ -4772,4 +4795,370 @@ img {
 .about-value-badge.badge-orange {
     color: #ffffff;
     background: var(--warning);
+}
+
+/* ==========================================================
+   SETTINGS PAGE (EDITABLE) -- config.yaml editor
+   ========================================================== */
+
+.settings-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 14px;
+
+    padding: 14px 18px;
+    margin-bottom: 16px;
+
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    box-shadow: var(--shadow-small);
+}
+
+.settings-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.settings-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.settings-toggle-label {
+    font-size: 18.5px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.settings-toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    flex-shrink: 0;
+}
+
+.settings-toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.settings-toggle-slider {
+    position: absolute;
+    inset: 0;
+    cursor: pointer;
+
+    background: var(--border-dark);
+    border-radius: 999px;
+
+    transition: background 0.18s ease;
+}
+
+.settings-toggle-slider::before {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 3px;
+
+    width: 16px;
+    height: 16px;
+
+    background: #ffffff;
+    border-radius: 50%;
+
+    transition: transform 0.18s ease;
+}
+
+.settings-toggle-switch input:checked + .settings-toggle-slider {
+    background: var(--accent-blue);
+}
+
+.settings-toggle-switch input:checked + .settings-toggle-slider::before {
+    transform: translateX(18px);
+}
+
+.settings-toggle-switch input:disabled + .settings-toggle-slider {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.settings-status-text {
+    font-size: 17px;
+    color: var(--text-secondary);
+}
+
+.settings-banner {
+    padding: 12px 16px;
+    margin-bottom: 16px;
+
+    border-radius: var(--radius-medium);
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.settings-banner.settings-banner-success {
+    color: var(--success-dark, #1a7f37);
+    background: var(--success-bg, #e6f7ec);
+    border: 1px solid var(--success, #2ea043);
+}
+
+.settings-banner.settings-banner-error {
+    color: var(--danger-dark, #b42318);
+    background: var(--danger-bg, #fdecea);
+    border: 1px solid var(--danger, #e5484d);
+}
+
+.settings-banner.settings-banner-info {
+    color: var(--text-secondary);
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+}
+
+.settings-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+
+    margin-bottom: 16px;
+}
+
+.settings-tab {
+    padding: 9px 16px;
+
+    color: var(--text-secondary);
+    background: var(--surface);
+
+    border: 1px solid var(--border);
+    border-radius: 999px;
+
+    font-size: 18px;
+    font-weight: 600;
+    cursor: pointer;
+
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.settings-tab:hover {
+    background: var(--surface-secondary);
+    border-color: var(--border-dark);
+}
+
+.settings-tab.active {
+    color: #ffffff;
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
+.settings-form-root {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 18px;
+    align-items: start;
+}
+
+.settings-group {
+    padding: 18px;
+
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+    box-shadow: var(--shadow-small);
+}
+
+.settings-group-header {
+    margin-bottom: 12px;
+}
+
+.settings-group-header h3 {
+    font-size: 21px;
+    font-weight: 600;
+}
+
+.settings-group-header p {
+    margin-top: 2px;
+    font-size: 18.5px;
+    color: var(--text-secondary);
+}
+
+.settings-field-grid {
+    display: grid;
+    gap: 10px;
+}
+
+.settings-field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+
+    padding: 6px 0;
+}
+
+.settings-field label {
+    font-size: 17.5px;
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+.settings-field .settings-input,
+.settings-field .settings-select {
+    width: 170px;
+    max-width: 48%;
+
+    padding: 6px 9px;
+
+    font-size: 17px;
+    color: var(--text-primary);
+
+    background: var(--surface-secondary);
+    border: 1px solid var(--border-dark);
+    border-radius: var(--radius-small);
+}
+
+.settings-field textarea.settings-input {
+    width: 100%;
+    max-width: 100%;
+    min-height: 70px;
+    font-family: monospace;
+    font-size: 14px;
+    resize: vertical;
+}
+
+.settings-field.settings-field-json {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.settings-field .settings-input:focus,
+.settings-field .settings-select:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.settings-field .settings-input[readonly],
+.settings-field .settings-input:disabled,
+.settings-field .settings-select:disabled {
+    color: var(--text-light);
+    background: var(--background);
+    cursor: not-allowed;
+    opacity: 0.75;
+}
+
+.settings-field input[type="checkbox"].settings-checkbox {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent-blue);
+}
+
+.settings-field.settings-field-changed label {
+    color: var(--text-primary);
+}
+
+.settings-field.settings-field-changed .settings-input,
+.settings-field.settings-field-changed .settings-select {
+    border-color: var(--warning);
+    background: var(--warning-bg, #fff6e0);
+}
+
+.settings-field.settings-field-invalid .settings-input {
+    border-color: var(--danger, #e5484d);
+    background: var(--danger-bg, #fdecea);
+}
+
+.settings-subgroup {
+    grid-column: 1 / -1;
+    margin-top: 4px;
+    padding: 10px 12px;
+
+    background: var(--surface-secondary);
+    border: 1px dashed var(--border-dark);
+    border-radius: var(--radius-small);
+}
+
+.settings-subgroup-title {
+    margin-bottom: 8px;
+
+    font-size: 18px;
+    font-weight: 700;
+
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+
+/* Basic/Advanced toggle: hidden unless #settingsAdvancedToggle is checked */
+.settings-form-root.settings-basic-mode .advanced-only {
+    display: none;
+}
+
+.settings-group.advanced-only-group.settings-basic-mode-hidden {
+    display: none;
+}
+
+/* ----------------------------------------------------------
+   CONFIRM CHANGES MODAL
+   ---------------------------------------------------------- */
+
+.settings-confirm-content {
+    width: min(640px, 100%);
+}
+
+.settings-confirm-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.settings-confirm-row {
+    padding: 10px 12px;
+
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+}
+
+.settings-confirm-path {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-secondary);
+
+    margin-bottom: 4px;
+
+    word-break: break-all;
+}
+
+.settings-confirm-values {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+
+    font-size: 18px;
+}
+
+.settings-confirm-old {
+    color: var(--danger-dark, #b42318);
+    text-decoration: line-through;
+    word-break: break-all;
+}
+
+.settings-confirm-new {
+    color: var(--success-dark, #1a7f37);
+    font-weight: 700;
+    word-break: break-all;
+}
+
+.settings-confirm-empty {
+    padding: 20px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 18px;
 }

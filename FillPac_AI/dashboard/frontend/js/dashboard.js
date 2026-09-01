@@ -134,8 +134,7 @@ const PAGE_INFO = {
 
     settings: {
         title: "Settings",
-        subtitle: "FillPac AI dashboard settings",
-        adminOnly: true
+        subtitle: "FillPac AI dashboard settings"
     },
 
     // Legacy pages (kept for backward compatibility, but hidden from UI)
@@ -1679,17 +1678,18 @@ function loadUserRole() {
 
 function updateSettingsVisibility() {
 
+    // Settings is viewable by any logged-in user (operator or
+    // admin) -- only writing config.yaml (Save / Validate /
+    // Reset) is admin-gated, both server-side (require_admin in
+    // server.py) and client-side (applySettingsRoleGating() in
+    // the SETTINGS PAGE section below).
     const settingsBtn = byId("settingsNavButton");
 
     if (!settingsBtn) {
         return;
     }
 
-    if (appState.userRole === "admin") {
-        settingsBtn.style.display = "flex";
-    } else {
-        settingsBtn.style.display = "none";
-    }
+    settingsBtn.style.display = "flex";
 }
 
 
@@ -1822,7 +1822,22 @@ async function loadCurrentPage() {
 
             case "settings":
 
-                await loadDashboardState();
+                // loadDashboardState() re-throws on failure (see its
+                // catch block), which used to abort this entire case
+                // before loadSettings() got a chance to run -- a
+                // transient /state error meant the Settings page
+                // stayed stuck on "Loading configuration..." forever
+                // with no error shown. Settings data doesn't depend
+                // on dashboard state, so a /state failure here is
+                // logged and swallowed instead of blocking the page.
+                try {
+                    await loadDashboardState();
+                } catch (error) {
+                    console.error(
+                        "Settings page: /state failed, continuing to load settings anyway:",
+                        error
+                    );
+                }
 
                 await loadSettings();
 
@@ -4757,189 +4772,1129 @@ async function loadCameraConfig() {
 
 
 /* ==========================================================
-   SETTINGS PAGE
+   SETTINGS PAGE (editable, schema-driven from config.yaml)
+
+   Every field on this page is generated from whatever
+   GET /api/settings returns -- nothing here hard-codes the
+   shape of config.yaml, so it stays correct if fields are
+   added/removed on the backend later.
+
+   Read access: any logged-in user (operator or admin).
+   Write access (Save / Validate / Reset): admin role only --
+   the backend enforces this too (403 on write routes for a
+   non-admin token), this is just UI-level convenience so an
+   operator sees a clearly read-only page instead of a
+   confusing 403 after editing.
    ========================================================== */
+
+const settingsState = {
+    original: null,     // last-known-saved config object (deep clone)
+    working: null,       // in-progress edited copy
+    activeTab: "global",
+    advanced: false,
+    controlsBound: false,
+    loading: false
+};
+
+// Top-level (and per-camera) config keys that are deep/internal
+// tuning rather than everyday operator settings. Hidden unless
+// "Show Advanced Settings" is on.
+const SETTINGS_ADVANCED_GROUPS = new Set([
+    "tracker",
+    "model",
+    "elasticsearch",
+    "logging",
+    "output"
+]);
+
+// Friendly titles/descriptions for known config sections. Any
+// key not listed here still renders fine -- it just falls back
+// to a prettified version of the raw key name.
+const SETTINGS_GROUP_META = {
+    project: { title: "Project", description: "Application identity" },
+    model: { title: "AI Model", description: "Detection model configuration (advanced)" },
+    tracker: { title: "Tracker", description: "ByteTrack tuning (advanced)" },
+    counting: { title: "Counting", description: "Bag counting parameters" },
+    print_detection: { title: "Print Detection", description: "Print inspection thresholds" },
+    jam_detection: { title: "Jam Detection", description: "Conveyor jam thresholds" },
+    bag_spacing: { title: "Bag Spacing", description: "Spacing / gap jam detection" },
+    condition_c: { title: "Condition C (ROI Occupancy)", description: "ROI bag-occupancy monitoring" },
+    display: { title: "Display Overlays", description: "On-screen overlay toggles" },
+    output: { title: "Output", description: "Video / image output (advanced)" },
+    elasticsearch: { title: "Elasticsearch", description: "Optional search indexing (advanced)" },
+    dashboard: { title: "Dashboard Service", description: "Dashboard host / port settings" },
+    logging: { title: "Logging", description: "Log level and file (advanced)" },
+    entry_roi_counting: { title: "Entry ROI Counting", description: "ROI-based entry counting" },
+    roi: { title: "ROI", description: "Region of interest coordinates" },
+    detection_roi: { title: "Detection ROI", description: "Region of interest coordinates" },
+    entry_roi: { title: "Entry ROI", description: "Region of interest coordinates" },
+    calibration: { title: "Calibration", description: "Pixel-to-world calibration points (advanced)" },
+    indices: { title: "Indices", description: "Elasticsearch index names" }
+};
+
+
+/* ----------------------------------------------------------
+   SMALL HELPERS
+   ---------------------------------------------------------- */
+
+function settingsPrettify(key) {
+
+    return String(key)
+        .replaceAll("_", " ")
+        .replace(/\b\w/g, character => character.toUpperCase());
+}
+
+
+function settingsIsPlainObject(value) {
+
+    return (
+        value !== null
+        && typeof value === "object"
+        && !Array.isArray(value)
+    );
+}
+
+
+function settingsIsPrimitiveArray(value) {
+
+    return (
+        Array.isArray(value)
+        && value.every(
+            item =>
+                item === null
+                || typeof item === "string"
+                || typeof item === "number"
+                || typeof item === "boolean"
+        )
+    );
+}
+
+
+function settingsDeepClone(value) {
+
+    return JSON.parse(JSON.stringify(value));
+}
+
+
+function settingsGetIn(root, pathParts) {
+
+    let node = root;
+
+    for (const part of pathParts) {
+
+        if (node === null || node === undefined) {
+            return undefined;
+        }
+
+        node = node[part];
+    }
+
+    return node;
+}
+
+
+function settingsSetIn(root, pathParts, value) {
+
+    let node = root;
+
+    for (let i = 0; i < pathParts.length - 1; i++) {
+
+        const part = pathParts[i];
+
+        if (node[part] === null || typeof node[part] !== "object") {
+            node[part] = {};
+        }
+
+        node = node[part];
+    }
+
+    node[pathParts[pathParts.length - 1]] = value;
+}
+
+
+// Leaf-level diff between two config trees, mirroring the
+// server's own ConfigManager.diff() so the confirmation modal
+// shows exactly what /api/settings will report as changed.
+function settingsComputeDiff(oldData, newData) {
+
+    const changes = [];
+
+    function walk(oldNode, newNode, path) {
+
+        const oldIsDict = settingsIsPlainObject(oldNode);
+        const newIsDict = settingsIsPlainObject(newNode);
+
+        if (oldIsDict || newIsDict) {
+
+            const oldMap = oldIsDict ? oldNode : {};
+            const newMap = newIsDict ? newNode : {};
+
+            const keys = Array.from(
+                new Set([
+                    ...Object.keys(oldMap),
+                    ...Object.keys(newMap)
+                ])
+            ).sort();
+
+            for (const key of keys) {
+                walk(oldMap[key], newMap[key], [...path, key]);
+            }
+
+            return;
+        }
+
+        const oldIsList = Array.isArray(oldNode);
+        const newIsList = Array.isArray(newNode);
+
+        if (oldIsList || newIsList) {
+
+            const oldList = oldIsList ? oldNode : [];
+            const newList = newIsList ? newNode : [];
+            const length = Math.max(oldList.length, newList.length);
+
+            for (let i = 0; i < length; i++) {
+                walk(oldList[i], newList[i], [...path, String(i)]);
+            }
+
+            return;
+        }
+
+        if (oldNode !== newNode) {
+            changes.push({
+                path: path.join("."),
+                old: oldNode,
+                new: newNode
+            });
+        }
+    }
+
+    walk(oldData || {}, newData || {}, []);
+
+    return changes;
+}
+
+
+function settingsFormatValue(value) {
+
+    if (value === null || value === undefined) {
+        return "--";
+    }
+
+    if (typeof value === "object") {
+        return JSON.stringify(value);
+    }
+
+    return String(value);
+}
+
+
+// Talks directly to the API (reusing the same auth token
+// apiFetch() uses) but always returns the parsed JSON body
+// alongside the response status, since the Settings page needs
+// to show the server's actual "detail" / "error" message on a
+// 400/403 -- apiFetch() only throws a generic Error on failure.
+async function settingsApiFetch(path, options = {}) {
+
+    const token =
+        localStorage.getItem("fillpac_auth_token") ||
+        sessionStorage.getItem("fillpac_auth_token");
+
+    const headers = {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+        ...(token ? { "Authorization": `Bearer ${token}` } : {})
+    };
+
+    const response = await fetch(
+        `${API_BASE}${path}`,
+        {
+            cache: "no-store",
+            ...options,
+            headers
+        }
+    );
+
+    let body = null;
+
+    try {
+        body = await response.json();
+    } catch (error) {
+        body = null;
+    }
+
+    if (response.status === 401) {
+
+        authRedirectInProgress = true;
+
+        localStorage.removeItem("fillpac_auth_token");
+        localStorage.removeItem("fillpac_user");
+        sessionStorage.removeItem("fillpac_auth_token");
+        sessionStorage.removeItem("fillpac_user");
+
+        window.location.href =
+            "/login?redirect=" + encodeURIComponent(window.location.href);
+    }
+
+    return {
+        ok: response.ok,
+        status: response.status,
+        data: body
+    };
+}
+
+
+function isSettingsAdmin() {
+
+    return appState.userRole === "admin";
+}
+
+
+function showSettingsBanner(type, message) {
+
+    const banner = byId("settingsBanner");
+
+    if (!banner) {
+        return;
+    }
+
+    banner.className = `settings-banner settings-banner-${type}`;
+    banner.textContent = message;
+    banner.style.display = "block";
+}
+
+
+function hideSettingsBanner() {
+
+    const banner = byId("settingsBanner");
+
+    if (banner) {
+        banner.style.display = "none";
+    }
+}
+
+
+function updateSettingsStatusText() {
+
+    const statusEl = byId("settingsStatusText");
+
+    if (!statusEl) {
+        return;
+    }
+
+    if (!isSettingsAdmin()) {
+        statusEl.textContent = "View only -- an administrator account is required to change settings.";
+        return;
+    }
+
+    const changeCount =
+        settingsComputeDiff(settingsState.original, settingsState.working).length;
+
+    statusEl.textContent =
+        changeCount === 0
+            ? "No unsaved changes"
+            : `${changeCount} unsaved change${changeCount === 1 ? "" : "s"}`;
+}
+
+
+/* ----------------------------------------------------------
+   LOAD
+   ---------------------------------------------------------- */
 
 async function loadSettings() {
 
+    settingsState.loading = true;
+
     try {
 
-        const data =
-            await apiFetch(
-                "/config"
-            );
+        const response = await settingsApiFetch("/api/settings");
 
-        renderSettings(
-            data
-        );
+        if (!response.ok) {
 
-        return data;
+            const message =
+                (response.data && (response.data.detail || response.data.error))
+                || `Failed to load settings (HTTP ${response.status}).`;
 
+            renderSettingsError(message);
+
+            return null;
+        }
+
+        const config = (response.data && response.data.config) || {};
+
+        settingsState.original = settingsDeepClone(config);
+        settingsState.working = settingsDeepClone(config);
+
+        if (
+            settingsState.activeTab !== "global"
+            && !settingsState.activeTab.startsWith("camera-")
+        ) {
+            settingsState.activeTab = "global";
+        }
+
+        bindSettingsControls();
+        renderSettingsTabs();
+        renderSettingsActiveTab();
+        applySettingsRoleGating();
+        updateSettingsStatusText();
+        hideSettingsBanner();
+
+        return config;
     }
 
     catch (error) {
 
-        console.error(
-            "Failed loading settings:",
-            error
-        );
+        console.error("Failed loading settings:", error);
+
+        renderSettingsError("Failed to load settings: " + error.message);
 
         return null;
     }
-}
 
+    finally {
 
-function prettifySettingLabel(key) {
-
-    return String(key)
-        .replaceAll("_", " ")
-        .replace(
-            /\b\w/g,
-            character =>
-                character.toUpperCase()
-        );
-}
-
-
-function renderSettingsGroup(
-    containerId,
-    data
-) {
-
-    const container =
-        byId(containerId);
-
-    if (!container) {
-        return;
+        settingsState.loading = false;
     }
+}
 
-    const entries =
-        Object.entries(
-            data || {}
-        );
 
-    if (entries.length === 0) {
+function renderSettingsError(message) {
 
-        container.innerHTML =
-            `
+    const root = byId("settingsFormRoot");
+
+    if (root) {
+        root.innerHTML = `
             <div class="setting-row">
                 <span>Status</span>
-                <strong>No configuration found</strong>
+                <strong>${escapeHtml(message)}</strong>
             </div>
-            `;
-
-        return;
+        `;
     }
 
-    container.innerHTML =
-        entries
-            .map(
-                ([key, value]) => {
+    const tabs = byId("settingsTabs");
+    if (tabs) {
+        tabs.innerHTML = "";
+    }
 
-                    const displayValue =
-                        typeof value === "object"
-                        && value !== null
-                            ? JSON.stringify(value)
-                            : String(
-                                value
-                                ??
-                                "--"
-                            );
-
-                    return `
-                    <div class="setting-row">
-                        <span>${escapeHtml(
-                            prettifySettingLabel(key)
-                        )}</span>
-                        <strong>${escapeHtml(
-                            displayValue
-                        )}</strong>
-                    </div>
-                    `;
-                }
-            )
-            .join("");
+    showSettingsBanner("error", message);
 }
 
 
-function renderSettings(data) {
+/* ----------------------------------------------------------
+   TABS
+   ---------------------------------------------------------- */
 
-    if (
-        !data
-        ||
-        typeof data !== "object"
-    ) {
+function renderSettingsTabs() {
+
+    const tabsContainer = byId("settingsTabs");
+
+    if (!tabsContainer || !settingsState.working) {
         return;
     }
 
-    setText(
-        "settingProjectRoot",
-        data.project_root
-        ??
-        "--"
-    );
+    const cameras = Array.isArray(settingsState.working.cameras)
+        ? settingsState.working.cameras
+        : [];
 
-    setText(
-        "settingConfigFile",
-        data.config_file
-        ??
-        "--"
-    );
+    const tabs = [{ id: "global", label: "Global" }];
 
-    setText(
-        "settingEventsFile",
-        data.events_file
-        ??
-        "--"
-    );
+    cameras.forEach((camera, index) => {
+        tabs.push({
+            id: `camera-${index}`,
+            label: camera && camera.name ? camera.name : `Camera ${index + 1}`
+        });
+    });
 
-    if (data.available === false) {
+    tabsContainer.innerHTML = tabs
+        .map(
+            tab => `
+            <button
+                type="button"
+                class="settings-tab${tab.id === settingsState.activeTab ? " active" : ""}"
+                data-tab-id="${escapeHtml(tab.id)}"
+            >${escapeHtml(tab.label)}</button>
+            `
+        )
+        .join("");
 
-        const message =
-            data.error
-            ??
-            "Configuration unavailable.";
+    tabsContainer.querySelectorAll(".settings-tab").forEach(button => {
 
-        [
-            "modelSettings",
-            "countingSettings",
-            "dashboardSettings"
-        ].forEach(
-            id => {
+        button.addEventListener("click", () => {
 
-                const container =
-                    byId(id);
+            settingsState.activeTab = button.dataset.tabId;
 
-                if (container) {
+            renderSettingsTabs();
+            renderSettingsActiveTab();
+            applySettingsRoleGating();
+        });
+    });
+}
 
-                    container.innerHTML =
-                        `
-                        <div class="setting-row">
-                            <span>Status</span>
-                            <strong>${escapeHtml(message)}</strong>
-                        </div>
-                        `;
+
+/* ----------------------------------------------------------
+   FORM RENDERING
+   ---------------------------------------------------------- */
+
+function renderSettingsActiveTab() {
+
+    const root = byId("settingsFormRoot");
+
+    if (!root || !settingsState.working) {
+        return;
+    }
+
+    root.innerHTML = "";
+    root.classList.toggle("settings-basic-mode", !settingsState.advanced);
+
+    let dataObj;
+    let pathPrefix;
+
+    if (settingsState.activeTab === "global") {
+
+        dataObj = settingsState.working;
+        pathPrefix = [];
+
+    } else {
+
+        const index = parseInt(settingsState.activeTab.replace("camera-", ""), 10);
+        dataObj = (settingsState.working.cameras || [])[index];
+        pathPrefix = ["cameras", String(index)];
+    }
+
+    if (!dataObj) {
+
+        root.innerHTML = `
+            <div class="setting-row">
+                <span>Status</span>
+                <strong>No configuration found for this tab.</strong>
+            </div>
+        `;
+
+        return;
+    }
+
+    const leafEntries = [];
+    const dictEntries = [];
+
+    Object.entries(dataObj).forEach(([key, value]) => {
+
+        if (key === "cameras" && pathPrefix.length === 0) {
+            return;
+        }
+
+        if (settingsIsPlainObject(value)) {
+            dictEntries.push([key, value]);
+        } else {
+            leafEntries.push([key, value]);
+        }
+    });
+
+    // "General" card: primitive fields living directly on this
+    // tab's root object (e.g. camera.name, camera.enabled).
+    if (leafEntries.length > 0) {
+
+        const card = document.createElement("section");
+        card.className = "settings-group";
+
+        card.innerHTML = `
+            <div class="settings-group-header">
+                <h3>General</h3>
+                <p>Top-level settings for this section</p>
+            </div>
+        `;
+
+        const grid = document.createElement("div");
+        grid.className = "settings-field-grid";
+
+        leafEntries.forEach(([key, value]) => {
+            grid.appendChild(
+                buildSettingsFieldRow(
+                    key,
+                    value,
+                    [...pathPrefix, key],
+                    false,
+                    key === "id"
+                )
+            );
+        });
+
+        card.appendChild(grid);
+        root.appendChild(card);
+    }
+
+    dictEntries.forEach(([key, value]) => {
+
+        const advancedGroup = SETTINGS_ADVANCED_GROUPS.has(key);
+        const meta = SETTINGS_GROUP_META[key] || {
+            title: settingsPrettify(key),
+            description: ""
+        };
+
+        const card = document.createElement("section");
+        card.className = "settings-group";
+
+        card.innerHTML = `
+            <div class="settings-group-header">
+                <h3>${escapeHtml(meta.title)}</h3>
+                ${meta.description ? `<p>${escapeHtml(meta.description)}</p>` : ""}
+            </div>
+        `;
+
+        renderSettingsDictBody(
+            card,
+            value,
+            [...pathPrefix, key],
+            advancedGroup
+        );
+
+        root.appendChild(card);
+    });
+}
+
+
+// Renders one dict's leaf fields into a field-grid, then any
+// nested dicts as indented "subgroup" boxes (recursively), so
+// arbitrarily nested config (camera.model.detection_roi, etc.)
+// renders correctly without special-casing each shape.
+function renderSettingsDictBody(container, dictObj, pathPrefix, advancedGroup) {
+
+    const grid = document.createElement("div");
+    grid.className = "settings-field-grid";
+
+    const nestedDicts = [];
+
+    Object.entries(dictObj).forEach(([key, value]) => {
+
+        if (settingsIsPlainObject(value)) {
+            nestedDicts.push([key, value]);
+            return;
+        }
+
+        grid.appendChild(
+            buildSettingsFieldRow(
+                key,
+                value,
+                [...pathPrefix, key],
+                advancedGroup,
+                false
+            )
+        );
+    });
+
+    container.appendChild(grid);
+
+    nestedDicts.forEach(([key, value]) => {
+
+        const meta = SETTINGS_GROUP_META[key] || {
+            title: settingsPrettify(key)
+        };
+
+        const subgroup = document.createElement("div");
+        subgroup.className = "settings-subgroup";
+
+        if (advancedGroup || key === "calibration") {
+            subgroup.classList.add("advanced-only");
+        }
+
+        subgroup.innerHTML = `<div class="settings-subgroup-title">${escapeHtml(meta.title)}</div>`;
+
+        renderSettingsDictBody(
+            subgroup,
+            value,
+            [...pathPrefix, key],
+            advancedGroup || key === "calibration"
+        );
+
+        container.appendChild(subgroup);
+    });
+}
+
+
+// Builds one <div class="settings-field"> row for a single leaf
+// value (primitive, primitive-array, or complex-array/JSON).
+function buildSettingsFieldRow(key, value, pathParts, advancedGroup, readOnly) {
+
+    const row = document.createElement("div");
+    row.className = "settings-field";
+    row.dataset.path = JSON.stringify(pathParts);
+
+    let forceAdvanced = false;
+    let controlHtml = "";
+    let kind = "string";
+
+    if (typeof value === "boolean") {
+
+        kind = "boolean";
+        controlHtml = `
+            <input
+                type="checkbox"
+                class="settings-checkbox"
+                ${value ? "checked" : ""}
+                ${readOnly ? "disabled" : ""}
+            >
+        `;
+
+    } else if (typeof value === "number") {
+
+        kind = "number";
+        controlHtml = `
+            <input
+                type="number"
+                step="any"
+                class="settings-input"
+                value="${escapeHtml(String(value))}"
+                ${readOnly ? "readonly" : ""}
+            >
+        `;
+
+    } else if (settingsIsPrimitiveArray(value)) {
+
+        kind = "array-primitive";
+        controlHtml = `
+            <input
+                type="text"
+                class="settings-input"
+                value="${escapeHtml(value.join(", "))}"
+                placeholder="comma-separated"
+                ${readOnly ? "readonly" : ""}
+            >
+        `;
+
+    } else if (Array.isArray(value) || value === null) {
+
+        kind = "json";
+        forceAdvanced = true;
+        row.classList.add("settings-field-json");
+        controlHtml = `
+            <textarea
+                class="settings-input"
+                spellcheck="false"
+                ${readOnly ? "readonly" : ""}
+            >${escapeHtml(JSON.stringify(value, null, 2))}</textarea>
+        `;
+
+    } else {
+
+        kind = "string";
+        controlHtml = `
+            <input
+                type="text"
+                class="settings-input"
+                value="${escapeHtml(String(value))}"
+                ${readOnly ? "readonly" : ""}
+            >
+        `;
+    }
+
+    row.dataset.kind = kind;
+
+    if (advancedGroup || forceAdvanced) {
+        row.classList.add("advanced-only");
+    }
+
+    row.innerHTML = `
+        <label>${escapeHtml(settingsPrettify(key))}</label>
+        ${controlHtml}
+    `;
+
+    if (!readOnly) {
+
+        const control = row.querySelector("input, textarea");
+
+        if (control) {
+
+            const eventName = kind === "boolean" ? "change" : "input";
+
+            control.addEventListener(eventName, () => {
+                handleSettingsFieldChange(row, control, kind, pathParts);
+            });
+        }
+    }
+
+    return row;
+}
+
+
+function handleSettingsFieldChange(row, control, kind, pathParts) {
+
+    let parsedValue;
+
+    if (kind === "boolean") {
+
+        parsedValue = control.checked;
+
+    } else if (kind === "number") {
+
+        const numeric = Number(control.value);
+
+        if (control.value.trim() === "" || Number.isNaN(numeric)) {
+            row.classList.add("settings-field-invalid");
+            return;
+        }
+
+        parsedValue = numeric;
+
+    } else if (kind === "array-primitive") {
+
+        const originalValue = settingsGetIn(settingsState.original, pathParts);
+        const sampleItem = Array.isArray(originalValue) ? originalValue[0] : undefined;
+
+        parsedValue = control.value
+            .split(",")
+            .map(item => item.trim())
+            .filter(item => item.length > 0)
+            .map(item => {
+
+                if (typeof sampleItem === "number") {
+                    return Number(item);
                 }
+
+                if (typeof sampleItem === "boolean") {
+                    return item.toLowerCase() === "true";
+                }
+
+                return item;
+            });
+
+    } else if (kind === "json") {
+
+        try {
+            parsedValue = control.value.trim() === "" ? null : JSON.parse(control.value);
+        } catch (error) {
+            row.classList.add("settings-field-invalid");
+            return;
+        }
+
+    } else {
+
+        parsedValue = control.value;
+    }
+
+    row.classList.remove("settings-field-invalid");
+
+    settingsSetIn(settingsState.working, pathParts, parsedValue);
+
+    const originalValue = settingsGetIn(settingsState.original, pathParts);
+    const changed = JSON.stringify(originalValue) !== JSON.stringify(parsedValue);
+
+    row.classList.toggle("settings-field-changed", changed);
+
+    updateSettingsStatusText();
+}
+
+
+/* ----------------------------------------------------------
+   ROLE GATING
+   ---------------------------------------------------------- */
+
+function applySettingsRoleGating() {
+
+    const admin = isSettingsAdmin();
+
+    const root = byId("settingsFormRoot");
+
+    if (root && !admin) {
+
+        // Operators can view every field, but none are editable
+        // -- writes are enforced server-side too (require_admin
+        // on PUT/validate/reload/reset), this just avoids a
+        // confusing 403 after typing a change.
+        root.querySelectorAll("input, textarea, select").forEach(control => {
+            control.disabled = true;
+        });
+    }
+
+    ["settingsSaveBtn", "settingsValidateBtn", "settingsResetBtn"].forEach(id => {
+
+        const button = byId(id);
+
+        if (!button) {
+            return;
+        }
+
+        button.disabled = !admin;
+        button.title = admin ? "" : "Administrator account required";
+    });
+
+    const advancedToggle = byId("settingsAdvancedToggle");
+    if (advancedToggle) {
+        advancedToggle.disabled = false; // viewing basic/advanced is fine for everyone
+    }
+}
+
+
+/* ----------------------------------------------------------
+   CONTROLS
+   ---------------------------------------------------------- */
+
+function bindSettingsControls() {
+
+    if (settingsState.controlsBound) {
+        return;
+    }
+
+    settingsState.controlsBound = true;
+
+    const advancedToggle = byId("settingsAdvancedToggle");
+    if (advancedToggle) {
+
+        advancedToggle.addEventListener("change", () => {
+
+            settingsState.advanced = advancedToggle.checked;
+
+            const root = byId("settingsFormRoot");
+            if (root) {
+                root.classList.toggle("settings-basic-mode", !settingsState.advanced);
+            }
+        });
+    }
+
+    const validateBtn = byId("settingsValidateBtn");
+    if (validateBtn) {
+        validateBtn.addEventListener("click", handleSettingsValidate);
+    }
+
+    const saveBtn = byId("settingsSaveBtn");
+    if (saveBtn) {
+        saveBtn.addEventListener("click", handleSettingsSaveClick);
+    }
+
+    const resetBtn = byId("settingsResetBtn");
+    if (resetBtn) {
+        resetBtn.addEventListener("click", handleSettingsResetClick);
+    }
+
+    const modalClose = byId("settingsConfirmClose");
+    const modalCancel = byId("settingsConfirmCancel");
+    const modalApply = byId("settingsConfirmApply");
+
+    if (modalClose) {
+        modalClose.addEventListener("click", closeSettingsConfirmModal);
+    }
+
+    if (modalCancel) {
+        modalCancel.addEventListener("click", closeSettingsConfirmModal);
+    }
+
+    if (modalApply) {
+        modalApply.addEventListener("click", handleSettingsConfirmApply);
+    }
+}
+
+
+async function handleSettingsValidate() {
+
+    if (!isSettingsAdmin()) {
+        return;
+    }
+
+    hideSettingsBanner();
+    showSettingsBanner("info", "Validating configuration...");
+
+    try {
+
+        const response = await settingsApiFetch(
+            "/api/settings/validate",
+            {
+                method: "POST",
+                body: JSON.stringify(settingsState.working)
             }
         );
 
+        if (!response.ok) {
+
+            const message =
+                (response.data && (response.data.detail || response.data.error))
+                || `Validation request failed (HTTP ${response.status}).`;
+
+            showSettingsBanner("error", message);
+            return;
+        }
+
+        if (response.data && response.data.valid) {
+            showSettingsBanner("success", "Configuration is valid.");
+        } else {
+            showSettingsBanner(
+                "error",
+                (response.data && response.data.error) || "Configuration is invalid."
+            );
+        }
+    }
+
+    catch (error) {
+        showSettingsBanner("error", "Validation failed: " + error.message);
+    }
+}
+
+
+function handleSettingsSaveClick() {
+
+    if (!isSettingsAdmin()) {
         return;
     }
 
-    renderSettingsGroup(
-        "modelSettings",
-        data.model
+    const changes = settingsComputeDiff(settingsState.original, settingsState.working);
+
+    if (changes.length === 0) {
+        showSettingsBanner("info", "No changes to save.");
+        return;
+    }
+
+    openSettingsConfirmModal(changes);
+}
+
+
+function openSettingsConfirmModal(changes) {
+
+    const modal = byId("settingsConfirmModal");
+    const list = byId("settingsConfirmList");
+
+    if (!modal || !list) {
+        return;
+    }
+
+    if (changes.length === 0) {
+
+        list.innerHTML = `<div class="settings-confirm-empty">No changes</div>`;
+
+    } else {
+
+        list.innerHTML = changes
+            .map(
+                change => `
+                <div class="settings-confirm-row">
+                    <div class="settings-confirm-path">${escapeHtml(change.path)}</div>
+                    <div class="settings-confirm-values">
+                        <span class="settings-confirm-old">${escapeHtml(settingsFormatValue(change.old))}</span>
+                        <span>&rarr;</span>
+                        <span class="settings-confirm-new">${escapeHtml(settingsFormatValue(change.new))}</span>
+                    </div>
+                </div>
+                `
+            )
+            .join("");
+    }
+
+    modal.style.display = "flex";
+}
+
+
+function closeSettingsConfirmModal() {
+
+    const modal = byId("settingsConfirmModal");
+
+    if (modal) {
+        modal.style.display = "none";
+    }
+}
+
+
+async function handleSettingsConfirmApply() {
+
+    if (!isSettingsAdmin()) {
+        closeSettingsConfirmModal();
+        return;
+    }
+
+    const applyBtn = byId("settingsConfirmApply");
+
+    if (applyBtn) {
+        applyBtn.disabled = true;
+    }
+
+    try {
+
+        const response = await settingsApiFetch(
+            "/api/settings",
+            {
+                method: "PUT",
+                body: JSON.stringify(settingsState.working)
+            }
+        );
+
+        if (!response.ok) {
+
+            const message =
+                (response.data && response.data.detail)
+                || `Save failed (HTTP ${response.status}).`;
+
+            closeSettingsConfirmModal();
+            showSettingsBanner("error", message);
+            return;
+        }
+
+        settingsState.original = settingsDeepClone(settingsState.working);
+
+        closeSettingsConfirmModal();
+        renderSettingsTabs();
+        renderSettingsActiveTab();
+        applySettingsRoleGating();
+        updateSettingsStatusText();
+
+        const message =
+            (response.data && response.data.message)
+            || "Settings saved.";
+
+        showSettingsBanner("success", message);
+    }
+
+    catch (error) {
+
+        closeSettingsConfirmModal();
+        showSettingsBanner("error", "Save failed: " + error.message);
+    }
+
+    finally {
+
+        if (applyBtn) {
+            applyBtn.disabled = false;
+        }
+    }
+}
+
+
+async function handleSettingsResetClick() {
+
+    if (!isSettingsAdmin()) {
+        return;
+    }
+
+    const confirmed = window.confirm(
+        "This restores config.yaml from the most recent backup, " +
+        "discarding any changes made since then. Continue?"
     );
 
-    renderSettingsGroup(
-        "countingSettings",
-        data.counting
-    );
+    if (!confirmed) {
+        return;
+    }
 
-    renderSettingsGroup(
-        "dashboardSettings",
-        data.dashboard
-    );
+    hideSettingsBanner();
+    showSettingsBanner("info", "Restoring configuration from backup...");
+
+    try {
+
+        const response = await settingsApiFetch(
+            "/api/settings/reset",
+            { method: "POST" }
+        );
+
+        if (!response.ok) {
+
+            const message =
+                (response.data && response.data.detail)
+                || `Reset failed (HTTP ${response.status}).`;
+
+            showSettingsBanner("error", message);
+            return;
+        }
+
+        await loadSettings();
+
+        showSettingsBanner("success", "Configuration restored from the most recent backup.");
+    }
+
+    catch (error) {
+        showSettingsBanner("error", "Reset failed: " + error.message);
+    }
 }
 
 

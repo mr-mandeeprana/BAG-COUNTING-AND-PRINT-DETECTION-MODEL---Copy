@@ -1,0 +1,32 @@
+bag_spacing:
+  enabled: false
+cameras:
+- bag_spacing:
+    enabled: false
+  condition_c:
+    enabled: false
+  enabled: true
+  id: 1
+  jam_detection:
+    enabled: false
+  mode: video
+  name: Camera 1
+  roi:
+    x1: 0
+    x2: 100
+    y1: 0
+    y2: 100
+  source: data/videos/camera1_test.mp4
+condition_c:
+  enabled: false
+counting:
+  direction: right
+  method: center
+jam_detection:
+  enabled: false
+model:
+  confidence: 0.2
+  path: models/fillpac_yolo26n_best.pt
+project:
+  name: FillPac AI Test
+  version: 1.1.0
